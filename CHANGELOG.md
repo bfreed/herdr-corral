@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.3 — 2026-08-13
+
+- Cleaning up or removing an open worktree no longer yanks Herdr's focus away: Herdr unconditionally switches to the removed worktree's parent repo workspace (verified in `app/worktrees.rs::close_removed_linked_worktree_workspace`), so Corral now records the focused workspace before removal and switches back afterward — unless you ran it from the workspace being removed.
+
 ## 0.15.2 — 2026-08-13
 
 - Worktrees created by `hwt new` (and reopened by `hwt open`) now display in Herdr's sidebar exactly like right-click-created ones: just the branch name. We stopped passing `--label` — an explicit label becomes the workspace's `custom_name`, which disables Herdr's branch-derived display (verified in `ui/sidebar.rs::grouped_child_display_label`), and our `"repo: branch"` labels ate the whole panel width with the repo prefix.

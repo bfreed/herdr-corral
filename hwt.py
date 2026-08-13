@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.15.2"
+__version__ = "0.15.3"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -1494,9 +1494,11 @@ def cmd_remove(args,cfg,state,herdr):
         branch2=git(path,"branch","--show-current").stdout.strip(); dirty2=bool(git(path,"status","--porcelain").stdout.strip())
         if branch2 != branch or dirty2 != dirty: raise WorkflowError("worktree changed while removal was being validated")
         if workspace:
+            focused = focused_workspace_id(herdr)
             cmd=["worktree","remove","--workspace",workspace]
             if args.force: cmd.append("--force")
             herdr.call(*cmd)
+            restore_focus_after_removal(herdr, workspace, focused)
         else:
             cmd=["worktree","remove"]
             if args.force: cmd.append("--force")
@@ -1694,6 +1696,23 @@ def cmd_cleanup_workspace(args, cfg, state, herdr):
     print(json.dumps(result, indent=2))
 
 
+def focused_workspace_id(herdr: Any) -> str | None:
+    with contextlib.suppress(Exception):
+        for workspace in herdr.call("workspace", "list")["result"]["workspaces"]:
+            if workspace.get("focused"):
+                return workspace.get("workspace_id")
+    return None
+
+
+def restore_focus_after_removal(herdr: Any, removed_workspace: str, focused: str | None) -> None:
+    # Herdr unconditionally switches focus to the removed worktree's parent repo
+    # workspace (close_removed_linked_worktree_workspace); jump back to wherever
+    # the user actually was.
+    if focused and focused != removed_workspace:
+        with contextlib.suppress(Exception):
+            herdr.call("workspace", "focus", focused)
+
+
 def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: str | None):
     branch = item.get("branch", "")
     if not branch or item.get("is_detached", False):
@@ -1745,10 +1764,12 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
         if remote_exists:
             git(canonical, "push", remote, "--delete", branch)
         if workspace:
+            focused = focused_workspace_id(herdr)
             remove = ["worktree", "remove", "--workspace", workspace]
             if dirty:
                 remove.append("--force")
             herdr.call(*remove)
+            restore_focus_after_removal(herdr, workspace, focused)
         else:
             # Not open in Herdr (its remove API is workspace-only); use git directly.
             remove = ["worktree", "remove"]

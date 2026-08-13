@@ -556,7 +556,7 @@ class RemovalTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             hwt.cmd_cleanup(args, self.CFG, Path("/state"), fake)
         self.assertIn(mock.call(Path("/canon/demo"), "push", "origin", "--delete", "feature/x"), git.call_args_list)
-        fake.call.assert_called_once_with("worktree", "remove", "--workspace", "w2", "--force")
+        self.assertIn(mock.call("worktree", "remove", "--workspace", "w2", "--force"), fake.call.call_args_list)
         self.assertIn(mock.call(Path("/canon/demo"), "update-ref", "-d", "refs/heads/feature/x"), git.call_args_list)
         release.assert_called_once_with(Path("/state"), str(Path("/approved/wt")))
 
@@ -621,7 +621,7 @@ class RemovalTests(unittest.TestCase):
              mock.patch.object(hwt, "release_port") as release, \
              contextlib.redirect_stdout(io.StringIO()) as out:
             hwt.cmd_cleanup(args, self.CFG, Path("/state"), fake)
-        fake.call.assert_called_once_with("worktree", "remove", "--workspace", "w2")
+        self.assertIn(mock.call("worktree", "remove", "--workspace", "w2"), fake.call.call_args_list)
         self.assertIn(mock.call(Path("/canon/demo"), "update-ref", "-d", "refs/heads/feature/x"), git.call_args_list)
         release.assert_called_once_with(Path("/state"), str(Path("/approved/wt")))
         self.assertEqual(json.loads(out.getvalue())["reason"], "no-unique-commits")
@@ -646,9 +646,43 @@ class RemovalTests(unittest.TestCase):
              contextlib.redirect_stdout(io.StringIO()):
             hwt.cmd_cleanup(args, self.CFG, Path("/state"), fake)
         self.assertIn(mock.call(Path("/canon/demo"), "push", "origin", "--delete", "feature/x"), git.call_args_list)
-        fake.call.assert_called_once_with("worktree", "remove", "--workspace", "w2")
+        self.assertIn(mock.call("worktree", "remove", "--workspace", "w2"), fake.call.call_args_list)
         self.assertIn(mock.call(Path("/canon/demo"), "update-ref", "-d", "refs/heads/feature/x"), git.call_args_list)
         release.assert_called_once_with(Path("/state"), str(Path("/approved/wt")))
+
+    def _refocus_run(self, focused_id):
+        args = self.cleanup_args()
+        fake = mock.Mock()
+
+        def herdr_call(*call_args):
+            if call_args[:2] == ("workspace", "list"):
+                return {"result": {"workspaces": [
+                    {"workspace_id": focused_id, "focused": True},
+                    {"workspace_id": "w2"},
+                ]}}
+            return {"result": {}}
+
+        fake.call.side_effect = herdr_call
+        responses = [mock.Mock(stdout="", returncode=0)] * 6
+        with mock.patch.object(hwt, "configured_worktree_items", return_value=[dict(self.ITEM)]), \
+             mock.patch.object(hwt, "resolve_existing", side_effect=lambda path: Path(path)), \
+             mock.patch.object(hwt, "validate_worktree_identity"), \
+             mock.patch.object(hwt, "worktree_lock", return_value=contextlib.nullcontext()), \
+             mock.patch.object(hwt, "git", side_effect=responses), \
+             mock.patch.object(hwt, "release_port"), \
+             contextlib.redirect_stdout(io.StringIO()):
+            hwt.cmd_cleanup(args, self.CFG, Path("/state"), fake)
+        return fake.call.call_args_list
+
+    def test_cleanup_restores_focus_to_where_it_was_run_from(self):
+        calls = self._refocus_run("w-home")
+        remove_index = calls.index(mock.call("worktree", "remove", "--workspace", "w2"))
+        focus_index = calls.index(mock.call("workspace", "focus", "w-home"))
+        self.assertLess(remove_index, focus_index)
+
+    def test_no_refocus_when_the_removed_workspace_was_focused(self):
+        calls = self._refocus_run("w2")
+        self.assertFalse([c for c in calls if c.args[:2] == ("workspace", "focus")])
 
     def test_git_identity_rejects_unrelated_checkout(self):
         cfg = {"worktree_root": "/approved"}
