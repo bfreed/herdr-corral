@@ -423,20 +423,42 @@ class LayoutTests(unittest.TestCase):
             "herdr", "workspace", "report-metadata", "w2", "--source",
             hwt.PLUGIN_ID, "--token", "dev_port=4180"])
 
-    def test_server_reminder_uses_live_pane_run_command(self):
+    def test_server_reminder_writes_to_pane_tty_without_echoing_a_command(self):
         api = hwt.Herdr("herdr")
-        with mock.patch.object(hwt, "run") as command:
+        process_info = mock.Mock(stdout=json.dumps(
+            {"result": {"process_info": {"shell_pid": 4242}}}))
+        with mock.patch.object(hwt, "run") as command, \
+                mock.patch.object(hwt.os, "readlink", return_value="/dev/pts/7") as link, \
+                mock.patch.object(hwt.os, "open", return_value=9) as opened, \
+                mock.patch.object(hwt.os, "write") as wrote, \
+                mock.patch.object(hwt.os, "close"):
+            command.side_effect = [mock.Mock(), process_info, mock.Mock()]
             api.show_reminder("w2:p3", "To start the development server, run: hwt dev")
+        link.assert_called_once_with("/proc/4242/fd/0")
+        opened.assert_called_once_with("/dev/pts/7", os.O_WRONLY | os.O_NOCTTY)
+        self.assertIn(b"To start the development server, run: hwt dev",
+                      wrote.call_args.args[1])
         self.assertEqual(command.call_args_list, [
             mock.call([
                 "herdr", "pane", "wait-output", "w2:p3", "--regex", "[$#%❯>] ?$",
                 "--source", "visible", "--lines", "5", "--timeout", "10000", "--raw",
             ]),
-            mock.call([
-                "herdr", "pane", "run", "w2:p3",
-                "printf '\\n%s\\n\\n' 'To start the development server, run: hwt dev'",
-            ]),
+            mock.call(["herdr", "pane", "process-info", "--pane", "w2:p3"]),
+            mock.call(["herdr", "pane", "send-keys", "w2:p3", "enter"]),
         ])
+
+    def test_server_reminder_falls_back_to_printf_when_tty_is_unavailable(self):
+        api = hwt.Herdr("herdr")
+        process_info = mock.Mock(stdout=json.dumps(
+            {"result": {"process_info": {"shell_pid": 4242}}}))
+        with mock.patch.object(hwt, "run") as command, \
+                mock.patch.object(hwt.os, "readlink", side_effect=OSError):
+            command.side_effect = [mock.Mock(), process_info, mock.Mock()]
+            api.show_reminder("w2:p3", "To start the development server, run: hwt dev")
+        self.assertEqual(command.call_args_list[-1], mock.call([
+            "herdr", "pane", "run", "w2:p3",
+            "printf '\\n%s\\n\\n' 'To start the development server, run: hwt dev'",
+        ]))
 
     def test_layout_is_idempotent_and_has_exactly_three_tabs(self):
         fake = hwt.FakeHerdrForTests()

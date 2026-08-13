@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.16.1 — 2026-08-13
+
+- Tab reminders no longer echo a `printf` command at the prompt: the message is written straight to the pane's tty (resolved via `pane process-info` + `/proc/<shell_pid>/fd/0`), styled dim so it reads as ambient guidance, followed by a bare Enter so the shell draws a fresh prompt below it. Hosts without `/proc` (macOS) automatically fall back to the previous printf-through-the-shell delivery.
+
 ## 0.16.0 — 2026-08-13
 
 - Tab guidance is back, richer, and robust: the `server` tab always gets a message on creation — `hwt dev` + the leased port + local/remote URLs when a dev command is configured, or a pointer to `hwt init` when not — and the `shell` tab gets orientation (`hwt -h`, how to open the palette, plus the init suggestion for unconfigured repos).

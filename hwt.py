@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.16.0"
+__version__ = "0.16.1"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -514,15 +514,40 @@ class Herdr:
     def show_reminder(self, pane_id: str, message: str) -> None:
         # Wait for a shell prompt (covering $, #, %, ❯ and > prompts); a missed
         # or slow reminder must never break the bootstrap, so failures are
-        # swallowed and the printf is attempted regardless.
+        # swallowed and delivery is attempted regardless.
         with contextlib.suppress(WorkflowError):
             run([
                 self.binary, "pane", "wait-output", pane_id, "--regex", "[$#%❯>] ?$",
                 "--source", "visible", "--lines", "5", "--timeout", "10000", "--raw",
             ])
+        if self._write_reminder_to_tty(pane_id, message):
+            return
         command = f"printf '\\n%s\\n\\n' {shlex.quote(message)}"
         with contextlib.suppress(WorkflowError):
             run([self.binary, "pane", "run", pane_id, command])
+
+    def _write_reminder_to_tty(self, pane_id: str, message: str) -> bool:
+        # Writing straight to the pane's tty displays the message without a
+        # command being typed and echoed at the prompt. Resolving the tty needs
+        # /proc, so non-Linux hosts return False and use the printf fallback.
+        try:
+            info = self.call("pane", "process-info", "--pane", pane_id)
+            shell_pid = int(info["result"]["process_info"]["shell_pid"])
+            tty = os.readlink(f"/proc/{shell_pid}/fd/0")
+            if not tty.startswith("/dev/"):
+                return False
+            fd = os.open(tty, os.O_WRONLY | os.O_NOCTTY)
+            try:
+                os.write(fd, f"\r\n\x1b[2m{message}\x1b[0m\r\n".encode())
+            finally:
+                os.close(fd)
+        except (WorkflowError, OSError, KeyError, TypeError, ValueError):
+            return False
+        # The shell doesn't know the cursor moved; a bare Enter makes it draw
+        # a fresh prompt below the message.
+        with contextlib.suppress(WorkflowError):
+            run([self.binary, "pane", "send-keys", pane_id, "enter"])
+        return True
 
 
 class FakeHerdrForTests:
