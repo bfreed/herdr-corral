@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.9.4"
+__version__ = "0.9.5"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -1037,14 +1037,43 @@ def cmd_status(args,cfg,state):
     print(json.dumps({"leases":rows},indent=2))
 
 
+def normalize_worktree_item(raw: dict[str, Any], repository: str) -> dict[str, Any]:
+    """Herdr's worktree schema varies; canonicalize and let git fill the gaps."""
+    item = dict(raw)
+    nested = raw.get("worktree")
+    if isinstance(nested, dict):
+        for key, value in nested.items():
+            item.setdefault(key, value)
+    if not isinstance(item.get("path"), str):
+        for key in ("worktree_path", "checkout_path", "cwd"):
+            if isinstance(item.get(key), str):
+                item["path"] = item[key]
+                break
+    path = item.get("path")
+    on_disk = isinstance(path, str) and Path(path).is_dir()
+    if not isinstance(item.get("branch"), str) and on_disk:
+        found = git(Path(path), "branch", "--show-current", check=False)
+        if found.returncode == 0 and found.stdout.strip():
+            item["branch"] = found.stdout.strip()
+    if "is_linked_worktree" not in item and on_disk:
+        common = git(Path(path), "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)
+        gitdir = git(Path(path), "rev-parse", "--path-format=absolute", "--git-dir", check=False)
+        if common.returncode == 0 and gitdir.returncode == 0:
+            item["is_linked_worktree"] = common.stdout.strip() != gitdir.stdout.strip()
+    item["repository"] = repository
+    return item
+
+
 def configured_worktree_items(cfg: dict[str, Any], herdr: Any) -> list[dict[str, Any]]:
     items = []
     for name, repo in cfg["repositories"].items():
         if repo.get("mode") != "worktree":
             continue
         result = herdr.call("worktree", "list", "--cwd", str(repo["path"]))["result"]
-        for item in result.get("worktrees", []):
-            items.append({**item, "repository": name})
+        raw_items = next((result[key] for key in ("worktrees", "items", "entries")
+                          if isinstance(result.get(key), list)), [])
+        for raw in raw_items:
+            items.append(normalize_worktree_item(raw, name))
     return items
 
 
@@ -1072,6 +1101,66 @@ def match_removal_items(items: list[dict[str, Any]], target: str) -> list[dict[s
     return matches
 
 
+def worktree_match_keys(item: dict[str, Any]) -> list[str]:
+    keys = [item.get("branch"), item.get("label")]
+    path = item.get("path")
+    if isinstance(path, str) and path:
+        keys.append(Path(path).name)
+    return [key for key in keys if isinstance(key, str) and key]
+
+
+def fuzzy_worktree_matches(items: list[dict[str, Any]], target: str) -> list[dict[str, Any]]:
+    import difflib
+    needle = target.lower()
+    hits = [item for item in items
+            if any(needle in key.lower() or key.lower() in needle
+                   for key in worktree_match_keys(item))]
+    if hits:
+        return hits
+    universe: dict[str, dict[str, Any]] = {}
+    for item in items:
+        for key in worktree_match_keys(item):
+            universe.setdefault(key, item)
+    ordered = []
+    for key in difflib.get_close_matches(target, list(universe), n=5, cutoff=0.5):
+        if universe[key] not in ordered:
+            ordered.append(universe[key])
+    return ordered
+
+
+def describe_worktree_item(item: dict[str, Any]) -> str:
+    branch = item.get("branch") or "(detached)"
+    return f"{item.get('repository', '?')}  {branch}  {item.get('path', '?')}"
+
+
+def choose_worktree_item(items: list[dict[str, Any]], target: str | None) -> dict[str, Any]:
+    linked = [item for item in items if item.get("is_linked_worktree", False)]
+    if target:
+        exact = match_removal_items(items, target)
+        if len(exact) == 1:
+            return exact[0]
+        if len(exact) > 1:
+            pool, header = exact, f"target {target!r} matches several worktrees"
+        else:
+            pool, header = fuzzy_worktree_matches(linked, target), f"no exact match for {target!r}; similar worktrees"
+    else:
+        pool, header = linked, "linked worktrees"
+    if not pool:
+        raise WorkflowError("no linked worktrees found; run 'hwt list' to inspect Herdr's view")
+    log(f"{header}:")
+    for index, item in enumerate(pool, 1):
+        log(f"  {index}. {describe_worktree_item(item)}")
+    if not sys.stdin.isatty():
+        raise WorkflowError("re-run with one of the listed branches or paths as the target")
+    answer = input("Number (Enter cancels): ").strip()
+    if not answer:
+        raise WorkflowError("cancelled")
+    try:
+        return pool[int(answer) - 1]
+    except (ValueError, IndexError):
+        raise WorkflowError(f"invalid selection: {answer!r}") from None
+
+
 def cmd_remove(args,cfg,state,herdr):
     target=args.target
     candidates=match_removal_items(configured_worktree_items(cfg, herdr), target)
@@ -1091,10 +1180,8 @@ def cmd_remove(args,cfg,state,herdr):
 
 
 def cmd_cleanup(args, cfg, state, herdr):
-    candidates = match_removal_items(configured_worktree_items(cfg, herdr), args.target)
-    if len(candidates) != 1:
-        raise WorkflowError("cleanup target must identify exactly one Herdr worktree")
-    result = cleanup_worktree_item(cfg, state, herdr, candidates[0],
+    item = choose_worktree_item(configured_worktree_items(cfg, herdr), args.target)
+    result = cleanup_worktree_item(cfg, state, herdr, item,
                                    abandon=args.abandon, confirm=args.confirm)
     print(json.dumps(result, indent=2))
 
@@ -1234,7 +1321,7 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("list"); sub.add_parser("status")
     d=sub.add_parser("dev",help="start the configured dev server on a leased port"); d.add_argument("--port",type=int)
     r=sub.add_parser("remove",help="remove a worktree, keeping its branch"); r.add_argument("target"); r.add_argument("--force",action="store_true"); r.add_argument("--confirm")
-    c=sub.add_parser("cleanup",help="delete worktree and branch (merged: no questions)"); c.add_argument("target"); c.add_argument("--abandon",action="store_true",help="delete even if unmerged or dirty (requires --confirm BRANCH)"); c.add_argument("--confirm")
+    c=sub.add_parser("cleanup",help="delete worktree and branch (merged: no questions)"); c.add_argument("target",nargs="?",help="branch, path, or worktree name; omit to pick from a list"); c.add_argument("--abandon",action="store_true",help="delete even if unmerged or dirty (requires --confirm BRANCH)"); c.add_argument("--confirm")
     sub.add_parser("doctor"); sub.add_parser("update",help="update Corral in place (git pull)")
     e=sub.add_parser("event",help=argparse.SUPPRESS)
     sub.add_parser("cleanup-workspace",help=argparse.SUPPRESS)

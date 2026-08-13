@@ -649,6 +649,72 @@ class RemovalTests(unittest.TestCase):
         hwt.check_remove_allowed(True, True, "feature/x", "feature/x")
 
 
+class WorktreeItemNormalizationTests(unittest.TestCase):
+    def test_nested_worktree_fields_and_checkout_path_are_flattened(self):
+        raw = {"workspace_id": "w3", "worktree": {
+            "checkout_path": "/somewhere/wt", "is_linked_worktree": True}}
+        item = hwt.normalize_worktree_item(raw, "demo")
+        self.assertEqual(item["path"], "/somewhere/wt")
+        self.assertTrue(item["is_linked_worktree"])
+        self.assertEqual(item["repository"], "demo")
+
+    def test_missing_branch_and_linkedness_are_derived_from_git(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            wt = Path(tmp)
+            responses = {
+                ("branch", "--show-current"): mock.Mock(stdout="worktree/quiet-harbor-af65\n", returncode=0),
+                ("rev-parse", "--path-format=absolute", "--git-common-dir"): mock.Mock(stdout="/repo/.git\n", returncode=0),
+                ("rev-parse", "--path-format=absolute", "--git-dir"): mock.Mock(stdout="/repo/.git/worktrees/x\n", returncode=0),
+            }
+            with mock.patch.object(hwt, "git", side_effect=lambda cwd, *a, **k: responses[a]):
+                item = hwt.normalize_worktree_item({"checkout_path": str(wt)}, "demo")
+        self.assertEqual(item["branch"], "worktree/quiet-harbor-af65")
+        self.assertTrue(item["is_linked_worktree"])
+
+
+class CleanupSelectionTests(unittest.TestCase):
+    ITEMS = [
+        {"branch": "worktree/quiet-harbor-af65", "is_linked_worktree": True,
+         "path": "/wts/katapult-lidar/worktree-quiet-harbor", "repository": "katapult-lidar",
+         "open_workspace_id": "w5"},
+        {"branch": "feature/other", "is_linked_worktree": True,
+         "path": "/wts/katapult-lidar/feature-other", "repository": "katapult-lidar",
+         "open_workspace_id": "w6"},
+        {"branch": "develop", "is_linked_worktree": False, "path": "/repo", "repository": "katapult-lidar"},
+    ]
+
+    def test_exact_match_needs_no_interaction(self):
+        item = hwt.choose_worktree_item([dict(x) for x in self.ITEMS], "worktree/quiet-harbor-af65")
+        self.assertEqual(item["open_workspace_id"], "w5")
+
+    def test_partial_target_finds_similar_worktrees(self):
+        matches = hwt.fuzzy_worktree_matches([dict(x) for x in self.ITEMS[:2]], "quiet-harbor-af65")
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["branch"], "worktree/quiet-harbor-af65")
+        matches = hwt.fuzzy_worktree_matches([dict(x) for x in self.ITEMS[:2]], "worktree-quiet-harbor-af65")
+        self.assertEqual(len(matches), 1)
+
+    def test_no_target_with_tty_offers_numbered_choice(self):
+        with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: True)), \
+             mock.patch("builtins.input", return_value="2"):
+            item = hwt.choose_worktree_item([dict(x) for x in self.ITEMS], None)
+        self.assertEqual(item["branch"], "feature/other")
+
+    def test_without_tty_lists_candidates_and_refuses(self):
+        logged = []
+        with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: False)), \
+             mock.patch.object(hwt, "log", side_effect=logged.append):
+            with self.assertRaisesRegex(hwt.WorkflowError, "re-run with one of the listed"):
+                hwt.choose_worktree_item([dict(x) for x in self.ITEMS], "quiet-harbor")
+        self.assertTrue(any("worktree/quiet-harbor-af65" in line for line in logged))
+
+    def test_unlinked_worktrees_are_never_offered(self):
+        with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: False)), \
+             mock.patch.object(hwt, "log"):
+            with self.assertRaises(hwt.WorkflowError):
+                hwt.choose_worktree_item([dict(self.ITEMS[2])], None)
+
+
 class WorkspaceCleanupActionTests(unittest.TestCase):
     ITEM = {
         "branch": "feature/x", "is_linked_worktree": True,
