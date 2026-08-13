@@ -1,0 +1,24 @@
+id = "corral"
+name = "Corral"
+version = "0.9.0"
+min_herdr_version = "0.8.0"
+description = "Herd your Git worktrees: env files, dependencies, agent/shell/server tabs, and merge-safe cleanup"
+platforms = ["linux", "macos"]
+
+[[events]]
+on = "worktree.created"
+command = ["python3", "hwt.py", "event"]
+
+[[events]]
+on = "worktree.opened"
+command = ["python3", "hwt.py", "event"]
+
+[[events]]
+on = "worktree.removed"
+command = ["python3", "hwt.py", "event"]
+
+[[actions]]
+id = "status"
+title = "Worktree status"
+contexts = ["workspace"]
+command = ["python3", "hwt.py", "status"]

@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+"""Install Corral for the current user. Run this from a git clone of the repo;
+the clone itself is the installation, which is what lets `hwt update` work."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+PLUGIN_ID = "corral"
+
+
+def quote(value: str) -> str:
+    return json.dumps(value)
+
+
+def git_output(repo: Path, *args: str) -> str | None:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args], text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def discover_repositories(root: Path) -> list[tuple[str, Path, str]]:
+    found = []
+    if not root.is_dir():
+        return found
+    for path in sorted(root.iterdir()):
+        if not path.is_dir() or path.name.startswith("."):
+            continue
+        top = git_output(path, "rev-parse", "--show-toplevel")
+        if not top or Path(top).resolve() != path.resolve():
+            continue
+        remote_head = git_output(path, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
+        base = remote_head.removeprefix("refs/remotes/") if remote_head else None
+        if not base:
+            current = git_output(path, "branch", "--show-current") or "main"
+            base = f"origin/{current}"
+        found.append((path.name, path.resolve(), base))
+    return found
+
+
+def render_config(repos_root: Path, worktree_root: Path, repos: list[tuple[str, Path, str]],
+                  dev_host: str, remote_host: str, agent_kind: str) -> str:
+    lines = [
+        f"canonical_root = {quote(str(repos_root.resolve()))}",
+        f"worktree_root = {quote(str(worktree_root.resolve()))}",
+        "additional_worktree_roots = []",
+        f"dev_host = {quote(dev_host)}",
+        f"remote_host = {quote(remote_host)}",
+        f"agent_kind = {quote(agent_kind)}",
+        "",
+        "[ports]",
+        "start = 4100",
+        "end = 4199",
+        "",
+        "# Repositories without an explicit `files` list get untracked .env / .env.*",
+        "# files copied into new worktrees, and dependencies default to policy",
+        '# "auto" (lockfile-detected install). Run `hwt init` inside a repository',
+        "# to refine its settings; that writes an overlay under repos.d/.",
+    ]
+    for name, path, base in repos:
+        lines += [
+            "",
+            f"[repositories.{quote(name)}]",
+            f"path = {quote(str(path))}",
+            'mode = "worktree"',
+            f"base_branch = {quote(base)}",
+            'remote = "origin"',
+            "fetch = true",
+            "start_agent = true",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+def run_checked(argv: list[str]) -> None:
+    result = subprocess.run(argv)
+    if result.returncode:
+        raise SystemExit(f"command failed ({result.returncode}): {' '.join(argv)}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repos-root", type=Path, default=Path.home() / "repos")
+    parser.add_argument("--worktree-root", type=Path)
+    parser.add_argument("--dev-host", default="127.0.0.1")
+    parser.add_argument("--remote-host", default="")
+    parser.add_argument("--agent-kind", default="hermes",
+                        help="agent started in the 'agent' tab (default: hermes)")
+    parser.add_argument("--force-config", action="store_true")
+    parser.add_argument("--skip-plugin", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+
+    source = Path(__file__).resolve().parent
+    if not (source / ".git").exists():
+        print("warning: this is not a git clone; `hwt update` will not work", file=sys.stderr)
+    repos_root = args.repos_root.expanduser().resolve()
+    if not repos_root.is_dir():
+        parser.error(f"repository root does not exist: {repos_root}")
+    worktree_root = (args.worktree_root or (repos_root / ".worktrees")).expanduser()
+    worktree_root.mkdir(parents=True, exist_ok=True)
+    worktree_root = worktree_root.resolve()
+
+    bin_dir = Path.home() / ".local/bin"
+    config_dir = Path.home() / ".config/herdr-corral"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "repos.d").mkdir(exist_ok=True)
+
+    launcher = bin_dir / "hwt"
+    launcher.write_text(f'#!/bin/sh\nexec python3 "{source / "hwt.py"}" "$@"\n')
+    launcher.chmod(0o755)
+
+    config = config_dir / "config.toml"
+    repos = discover_repositories(repos_root)
+    if config.exists() and not args.force_config:
+        config_result = "preserved existing configuration"
+    else:
+        if config.exists():
+            backup = config.with_suffix(".toml.bak")
+            shutil.copy2(config, backup)
+        config.write_text(render_config(repos_root, worktree_root, repos,
+                                        args.dev_host, args.remote_host, args.agent_kind))
+        config.chmod(0o600)
+        config_result = f"configured {len(repos)} repositories"
+
+    if not args.skip_plugin:
+        if shutil.which("herdr") is None:
+            raise SystemExit("Herdr is not on PATH; install Herdr, then rerun this installer")
+        subprocess.run(["herdr", "plugin", "unlink", PLUGIN_ID], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL)
+        run_checked(["herdr", "plugin", "link", str(source), "--enabled"])
+
+    print(f"Installed the hwt launcher at {launcher} (running from {source})")
+    print(f"Configuration: {config} ({config_result})")
+    print(f"Discovered repositories: {', '.join(name for name, _, _ in repos) or '(none)'}")
+    if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
+        print(f"Add {bin_dir} to PATH before using hwt")
+    print("Next: review config.toml, then run: hwt doctor")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
