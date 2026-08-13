@@ -23,6 +23,21 @@ For every configured repository and each of its worktrees, Herdr gets exactly th
 5. Never add a tests tab. Never auto-start a dev server.
 6. Do not run `hwt cleanup` to "test" the installation; it deletes branches. Use `hwt open` for verification.
 
+## Step 0 — outline the plan before your first command
+
+Before running anything, send the user a brief outline (about 6 lines — no more) of what is coming, flagging what their harness may ask them to approve:
+
+> Here's the plan:
+> 1. Check prerequisites and scan for your repository folders — read-only commands.
+> 2. Ask you a few setup questions, one at a time.
+> 3. Clone Corral to `~/.local/share/herdr-corral` and run its installer — writes only to `~/.local/bin`, `~/.config/herdr-corral`, and registers the Herdr plugin.
+> 4. Run Corral's test suite and verify the plugin — read-only, plus one test workspace you approve first.
+> 5. Only with your OK: edit Herdr's config if you pick a custom worktree location.
+>
+> Your harness may ask you to approve some of these commands as we go.
+
+From then on, whenever a command is likely to trigger an approval prompt, say in one short line what it does and whether it changes anything — e.g. "Scanning your home folder for Git repositories — read-only." — before running it.
+
 ## Step 1 — prerequisites
 
 Verify, and report anything missing to the user before continuing:
