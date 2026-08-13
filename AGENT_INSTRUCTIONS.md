@@ -1,6 +1,8 @@
 # Agent instructions: install Corral on this machine
 
-You are an AI coding agent installing Corral — a Herdr plugin and `hwt` CLI for Git-worktree workflows — for the user who pointed you at this file. Follow these instructions exactly; where they say to ask the user, ask instead of guessing.
+You are an AI coding agent installing Corral — a Herdr plugin and `hwt` CLI for Git-worktree workflows — for the user who pointed you at this file.
+
+These instructions define **what** to accomplish and the safety rules that are non-negotiable. For **how** to converse, use your harness's best affordances and your own judgment: ask one question at a time, prefer structured pickers over freeform prompts, and investigate the machine first so you offer detected options instead of making the user type. Where the instructions say to ask the user, ask instead of guessing.
 
 ## What you are installing
 
@@ -32,14 +34,20 @@ Verify, and report anything missing to the user before continuing:
 
 If Herdr is missing, install it per its current official instructions (https://herdr.dev). Do not invent commands.
 
-## Step 2 — ask the user
+## Step 2 — interview the user
 
-Ask these questions (suggest the defaults):
+How you ask matters as much as what you ask:
 
-1. **Where do your Git repositories live?** (default `~/repos` — one parent directory whose immediate children are repositories)
-2. **Where should worktrees go?** (default: `<repo>__worktrees/` next to each repository — Herdr's native layout; existing `<repo>__worktrees/` directories are recognized automatically. Only if the user prefers one collected location, set `worktree_placement = "shared-root"` in the config and pass `--worktree-root`.)
-3. **Should dev servers be reachable from other machines?** If yes, ask for the hostname/DNS name others should use → `--dev-host 0.0.0.0 --remote-host <name>`. If no, omit both (localhost only).
-4. **Which agent should start in the `agent` tab?** (default `hermes`; any kind accepted by `herdr agent start --kind`)
+- Ask **one question per turn**. Wait for the answer before the next question.
+- If your harness has a structured question tool (a multiple-choice picker with an "other/custom" option), use it for every question. Without one, present short numbered options the user can answer with a number.
+- **Investigate before you ask**, so every question offers concrete detected options instead of a freeform prompt.
+
+The questions, each with the detective work to do first:
+
+1. **Where do your Git repositories live?** First scan for plausible parents — `~/repos`, `~/code`, `~/src`, `~/dev`, `~/projects`, `~/GitRepos`, `~/Documents/GitRepos`, and anything else you find under `$HOME` whose immediate children include several Git repositories. Offer the candidates you found (with their repo counts) plus a custom-path option.
+2. **Where should worktrees go?** Offer: (a) `<repo>__worktrees/` next to each repository — the default and Herdr's native layout; existing `__worktrees` directories are recognized automatically; or (b) one collected folder → set `worktree_placement = "shared-root"` in the config and pass `--worktree-root`.
+3. **Should dev servers be reachable from other machines?** Detect the machine's names first: if `tailscale` is on PATH, get the DNS name from `tailscale status --json` (`.Self.DNSName`) or `tailscale ip -4`; also consider `hostname -f`. Offer: localhost only (default), each detected name, or a custom hostname. Anything except localhost-only → `--dev-host 0.0.0.0 --remote-host <name>`.
+4. **Which agent should start in the `agent` tab?** Check PATH for common agent CLIs (`hermes`, `claude`, `codex`, `grok`, `opencode`, …) and offer the ones actually installed (default `hermes` when present), plus "none". Before passing `--agent-kind`, confirm the value is a kind `herdr agent start --kind` accepts (check `herdr agent start --help`; a CLI name is not automatically a valid kind). For "none", install with the default and then set `start_agent = false` on the repositories in `config.toml`.
 
 ## Step 3 — install
 
