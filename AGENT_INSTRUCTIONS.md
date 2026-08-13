@@ -37,7 +37,7 @@ If Herdr is missing, install it per its current official instructions (https://h
 Ask these questions (suggest the defaults):
 
 1. **Where do your Git repositories live?** (default `~/repos` — one parent directory whose immediate children are repositories)
-2. **Where should worktrees go?** (default `<repos-root>/.worktrees`)
+2. **Where should worktrees go?** (default: `<repo>__worktrees/` next to each repository — Herdr's native layout; existing `<repo>__worktrees/` directories are recognized automatically. Only if the user prefers one collected location, set `worktree_placement = "shared-root"` in the config and pass `--worktree-root`.)
 3. **Should dev servers be reachable from other machines?** If yes, ask for the hostname/DNS name others should use → `--dev-host 0.0.0.0 --remote-host <name>`. If no, omit both (localhost only).
 4. **Which agent should start in the `agent` tab?** (default `hermes`; any kind accepted by `herdr agent start --kind`)
 

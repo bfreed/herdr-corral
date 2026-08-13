@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.2 — 2026-08-13
+
+- Corral now understands the native Herdr/workmux worktree layout: `<repo>__worktrees/` directories next to each configured repository are approved and repo-mapped automatically, so pre-existing worktrees there get bootstrapped by events and are addressable by `hwt open`/`remove`/`cleanup`.
+- New global setting `worktree_placement` (default `"sibling"`): `hwt new` creates worktrees in `<repo>__worktrees/`; `"shared-root"` restores the `worktree_root/<repo>/` layout.
+- `hwt open <name>` also matches worktree directory names verbatim, not only hwt's hashed slugs.
+
 ## 0.9.1 — 2026-08-13
 
 Fixes from the first field install.

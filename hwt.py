@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -593,8 +593,15 @@ def check_remove_allowed(dirty: bool, force: bool, confirmation: str | None, bra
         raise WorkflowError(f"force removal requires --confirm {branch!r}")
 
 
+def sibling_worktree_dir(repo_path: Path) -> Path:
+    """Native Herdr/workmux convention: worktrees in <repo>__worktrees next to the repo."""
+    return repo_path.parent / f"{repo_path.name}__worktrees"
+
+
 def approved_worktree_roots(cfg: dict[str, Any]) -> list[Path]:
     roots = [Path(cfg["worktree_root"]), *map(Path, cfg.get("additional_worktree_roots", []))]
+    roots += [sibling_worktree_dir(Path(repo["path"]))
+              for repo in cfg.get("repositories", {}).values() if "path" in repo]
     return [root.resolve() for root in roots]
 
 
@@ -609,6 +616,12 @@ def repo_for_worktree(cfg: dict[str, Any], path: Path) -> tuple[str, dict[str, A
     if not any(is_within(target, root) for root in approved):
         joined = ", ".join(map(str, approved))
         raise SafetyError(f"refusing path outside approved worktree roots [{joined}]: {target}")
+    for name, repo in cfg["repositories"].items():
+        if "path" not in repo:
+            continue
+        sibling = sibling_worktree_dir(Path(repo["path"])).resolve()
+        if sibling.exists() and is_within(target, sibling):
+            return name, repo, resolve_existing(Path(repo["path"]))
     for root in approved:
         for name, repo in cfg["repositories"].items():
             repo_root = root / name
@@ -870,10 +883,18 @@ def cmd_new(args, cfg, state, herdr: Herdr):
     run(["git","check-ref-format","--branch",branch])
     if repo.get("fetch",True): fetch_with_offline_fallback(canonical,repo.get("remote","origin"))
     canonical_workspace = ensure_canonical_workspace(herdr, canonical, name, False)
-    path=Path(cfg["worktree_root"])/name/branch_slug(branch)
-    created_namespace = not path.parent.exists()
-    path.parent.mkdir(parents=True,exist_ok=True)
-    require_within(path.parent,Path(cfg["worktree_root"]))
+    placement = cfg.get("worktree_placement", "sibling")
+    if placement == "sibling":
+        parent = sibling_worktree_dir(canonical)
+    elif placement == "shared-root":
+        parent = Path(cfg["worktree_root"]) / name
+    else:
+        raise WorkflowError(f"unknown worktree_placement: {placement!r} (use \"sibling\" or \"shared-root\")")
+    path = parent / branch_slug(branch)
+    created_namespace = not parent.exists()
+    parent.mkdir(parents=True,exist_ok=True)
+    if placement == "shared-root":
+        require_within(parent,Path(cfg["worktree_root"]))
     command=["worktree","create","--workspace",canonical_workspace,"--cwd",str(canonical),"--branch",branch,"--base",base,"--path",str(path),"--label",f"{name}: {branch}","--no-focus" if args.background else "--focus"]
     try:
         obj=herdr.call(*command)
@@ -938,10 +959,14 @@ def cmd_open(args,cfg,state,herdr:Herdr):
     if token.exists(): path=resolve_existing(token)
     else:
         matches=[]
+        wanted = {args.target}
+        with contextlib.suppress(SafetyError):
+            wanted.add(branch_slug(args.target))
         for name,repo in cfg["repositories"].items():
             if args.target==name: matches.append(Path(repo["path"]))
-            wtroot=Path(cfg["worktree_root"])/name
-            if wtroot.exists(): matches += [p for p in wtroot.iterdir() if p.name==branch_slug(args.target)]
+            candidates = [Path(cfg["worktree_root"])/name, sibling_worktree_dir(Path(repo["path"]))]
+            for wtroot in candidates:
+                if wtroot.exists(): matches += [p for p in wtroot.iterdir() if p.name in wanted]
         if len(matches)!=1: raise WorkflowError(f"target did not resolve uniquely: {args.target}")
         path=resolve_existing(matches[0])
     try:
