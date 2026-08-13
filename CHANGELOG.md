@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.2 — 2026-08-13
+
+- Worktrees created by `hwt new` (and reopened by `hwt open`) now display in Herdr's sidebar exactly like right-click-created ones: just the branch name. We stopped passing `--label` — an explicit label becomes the workspace's `custom_name`, which disables Herdr's branch-derived display (verified in `ui/sidebar.rs::grouped_child_display_label`), and our `"repo: branch"` labels ate the whole panel width with the repo prefix.
+
 ## 0.15.1 — 2026-08-13
 
 - Base-branch candidates fixed and reordered: the canonical checkout's own branch is no longer excluded (having `develop` checked out in the main clone was hiding `origin/develop` — the most wanted base), only branches checked out in *linked* worktrees are; and plain main-line names (`develop`, `main`, `staging`) sort before slash-namespaced topic branches so they always make the top-10 cut.

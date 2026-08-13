@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.15.1"
+__version__ = "0.15.2"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -1122,7 +1122,9 @@ def cmd_new(args, cfg, state, herdr: Herdr):
     if placement == "shared-root":
         require_within(parent,Path(cfg["worktree_root"]))
     # herdr rejects --workspace together with --cwd; the workspace anchors the repo.
-    command=["worktree","create","--workspace",canonical_workspace,"--branch",branch,"--base",base,"--path",str(path),"--label",f"{name}: {branch}","--no-focus" if args.background else "--focus"]
+    # No --label: a label becomes the workspace's custom_name, which disables
+    # Herdr's branch-derived sidebar display (strip_prefix("worktree/")).
+    command=["worktree","create","--workspace",canonical_workspace,"--branch",branch,"--base",base,"--path",str(path),"--no-focus" if args.background else "--focus"]
     try:
         obj=herdr.call(*command)
     except WorkflowError:
@@ -1301,7 +1303,7 @@ def cmd_open(args,cfg,state,herdr:Herdr):
         ensure_canonical_layout(herdr, workspace, path, name, bool(repo.get("start_agent", False)), cfg.get("agent_kind", "hermes"))
         print(json.dumps({"workspace_id":workspace,"path":str(path),"repository":name},indent=2))
     else:
-        obj=herdr.call("worktree","open","--cwd",str(Path(repo["path"])),"--path",str(path),"--label",f"{name}: {path.name}","--focus")
+        obj=herdr.call("worktree","open","--cwd",str(Path(repo["path"])),"--path",str(path),"--focus")
         workspace=obj["result"]["workspace"]["workspace_id"]
         print(json.dumps(bootstrap(cfg,state,path,workspace,herdr),indent=2))
 

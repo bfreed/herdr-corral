@@ -1153,6 +1153,9 @@ class BaseRefTests(unittest.TestCase):
         self.assertEqual(created[:2], ("worktree", "create"))
         self.assertNotIn("--cwd", created)
         self.assertIn("--workspace", created)
+        # A label would become custom_name and disable Herdr's branch-derived
+        # sidebar display; the branch itself must be what the sidebar shows.
+        self.assertNotIn("--label", created)
 
     def test_run_failure_message_includes_stderr(self):
         with mock.patch.object(hwt.subprocess, "run",
