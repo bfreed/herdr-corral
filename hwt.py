@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.13.0"
+__version__ = "0.14.0"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -937,6 +937,28 @@ def cmd_update(args) -> None:
                       "version": current, "up_to_date": current == previous}, indent=2))
 
 
+def ref_exists(repo: Path, ref: str) -> bool:
+    return git(repo, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False).returncode == 0
+
+
+def remote_base_candidates(canonical: Path, remote: str) -> list[str]:
+    """Remote branches by recency, excluding HEAD and branches checked out in a worktree."""
+    result = git(canonical, "for-each-ref", "--sort=-committerdate",
+                 "--format=%(refname:short)", f"refs/remotes/{remote}", check=False)
+    if result.returncode:
+        return []
+    branches = [line.strip() for line in result.stdout.splitlines()
+                if line.strip() and not line.strip().endswith("/HEAD")]
+    used: set[str] = set()
+    worktrees = git(canonical, "worktree", "list", "--porcelain", check=False)
+    if worktrees.returncode == 0:
+        for line in worktrees.stdout.splitlines():
+            if line.startswith("branch refs/heads/"):
+                used.add(line.removeprefix("branch refs/heads/").strip())
+    return [branch for branch in branches
+            if "/" in branch and branch.split("/", 1)[1] not in used]
+
+
 def interactive_new_setup(args, cfg: dict[str, Any]) -> None:
     """Fill in branch/base/repo by asking, using where we're standing as context."""
     if not sys.stdin.isatty():
@@ -981,15 +1003,23 @@ def interactive_new_setup(args, cfg: dict[str, Any]) -> None:
         offer(context_branch, "this worktree's branch — stack on top of it")
     else:
         offer(configured_base, "configured base")
+    canonical_path = Path(repo["path"])
+    if canonical_path.is_dir():
+        for candidate in remote_base_candidates(canonical_path, repo.get("remote", "origin"))[:10]:
+            offer(candidate, "remote branch")
     lines = [f"  {index:>2}. {ref}  " + colorize(f"({note})", "2")
              for index, (ref, note) in enumerate(options, 1)]
     lines.append(f"  {len(options) + 1:>2}. other (type a ref)")
     base_index = choose_indexed(lines, len(options) + 1,
                                 f"base branch for the new worktree in {repo_name}")
     if base_index == len(options):
-        base = input("Base ref: ").strip()
-        if not base:
-            raise WorkflowError("cancelled")
+        while True:
+            base = input("Base ref (empty cancels): ").strip()
+            if not base:
+                raise WorkflowError("cancelled")
+            if not canonical_path.is_dir() or ref_exists(canonical_path, base):
+                break
+            print(f"no such ref here: {base!r} — check the listing above for the exact name")
     else:
         base = options[base_index][0]
     branch = input("New branch name: ").strip()
@@ -1023,6 +1053,10 @@ def cmd_new(args, cfg, state, herdr: Herdr):
     canonical=resolve_existing(Path(repo["path"])); branch=args.branch; base=args.base or repo.get("base_branch","main")
     run(["git","check-ref-format","--branch",branch])
     if repo.get("fetch",True): fetch_with_offline_fallback(canonical,repo.get("remote","origin"))
+    # Validate before anything is created; a typo'd base would otherwise fail
+    # somewhere mid-creation, possibly after the workspace exists.
+    if not ref_exists(canonical, base):
+        raise WorkflowError(f"base ref does not exist (even after fetch): {base!r}")
     canonical_workspace = ensure_canonical_workspace(herdr, canonical, name, False)
     placement = cfg.get("worktree_placement", "shared-root")
     if placement == "sibling":

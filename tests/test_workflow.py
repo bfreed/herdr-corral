@@ -1033,6 +1033,51 @@ class InteractiveNewTests(unittest.TestCase):
                 hwt.interactive_new_setup(args, self.CFG)
 
 
+class BaseRefTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = Path(self.tmp.name)
+        self.repo = self.root / "demo"
+        self.repo.mkdir()
+        hwt.git(self.repo.parent, "init", "-q", str(self.repo))
+        (self.repo / "f").write_text("x")
+        hwt.git(self.repo, "add", "f")
+        hwt.git(self.repo, "-c", "user.email=t@example.invalid", "-c", "user.name=T",
+                "-c", "commit.gpgsign=false", "commit", "-q", "-m", "c")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_ref_exists(self):
+        self.assertTrue(hwt.ref_exists(self.repo, "HEAD"))
+        self.assertFalse(hwt.ref_exists(self.repo, "dev"))
+
+    def test_remote_candidates_exclude_head_and_worktree_branches(self):
+        for name in ("develop", "feature/x", "used-branch"):
+            hwt.git(self.repo, "update-ref", f"refs/remotes/origin/{name}", "HEAD")
+        hwt.git(self.repo, "update-ref", "refs/remotes/origin/HEAD", "HEAD")
+        hwt.git(self.repo, "worktree", "add", "-q", str(self.root / "wt"), "-b", "used-branch")
+        names = hwt.remote_base_candidates(self.repo, "origin")
+        self.assertIn("origin/develop", names)
+        self.assertIn("origin/feature/x", names)
+        self.assertNotIn("origin/HEAD", names)
+        self.assertNotIn("origin/used-branch", names)
+
+    def test_cmd_new_rejects_nonexistent_base_before_touching_herdr(self):
+        worktrees = self.root / ".wts"
+        worktrees.mkdir()
+        cfg = {"canonical_root": str(self.root), "worktree_root": str(worktrees),
+               "repositories": {"demo": {"path": str(self.repo), "mode": "worktree",
+                                         "fetch": False}}}
+        args = type("Args", (), {"branch": "feature/x", "base": "dev", "repo": str(self.repo),
+                                 "background": True, "config": Path("/nonexistent")})()
+        fake = mock.Mock()
+        with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: False)):
+            with self.assertRaisesRegex(hwt.WorkflowError, "base ref does not exist"):
+                hwt.cmd_new(args, cfg, self.root / "state", fake)
+        fake.call.assert_not_called()
+
+
 class OpenPickerTests(unittest.TestCase):
     CFG = {"repositories": {
         "demo": {"path": "/canon/demo", "mode": "worktree"},

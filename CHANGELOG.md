@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.14.0 — 2026-08-13
+
+- The `hwt new` base picker also lists the repository's remote branches (up to 10, newest first, excluding `HEAD` and branches already checked out in a worktree).
+- Base refs are validated: a typed "other" ref is checked on the spot with a re-prompt, and `hwt new`/`--base` verify the ref exists (after the fetch) before anything is created — no more half-created worktrees from a typo like `dev`.
+
 ## 0.13.0 — 2026-08-13
 
 - `hwt new` with no arguments is now interactive and context-aware: inside a canonical repository it offers that checkout's current branch as the default base; inside a worktree it defaults to the configured base (a sibling worktree) with the option to stack the new branch on the current worktree's branch; outside any repository it offers a numbered repository picker, then a base picker, then prompts for the branch name.
