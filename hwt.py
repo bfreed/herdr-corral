@@ -46,7 +46,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.17.0"
+__version__ = "0.17.1"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -1607,6 +1607,31 @@ SAFETY_LABELS = {
 }
 
 
+def branch_disposition(repo: dict[str, Any], canonical: Path, branch: str) -> dict[str, Any]:
+    """Merge/uniqueness verdict for a branch, from currently-known refs.
+
+    Fetching first is the caller's business: the palette annotates from local
+    refs, while cleanup and teardown fetch before deciding. unique_commits
+    counts only commits that would survive nowhere if the local branch and its
+    own remote copy both vanished — cleanup deletes the pair, and teardown
+    offers the remote copy as a follow-up deletion — so a fresh, fully
+    cherry-picked, or rebased-elsewhere branch loses nothing. A failed probe
+    counts as unique: errors may block a deletion, never excuse one."""
+    remote = repo.get("remote", "origin")
+    base_branch = repo.get("base_branch", f"{remote}/main")
+    branch_ref = f"refs/heads/{branch}"
+    merged = "/" in base_branch and git(canonical, "merge-base", "--is-ancestor", branch_ref,
+                                        f"refs/remotes/{base_branch}", check=False).returncode == 0
+    unique = False
+    if not merged:
+        probe = git(canonical, "rev-list", "-n", "1", branch_ref, "--not",
+                    f"--exclude={branch_ref}", f"--exclude=refs/remotes/{remote}/{branch}",
+                    "--all", check=False)
+        unique = bool(probe.returncode) or bool(probe.stdout.strip())
+    return {"remote": remote, "base_branch": base_branch, "branch_ref": branch_ref,
+            "merged": merged, "unique_commits": unique}
+
+
 def worktree_safety(cfg: dict[str, Any], item: dict[str, Any]) -> str:
     """Advisory annotation from local refs; cleanup itself re-verifies after a fetch."""
     branch = item.get("branch")
@@ -1619,19 +1644,10 @@ def worktree_safety(cfg: dict[str, Any], item: dict[str, Any]) -> str:
     repo_path = repo.get("path")
     if not repo_path:
         return "unknown"
-    canonical = Path(repo_path)
-    remote = repo.get("remote", "origin")
-    base_branch = repo.get("base_branch", f"{remote}/main")
-    branch_ref = f"refs/heads/{branch}"
-    if "/" in base_branch and git(canonical, "merge-base", "--is-ancestor", branch_ref,
-                                  f"refs/remotes/{base_branch}", check=False).returncode == 0:
+    verdict = branch_disposition(repo, Path(repo_path), branch)
+    if verdict["merged"]:
         return "merged"
-    probe = git(canonical, "rev-list", "-n", "1", branch_ref, "--not",
-                f"--exclude={branch_ref}", f"--exclude=refs/remotes/{remote}/{branch}",
-                "--all", check=False)
-    if probe.returncode == 0 and not probe.stdout.strip():
-        return "no-unique-commits"
-    return "unpublished-work"
+    return "unpublished-work" if verdict["unique_commits"] else "no-unique-commits"
 
 
 SAFETY_COLORS = {"merged": "32", "no-unique-commits": "32",
@@ -1812,7 +1828,7 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
     base_branch = repo.get("base_branch", f"{remote}/main")
     if "/" not in base_branch:
         raise WorkflowError("cleanup base_branch must name a remote-tracking branch")
-    base_remote, base_name = base_branch.split("/", 1)
+    base_remote = base_branch.split("/", 1)[0]
     if base_remote != remote:
         raise WorkflowError("cleanup base_branch remote does not match configured remote")
     if branch in protected_branches(repo):
@@ -1827,21 +1843,13 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
         # Fetch and prove the merge before any deletion. Authentication failures
         # therefore leave the remote, checkout, branch, and lease untouched.
         git(canonical, "fetch", remote, "--prune")
+        verdict = branch_disposition(repo, canonical, branch)
+        merged = verdict["merged"]
+        if not merged and not abandon and verdict["unique_commits"]:
+            raise WorkflowError(
+                f"branch {branch} is not merged into {base_branch} and has commits not "
+                f"available on any other branch; rerun with --abandon --confirm {branch} to delete it anyway")
         branch_ref = f"refs/heads/{branch}"
-        base_ref = f"refs/remotes/{remote}/{base_name}"
-        merged = git(canonical, "merge-base", "--is-ancestor", branch_ref, base_ref, check=False).returncode == 0
-        if not merged and not abandon:
-            # The guard protects commits that exist nowhere else. A branch whose
-            # every commit is reachable from some other ref (fresh branch, or
-            # fully cherry-picked/rebased elsewhere) loses nothing when deleted.
-            # Its own remote copy does not count: cleanup deletes that too.
-            probe = git(canonical, "rev-list", "-n", "1", branch_ref, "--not",
-                        f"--exclude={branch_ref}", f"--exclude=refs/remotes/{remote}/{branch}",
-                        "--all", check=False)
-            if probe.returncode or probe.stdout.strip():
-                raise WorkflowError(
-                    f"branch {branch} is not merged into {base_branch} and has commits not "
-                    f"available on any other branch; rerun with --abandon --confirm {branch} to delete it anyway")
         remote_ref = f"refs/remotes/{remote}/{branch}"
         remote_exists = git(canonical, "show-ref", "--verify", "--quiet", remote_ref, check=False).returncode == 0
         suppress_teardown(state, str(path))
@@ -1882,8 +1890,6 @@ def teardown_status(repo: dict[str, Any], canonical: Path, branch: str) -> dict[
     GitHub merge-then-delete flow) from one that was never pushed. Offline,
     the remote cannot be checked and the state is "unknown"."""
     remote = repo.get("remote", "origin")
-    base_branch = repo.get("base_branch", f"{remote}/main")
-    branch_ref = f"refs/heads/{branch}"
     tracking_ref = f"refs/remotes/{remote}/{branch}"
     had_tracking = git(canonical, "show-ref", "--verify", "--quiet", tracking_ref, check=False).returncode == 0
     fetched = git(canonical, "fetch", remote, "--prune", check=False).returncode == 0
@@ -1891,11 +1897,6 @@ def teardown_status(repo: dict[str, Any], canonical: Path, branch: str) -> dict[
         remote_exists = git(canonical, "show-ref", "--verify", "--quiet", tracking_ref, check=False).returncode == 0
     else:
         remote_exists = had_tracking
-    merged = "/" in base_branch and git(canonical, "merge-base", "--is-ancestor", branch_ref,
-                                        f"refs/remotes/{base_branch}", check=False).returncode == 0
-    probe = git(canonical, "rev-list", "-n", "1", branch_ref, "--not",
-                f"--exclude={branch_ref}", f"--exclude={tracking_ref}", "--all", check=False)
-    unique = bool(probe.returncode) or bool(probe.stdout.strip())
     if not fetched:
         remote_state = "unknown"
     elif remote_exists:
@@ -1904,8 +1905,8 @@ def teardown_status(repo: dict[str, Any], canonical: Path, branch: str) -> dict[
         remote_state = "deleted"
     else:
         remote_state = "never-pushed"
-    return {"remote": remote, "base_branch": base_branch, "merged": merged,
-            "unique_commits": unique, "remote_state": remote_state, "fetched": fetched}
+    return {**branch_disposition(repo, canonical, branch),
+            "remote_state": remote_state, "fetched": fetched}
 
 
 def teardown_advice(branch: str, status: dict[str, Any]) -> list[str]:

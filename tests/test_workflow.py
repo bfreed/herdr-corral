@@ -573,6 +573,7 @@ class RemovalTests(unittest.TestCase):
             mock.Mock(stdout=" M app.py\n", returncode=0),   # status: dirty
             mock.Mock(stdout="", returncode=0),               # fetch
             mock.Mock(stdout="", returncode=1),               # merge-base: NOT merged
+            mock.Mock(stdout="abc\n", returncode=0),          # rev-list: unique (moot under abandon)
             mock.Mock(stdout="", returncode=0),               # show-ref: remote exists
             mock.Mock(stdout="", returncode=0),               # push --delete
             mock.Mock(stdout="", returncode=0),               # update-ref -d
@@ -1027,8 +1028,7 @@ class TeardownStatusTests(unittest.TestCase):
             mock.Mock(returncode=0),                 # show-ref tracking: existed
             mock.Mock(returncode=0),                 # fetch --prune
             mock.Mock(returncode=1),                 # show-ref tracking: pruned away
-            mock.Mock(returncode=0),                 # merge-base: merged
-            mock.Mock(returncode=0, stdout=""),      # rev-list: nothing unique
+            mock.Mock(returncode=0),                 # merge-base: merged (probe skipped)
         ])
         self.assertEqual(status["remote_state"], "deleted")
         self.assertTrue(status["merged"])
@@ -1050,8 +1050,7 @@ class TeardownStatusTests(unittest.TestCase):
         status = self.status_with([
             mock.Mock(returncode=0),                 # show-ref tracking: existed
             mock.Mock(returncode=1),                 # fetch --prune: offline
-            mock.Mock(returncode=0),                 # merge-base: merged locally
-            mock.Mock(returncode=0, stdout=""),      # rev-list
+            mock.Mock(returncode=0),                 # merge-base: merged locally (probe skipped)
         ])
         self.assertEqual(status["remote_state"], "unknown")
         self.assertFalse(status["fetched"])

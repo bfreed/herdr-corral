@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.17.1 — 2026-08-13
+
+- Internal, no behavior change: the merged / unique-commits verdict that existed in three copies (palette safety labels, merge-checked cleanup, and the teardown popup) is now single-sourced in `branch_disposition`, so the advice shown always matches what the deletion paths actually enforce.
+
 ## 0.17.0 — 2026-08-13
 
 - New GUI teardown hook: deleting a worktree checkout from Herdr's right-click menu ("Delete worktree checkout...") now opens a Corral popup for the branch left behind. It fetches with `--prune`, reports whether the remote branch has already been deleted (the GitHub merge-then-delete flow), whether the branch is merged or all its commits exist elsewhere, then asks about deleting the local branch — defaulting to delete when safe, and requiring the branch name typed back when commits exist nowhere else. If the remote branch still exists and the local one was deleted, it offers to delete the remote too (default follows merge state).
