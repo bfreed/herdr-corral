@@ -40,19 +40,47 @@ How you ask matters as much as what you ask:
 
 - Ask **one question per turn**. Wait for the answer before the next question.
 - If your harness has a structured question tool (a multiple-choice picker with an "other/custom" option), use it for every question. Without one, present short numbered options the user can answer with a number.
-- **Investigate before you ask**, so every question offers concrete detected options instead of a freeform prompt.
+- **Investigate before you ask**, so every question offers concrete detected options instead of a freeform prompt. The user must see what you detected in the question itself — never make them ask "what?" to get the options.
+- Phrase questions in the user's terms, not Corral's internals: "What parent folder are your repositories in?", not "Which Git repository parent should Corral manage?". Where a suggested wording is given below, use it (adapted to your findings).
 
 The questions, each with the detective work to do first:
 
-1. **Where do your Git repositories live?** First scan for plausible parents — `~/repos`, `~/code`, `~/src`, `~/dev`, `~/projects`, `~/GitRepos`, `~/Documents/GitRepos`, and anything else you find under `$HOME` whose immediate children include several Git repositories. Offer the candidates you found (with their repo counts) plus a custom-path option.
+1. **Repositories parent folder.** Scan before asking: `~/repos`, `~/code`, `~/src`, `~/dev`, `~/projects`, `~/GitRepos`, `~/Documents/GitRepos`, and anything else under `$HOME` whose immediate children include several Git repositories. Then ask, with your findings already in the question:
+
+   > What parent folder are your repositories in?
+   > 1. `/home/user/Documents/GitRepos` — 21 repositories found (recommended)
+   > 2. `/home/user/code` — 3 repositories found
+   > 3. Somewhere else (tell me the path)
 2. **Where should worktrees go?** The goal is one location and one convention for *both* entry points: Herdr's right-click "new worktree" and `hwt new`. Investigate first:
    - Read Herdr's current `[worktrees].directory` from `~/.config/herdr/config.toml` (default when absent: `~/.herdr/worktrees`; Herdr organizes checkouts as `<directory>/<repo>/<branch-slug>`).
    - Scan for existing worktree collections: that Herdr directory, `<repo>__worktrees/` siblings next to repositories (the workmux layout), and any previous Corral `worktree_root`.
 
-   Then offer, telling the user what each choice does:
-   - **(a) Herdr's current directory** (recommended default) → `--worktree-root <that directory>` (placement `shared-root` is the default). No Herdr config change needed.
-   - **(b) A different shared folder** (e.g. a visible one near their repos, or an existing collection you found) → `--worktree-root <folder>`, **and tell the user you will change Herdr's `[worktrees].directory` to the same folder so right-click matches** — with their OK, edit `~/.config/herdr/config.toml` and apply it with `herdr server reload-config`.
-   - **(c) workmux-style `<repo>__worktrees/` siblings** (`--worktree-placement sibling`) → warn clearly: Herdr's own dialog only supports a single shared directory, so right-click worktrees will still go to Herdr's directory — the two entry points cannot be unified in this layout. Corral recognizes and bootstraps both locations regardless.
+   Then ask, showing the user what each layout literally looks like on disk (substitute their real paths and a real repo name you found):
+
+   > Where should new worktrees go? Both Herdr's right-click "new worktree" and Corral's `hwt new` will use this.
+   >
+   > 1. **One shared folder, Herdr's current one** (recommended — no config changes):
+   >    ```
+   >    ~/.herdr/worktrees/
+   >      myapp/feature-login/        <- worktree of myapp
+   >      myapp/fix-nav-bug/
+   >      otherapp/spike-cache/
+   >    ```
+   > 2. **One shared folder somewhere visible**, e.g. `~/Documents/GitRepos/.worktrees/` — same shape as option 1, just where you can see it. I would also update Herdr's own worktree setting to match, so right-click agrees.
+   > 3. **A `__worktrees` folder next to each repository** (workmux's convention — pick this to keep your existing habit):
+   >    ```
+   >    ~/Documents/GitRepos/
+   >      myapp/                      <- the repository
+   >      myapp__worktrees/feature-login/
+   >      otherapp/
+   >      otherapp__worktrees/spike-cache/
+   >    ```
+   >    Caveat: Herdr's right-click dialog can only use one shared folder, so right-click worktrees would still go to Herdr's directory — only `hwt new` follows this layout.
+
+   Mapping the answer to actions:
+   - **(1)** → `--worktree-root <Herdr's current directory>` (placement `shared-root` is the default). No Herdr config change.
+   - **(2)** → `--worktree-root <folder>`, **and tell the user you will change Herdr's `[worktrees].directory` to the same folder** — with their OK, edit `~/.config/herdr/config.toml` and apply it with `herdr server reload-config`.
+   - **(3)** → add `--worktree-placement sibling`. Repeat the caveat when confirming.
 
    Existing worktrees are never moved; all known layouts stay recognized.
 3. **Should dev servers be reachable from other machines?** Detect the machine's names first: if `tailscale` is on PATH, get the DNS name from `tailscale status --json` (`.Self.DNSName`) or `tailscale ip -4`; also consider `hostname -f`. Offer: localhost only (default), each detected name, or a custom hostname. Anything except localhost-only → `--dev-host 0.0.0.0 --remote-host <name>`.
@@ -68,7 +96,7 @@ python3 ~/.local/share/herdr-corral/install.py \
   --agent-kind <ANSWER-4>
 ```
 
-Add `--dev-host 0.0.0.0 --remote-host <name>` only if the user opted in at question 3, and `--worktree-placement sibling` only for choice (c). If the user picked choice (b), also make the approved Herdr config edit now and run `herdr server reload-config`.
+Add `--dev-host 0.0.0.0 --remote-host <name>` only if the user opted in at question 3, and `--worktree-placement sibling` only if they chose the `__worktrees`-sibling layout in question 2. If they chose a shared folder other than Herdr's current one, also make the approved Herdr config edit now and run `herdr server reload-config`.
 
 The clone location matters: the clone **is** the installation (`hwt update` runs `git pull` in it). `~/.local/share/herdr-corral` is the convention; honor the user's preference if they have one — but do **not** clone into their repositories root. The clone is tooling, not one of their projects.
 
