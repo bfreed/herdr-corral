@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.9.7 — 2026-08-13
+
+- `hwt cleanup` no longer demands `--abandon` for unmerged branches that have no commits of their own: if every commit on the branch is reachable from another ref (excluding the branch's own remote copy, which cleanup also deletes), it is deleted without questions. Fresh, never-committed worktree branches now clean up in one step. Cleanup output gains a `reason` field (`merged` / `no-unique-commits` / `abandoned`).
+
 ## 0.9.6 — 2026-08-13
 
 - Repository discovery no longer registers linked worktrees found in the repos root as separate repositories (their git dir lives in the canonical repo).

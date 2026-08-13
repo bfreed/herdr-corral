@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.9.6"
+__version__ = "0.9.7"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -1270,9 +1270,17 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
         base_ref = f"refs/remotes/{remote}/{base_name}"
         merged = git(canonical, "merge-base", "--is-ancestor", branch_ref, base_ref, check=False).returncode == 0
         if not merged and not abandon:
-            raise WorkflowError(
-                f"branch {branch} is not merged into {base_branch}; "
-                f"rerun with --abandon --confirm {branch} to delete it anyway")
+            # The guard protects commits that exist nowhere else. A branch whose
+            # every commit is reachable from some other ref (fresh branch, or
+            # fully cherry-picked/rebased elsewhere) loses nothing when deleted.
+            # Its own remote copy does not count: cleanup deletes that too.
+            probe = git(canonical, "rev-list", "-n", "1", branch_ref, "--not",
+                        f"--exclude={branch_ref}", f"--exclude=refs/remotes/{remote}/{branch}",
+                        "--all", check=False)
+            if probe.returncode or probe.stdout.strip():
+                raise WorkflowError(
+                    f"branch {branch} is not merged into {base_branch} and has commits not "
+                    f"available on any other branch; rerun with --abandon --confirm {branch} to delete it anyway")
         remote_ref = f"refs/remotes/{remote}/{branch}"
         remote_exists = git(canonical, "show-ref", "--verify", "--quiet", remote_ref, check=False).returncode == 0
         if remote_exists:
@@ -1291,6 +1299,7 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
         "merged": merged,
         "merged_into": base_branch if merged else None,
         "abandoned": bool(abandon),
+        "reason": "merged" if merged else ("abandoned" if abandon else "no-unique-commits"),
     }
 
 

@@ -49,7 +49,7 @@ hwt cleanup feature/my-task --abandon --confirm feature/my-task
                                               # not merged / dirty? affirmatively discard it
 ```
 
-`cleanup` fetches first and proves the merge with `git merge-base --is-ancestor` before touching anything, refuses protected branches (`main`, `master`, `develop`, your configured base), and releases the port lease.
+`cleanup` fetches first and proves the merge with `git merge-base --is-ancestor` before touching anything, refuses protected branches (`main`, `master`, `develop`, your configured base), and releases the port lease. The guard protects **work that exists nowhere else**, not branch names: an unmerged branch whose every commit is reachable from some other ref — a fresh worktree branch with no commits of its own, or one fully rebased/cherry-picked elsewhere — is also cleaned up without questions. (The branch's own remote copy doesn't count as "elsewhere", since cleanup deletes that too.)
 
 No typing required: the plugin also adds a **"Corral: clean up this worktree"** action in the workspace context menu. It runs the same merge-checked cleanup for that workspace's worktree; if the branch is unmerged or dirty, nothing is deleted and the refusal (with the exact `--abandon` command) is shown in the worktree's `shell` tab.
 
