@@ -755,6 +755,98 @@ class CleanupSelectionTests(unittest.TestCase):
                 hwt.choose_worktree_item([dict(self.ITEMS[2])], None)
 
 
+class WorktreeSafetyTests(unittest.TestCase):
+    CFG = {"repositories": {"demo": {
+        "path": "/canon/demo", "remote": "origin", "base_branch": "origin/main"}}}
+    ITEM = {"branch": "feature/x", "path": "/nonexistent-wt", "repository": "demo"}
+
+    def test_detached_worktree(self):
+        self.assertEqual(hwt.worktree_safety(self.CFG, {"path": "/wt"}), "detached")
+
+    def test_dirty_worktree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            item = {**self.ITEM, "path": tmp}
+            with mock.patch.object(hwt, "git", return_value=mock.Mock(stdout=" M x\n", returncode=0)):
+                self.assertEqual(hwt.worktree_safety(self.CFG, item), "dirty")
+
+    def test_merged_branch(self):
+        with mock.patch.object(hwt, "git", return_value=mock.Mock(stdout="", returncode=0)):
+            self.assertEqual(hwt.worktree_safety(self.CFG, dict(self.ITEM)), "merged")
+
+    def test_unpublished_work(self):
+        responses = [mock.Mock(returncode=1, stdout=""), mock.Mock(returncode=0, stdout="abc\n")]
+        with mock.patch.object(hwt, "git", side_effect=responses):
+            self.assertEqual(hwt.worktree_safety(self.CFG, dict(self.ITEM)), "unpublished-work")
+
+    def test_no_unique_commits(self):
+        responses = [mock.Mock(returncode=1, stdout=""), mock.Mock(returncode=0, stdout="")]
+        with mock.patch.object(hwt, "git", side_effect=responses):
+            self.assertEqual(hwt.worktree_safety(self.CFG, dict(self.ITEM)), "no-unique-commits")
+
+
+class PaletteTests(unittest.TestCase):
+    def test_palette_requires_a_terminal(self):
+        with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: False)):
+            with self.assertRaisesRegex(hwt.WorkflowError, "interactive"):
+                hwt.cmd_palette(object(), {}, Path("/state"), mock.Mock())
+
+    def test_palette_cleans_selected_worktree_and_quits(self):
+        items = [{"branch": "feature/x", "is_linked_worktree": True,
+                  "path": "/wts/x", "repository": "demo"}]
+        answers = iter(["1", "", "q"])
+        with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: True)), \
+             mock.patch("builtins.input", side_effect=lambda *_: next(answers)), \
+             mock.patch.object(hwt, "configured_worktree_items", return_value=items), \
+             mock.patch.object(hwt, "worktree_safety", return_value="merged"), \
+             mock.patch.object(hwt, "cleanup_worktree_item", return_value={"removed": "/wts/x"}) as core, \
+             contextlib.redirect_stdout(io.StringIO()):
+            hwt.cmd_palette(object(), {"repositories": {}}, Path("/state"), mock.Mock())
+        core.assert_called_once()
+
+
+class SweepTests(unittest.TestCase):
+    def test_sweep_cleans_qualifying_and_reports_skipped_with_commands(self):
+        items = [
+            {"branch": "feature/a", "is_linked_worktree": True, "path": "/wts/a", "repository": "demo"},
+            {"branch": "feature/b", "is_linked_worktree": True, "path": "/wts/b", "repository": "demo"},
+            {"branch": "main", "is_linked_worktree": False, "path": "/repo", "repository": "demo"},
+        ]
+
+        def core(cfg, state, herdr, item, *, abandon, confirm):
+            if item["branch"] == "feature/b":
+                raise hwt.WorkflowError(
+                    "worktree has uncommitted changes; rerun with --abandon --confirm feature/b to discard them")
+            return {"removed": item["path"], "reason": "merged"}
+
+        with mock.patch.object(hwt, "configured_worktree_items", return_value=items), \
+             mock.patch.object(hwt, "cleanup_worktree_item", side_effect=core), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            hwt.cmd_sweep(object(), {}, Path("/state"), mock.Mock())
+        report = json.loads(out.getvalue())
+        self.assertEqual([c["removed"] for c in report["cleaned"]], ["/wts/a"])
+        self.assertEqual(len(report["skipped"]), 1)
+        self.assertIn("--abandon --confirm feature/b", report["skipped"][0]["reason"])
+
+    def test_sweep_continues_after_a_failing_worktree(self):
+        items = [
+            {"branch": "feature/a", "is_linked_worktree": True, "path": "/wts/a", "repository": "demo"},
+            {"branch": "feature/c", "is_linked_worktree": True, "path": "/wts/c", "repository": "demo"},
+        ]
+
+        def core(cfg, state, herdr, item, *, abandon, confirm):
+            if item["branch"] == "feature/a":
+                raise hwt.WorkflowError("fetch failed")
+            return {"removed": item["path"], "reason": "merged"}
+
+        with mock.patch.object(hwt, "configured_worktree_items", return_value=items), \
+             mock.patch.object(hwt, "cleanup_worktree_item", side_effect=core), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            hwt.cmd_sweep(object(), {}, Path("/state"), mock.Mock())
+        report = json.loads(out.getvalue())
+        self.assertEqual([c["removed"] for c in report["cleaned"]], ["/wts/c"])
+        self.assertEqual(report["skipped"][0]["reason"], "fetch failed")
+
+
 class WorkspaceCleanupActionTests(unittest.TestCase):
     ITEM = {
         "branch": "feature/x", "is_linked_worktree": True,

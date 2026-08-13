@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.9.7"
+__version__ = "0.10.0"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -1212,6 +1212,127 @@ def cmd_cleanup(args, cfg, state, herdr):
     print(json.dumps(result, indent=2))
 
 
+SAFETY_LABELS = {
+    "merged": "merged — cleans instantly",
+    "no-unique-commits": "nothing unique — cleans instantly",
+    "unpublished-work": "has unpublished commits",
+    "dirty": "dirty",
+    "detached": "detached HEAD",
+}
+
+
+def worktree_safety(cfg: dict[str, Any], item: dict[str, Any]) -> str:
+    """Advisory annotation from local refs; cleanup itself re-verifies after a fetch."""
+    branch = item.get("branch")
+    if not branch:
+        return "detached"
+    path = Path(item.get("path", ""))
+    if path.is_dir() and git(path, "status", "--porcelain", check=False).stdout.strip():
+        return "dirty"
+    repo = cfg.get("repositories", {}).get(item.get("repository"), {})
+    repo_path = repo.get("path")
+    if not repo_path:
+        return "unknown"
+    canonical = Path(repo_path)
+    remote = repo.get("remote", "origin")
+    base_branch = repo.get("base_branch", f"{remote}/main")
+    branch_ref = f"refs/heads/{branch}"
+    if "/" in base_branch and git(canonical, "merge-base", "--is-ancestor", branch_ref,
+                                  f"refs/remotes/{base_branch}", check=False).returncode == 0:
+        return "merged"
+    probe = git(canonical, "rev-list", "-n", "1", branch_ref, "--not",
+                f"--exclude={branch_ref}", f"--exclude=refs/remotes/{remote}/{branch}",
+                "--all", check=False)
+    if probe.returncode == 0 and not probe.stdout.strip():
+        return "no-unique-commits"
+    return "unpublished-work"
+
+
+def palette_new_worktree(args, cfg, state, herdr) -> None:
+    repos = [name for name, repo in cfg["repositories"].items() if repo.get("mode") == "worktree"]
+    if not repos:
+        print("no repositories configured for worktrees")
+        return
+    if len(repos) == 1:
+        name = repos[0]
+    else:
+        for index, repo_name in enumerate(repos, 1):
+            print(f"  {index}. {repo_name}")
+        try:
+            name = repos[int(input("Repository number: ").strip()) - 1]
+        except (ValueError, IndexError):
+            print("cancelled")
+            return
+    branch = input("Branch name (empty cancels): ").strip()
+    if not branch:
+        print("cancelled")
+        return
+    new_args = type("Args", (), {"branch": branch, "base": None,
+                                 "repo": cfg["repositories"][name]["path"],
+                                 "background": True, "config": args.config})()
+    try:
+        cmd_new(new_args, cfg, state, herdr)
+    except WorkflowError as exc:
+        print(f"failed: {exc}")
+
+
+def cmd_palette(args, cfg, state, herdr):
+    """Interactive popup: annotated worktree list + one-key operations."""
+    if not sys.stdin.isatty():
+        raise WorkflowError("palette is interactive; open it via the Corral popup or a terminal")
+    while True:
+        items = [i for i in configured_worktree_items(cfg, herdr) if i.get("is_linked_worktree", False)]
+        print("\nCorral — worktrees")
+        if not items:
+            print("  (none)")
+        for index, item in enumerate(items, 1):
+            safety = worktree_safety(cfg, item)
+            print(f"  {index}. {describe_worktree_item(item)}  [{SAFETY_LABELS.get(safety, safety)}]")
+        choice = input("\n[number] clean up   [n]ew worktree   [s]weep   [q]uit > ").strip().lower()
+        if choice in ("", "q", "quit"):
+            return
+        if choice == "s":
+            cmd_sweep(args, cfg, state, herdr)
+        elif choice == "n":
+            palette_new_worktree(args, cfg, state, herdr)
+        else:
+            try:
+                item = items[int(choice) - 1]
+            except (ValueError, IndexError):
+                print(f"unrecognized choice: {choice!r}")
+                continue
+            try:
+                print(json.dumps(cleanup_worktree_item(cfg, state, herdr, item,
+                                                       abandon=False, confirm=None), indent=2))
+            except WorkflowError as exc:
+                print(f"refused: {exc}")
+        input("Enter to continue ")
+
+
+def cmd_palette_open(args) -> None:
+    """Action entry point: open the palette popup via the Herdr CLI."""
+    binary = os.environ.get("HERDR_BIN_PATH", "herdr")
+    result = subprocess.run([binary, "plugin", "pane", "open",
+                             "--plugin", PLUGIN_ID, "--entrypoint", "palette"])
+    raise SystemExit(result.returncode)
+
+
+def cmd_sweep(args, cfg, state, herdr):
+    """Clean every linked worktree that qualifies without questions; report the rest."""
+    cleaned, skipped = [], []
+    for item in configured_worktree_items(cfg, herdr):
+        if not item.get("is_linked_worktree", False):
+            continue
+        try:
+            cleaned.append(cleanup_worktree_item(cfg, state, herdr, item, abandon=False, confirm=None))
+        except WorkflowError as exc:
+            skipped.append({"worktree": item.get("path"), "branch": item.get("branch"),
+                            "repository": item.get("repository"), "reason": str(exc)})
+    print(json.dumps({"cleaned": cleaned, "skipped": skipped}, indent=2))
+    if skipped:
+        log(f"{len(skipped)} worktree(s) kept; each reason above includes the command to discard it deliberately")
+
+
 def cmd_cleanup_workspace(args, cfg, state, herdr):
     """Herdr action entry point: clean up the worktree of the invoking workspace."""
     workspace = os.environ.get("HERDR_WORKSPACE_ID", "")
@@ -1357,9 +1478,12 @@ def parser() -> argparse.ArgumentParser:
     d=sub.add_parser("dev",help="start the configured dev server on a leased port"); d.add_argument("--port",type=int)
     r=sub.add_parser("remove",help="remove a worktree, keeping its branch"); r.add_argument("target"); r.add_argument("--force",action="store_true"); r.add_argument("--confirm")
     c=sub.add_parser("cleanup",help="delete worktree and branch (merged: no questions)"); c.add_argument("target",nargs="?",help="branch, path, or worktree name; omit to pick from a list"); c.add_argument("--abandon",action="store_true",help="delete even if unmerged or dirty (requires --confirm BRANCH)"); c.add_argument("--confirm")
+    sub.add_parser("sweep",help="clean up every worktree that qualifies without questions")
+    sub.add_parser("palette",help="interactive worktree palette (runs inside the Corral popup)")
     sub.add_parser("doctor"); sub.add_parser("update",help="update Corral in place (git pull)")
     e=sub.add_parser("event",help=argparse.SUPPRESS)
     sub.add_parser("cleanup-workspace",help=argparse.SUPPRESS)
+    sub.add_parser("palette-open",help=argparse.SUPPRESS)
     return p
 
 
@@ -1369,10 +1493,13 @@ def main(argv: list[str] | None=None) -> int:
         if args.command == "update":
             cmd_update(args)
             return 0
+        if args.command == "palette-open":
+            cmd_palette_open(args)
+            return 0
         cfg=load_config(args.config); state=runtime_state_dir(); herdr=Herdr()
-        commands={"new":cmd_new,"open":cmd_open,"init":cmd_init,"list":cmd_list,"status":cmd_status,"dev":cmd_dev,"remove":cmd_remove,"cleanup":cmd_cleanup,"cleanup-workspace":cmd_cleanup_workspace,"doctor":cmd_doctor,"event":cmd_event}
+        commands={"new":cmd_new,"open":cmd_open,"init":cmd_init,"list":cmd_list,"status":cmd_status,"dev":cmd_dev,"remove":cmd_remove,"cleanup":cmd_cleanup,"cleanup-workspace":cmd_cleanup_workspace,"sweep":cmd_sweep,"palette":cmd_palette,"doctor":cmd_doctor,"event":cmd_event}
         fn=commands[args.command]
-        if args.command in ("new","open","list","remove","cleanup","cleanup-workspace","event"): fn(args,cfg,state,herdr)
+        if args.command in ("new","open","list","remove","cleanup","cleanup-workspace","sweep","palette","event"): fn(args,cfg,state,herdr)
         else: fn(args,cfg,state)
         return 0
     except WorkflowError as exc:

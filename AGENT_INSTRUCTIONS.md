@@ -101,6 +101,18 @@ The questions, each with the detective work to do first:
 3. **Should dev servers be reachable from other machines?** Detect the machine's names first: if `tailscale` is on PATH, get the DNS name from `tailscale status --json` (`.Self.DNSName`) or `tailscale ip -4`; also consider `hostname -f`. Offer: localhost only (default), each detected name, or a custom hostname. Anything except localhost-only → `--dev-host 0.0.0.0 --remote-host <name>`.
 4. **Which agent should start in the `agent` tab?** The authoritative list is Herdr's, not PATH: read the kinds `herdr agent start --kind` accepts from `herdr agent start --help` (Herdr also has its own agent detection — use whatever it reports). To judge which kinds are actually usable, remember your own shell probably has a reduced PATH: agent CLIs are typically installed into per-product home directories (`~/.grok/bin/grok`, and the same `~/.<vendor>/bin/<tool>` pattern for others) whose PATH entry lives in the user's rc files. Probe three ways before declaring an agent absent: plain `command -v`, the user's login+interactive shell (`$SHELL -lic 'command -v hermes claude codex grok opencode'`, with a timeout in case the rc file prompts), and a direct glob like `ls ~/.*/bin/ ~/.local/bin/ 2>/dev/null`. A product's CLI binary also may not be named after its brand — never conclude an agent is missing from one failed name lookup. Offer every usable kind (default `hermes` when present), plus "other" and "none". If the user says they use an agent you did not detect, believe them and verify the kind against Herdr's help output. For "none", install with the default and then set `start_agent = false` on the repositories in `config.toml`.
 
+5. **Keyboard shortcut for the Corral palette?** The palette popup (worktree list with safety annotations; clean up / new worktree / sweep) is Corral's main interactive surface — Herdr's right-click menu cannot host plugin entries. First read the user's existing bindings from `~/.config/herdr/config.toml` (`[keys]` and `[[keys.command]]`) so you can propose a key that is actually free (suggest `prefix+w` if unbound). With their OK, append to that file:
+
+   ```toml
+   [[keys.command]]
+   key = "prefix+w"
+   type = "plugin_action"
+   command = "corral.palette"
+   description = "Corral: worktree palette"
+   ```
+
+   then run `herdr server reload-config`. Optionally offer a second binding for `corral.cleanup` (merge-checked cleanup of the focused worktree, no popup). Fine to skip: everything remains reachable via `hwt` and `herdr plugin action invoke corral.palette`.
+
 ## Step 3 — install
 
 ```bash
@@ -126,7 +138,7 @@ hwt doctor
 herdr plugin list
 ```
 
-Confirm plugin `corral` is linked and enabled. `hwt doctor` failing only on a missing agent CLI is acceptable if the user declined auto-started agents.
+Confirm plugin `corral` is linked and enabled, and that `herdr plugin action list --plugin corral` shows the `cleanup` and `palette` actions. `hwt doctor` failing only on a missing agent CLI is acceptable if the user declined auto-started agents.
 
 Then **ask the user** which repository to use for a live workspace check, and tell them it will create one Herdr workspace with three tabs (and start their agent in it if `start_agent` is enabled). With their approval:
 

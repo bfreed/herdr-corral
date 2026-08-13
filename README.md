@@ -51,7 +51,31 @@ hwt cleanup feature/my-task --abandon --confirm feature/my-task
 
 `cleanup` fetches first and proves the merge with `git merge-base --is-ancestor` before touching anything, refuses protected branches (`main`, `master`, `develop`, your configured base), and releases the port lease. The guard protects **work that exists nowhere else**, not branch names: an unmerged branch whose every commit is reachable from some other ref — a fresh worktree branch with no commits of its own, or one fully rebased/cherry-picked elsewhere — is also cleaned up without questions. (The branch's own remote copy doesn't count as "elsewhere", since cleanup deletes that too.)
 
-No typing required: the plugin also adds a **"Corral: clean up this worktree"** action in the workspace context menu. It runs the same merge-checked cleanup for that workspace's worktree; if the branch is unmerged or dirty, nothing is deleted and the refusal (with the exact `--abandon` command) is shown in the worktree's `shell` tab.
+No typing required, two ways:
+
+- **`hwt sweep`** — cleans *every* worktree that qualifies without questions in one shot, and reports the kept ones with the exact `--abandon` command for each.
+- **The Corral palette** — a popup (bind it to a key, below) listing every worktree with a safety annotation (`merged — cleans instantly`, `nothing unique — cleans instantly`, `has unpublished commits`, `dirty`). Pick a number to clean it, `n` to create a worktree, `s` to sweep, `q` to close.
+
+## Keybindings
+
+Herdr's sidebar right-click menu is not extensible by plugins (as of 0.8.0 the plugin manifest's `contexts` field is parsed but not used by any UI — verified against the Herdr source), so Corral's interactive surface is the palette popup plus keybindings. Add to `~/.config/herdr/config.toml` and run `herdr server reload-config`:
+
+```toml
+[[keys.command]]
+key = "prefix+w"
+type = "plugin_action"
+command = "corral.palette"
+description = "Corral: worktree palette"
+
+# optional: merge-checked cleanup of the worktree you're focused on, no UI
+[[keys.command]]
+key = "prefix+backspace"
+type = "plugin_action"
+command = "corral.cleanup"
+description = "Corral: clean up the focused worktree"
+```
+
+Pick any free keys; the install agent offers to set this up. To try it without a binding: `herdr plugin action invoke corral.palette`. For `corral.cleanup`, refusals (unmerged/dirty) delete nothing and are shown in the worktree's `shell` tab.
 
 ## Configuration
 

@@ -1,6 +1,6 @@
 id = "corral"
 name = "Corral"
-version = "0.9.7"
+version = "0.10.0"
 min_herdr_version = "0.8.0"
 description = "Herd your Git worktrees: env files, dependencies, agent/shell/server tabs, and merge-safe cleanup"
 platforms = ["linux", "macos"]
@@ -28,3 +28,17 @@ id = "cleanup"
 title = "Corral: clean up this worktree (merge-checked)"
 contexts = ["workspace"]
 command = ["python3", "hwt.py", "cleanup-workspace"]
+
+[[actions]]
+id = "palette"
+title = "Corral: worktree palette"
+contexts = ["workspace"]
+command = ["python3", "hwt.py", "palette-open"]
+
+[[panes]]
+id = "palette"
+title = "Corral"
+placement = "popup"
+width = "70%"
+height = "70%"
+command = ["python3", "hwt.py", "palette"]

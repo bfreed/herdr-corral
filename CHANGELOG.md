@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.0 — 2026-08-13
+
+- **`hwt sweep`**: batch cleanup — deletes every linked worktree that qualifies without questions (merged or nothing-unique, clean) and reports the kept ones with a ready-to-paste `--abandon` command each.
+- **Corral palette**: a popup pane (`placement = "popup"`, real PTY) listing all worktrees with advisory safety annotations; number cleans, `n` creates a worktree, `s` sweeps, `q` closes. Open via a `[[keys.command]]` binding with `type = "plugin_action"` and `command = "corral.palette"`, or `herdr plugin action invoke corral.palette`. The install interview now offers to set the binding up (consent-gated, `herdr server reload-config` applied).
+- Correction, verified against the Herdr source (0.8.x): the sidebar context menu is hardcoded and the plugin manifest's `contexts` field is parsed but unused by any UI — the previous README claim that the cleanup action appears in the right-click menu was wrong. `contexts` values are kept as forward-looking metadata.
+
 ## 0.9.7 — 2026-08-13
 
 - `hwt cleanup` no longer demands `--abandon` for unmerged branches that have no commits of their own: if every commit on the branch is reachable from another ref (excluding the branch's own remote copy, which cleanup also deletes), it is deleted without questions. Fresh, never-committed worktree branches now clean up in one step. Cleanup output gains a `reason` field (`merged` / `no-unique-commits` / `abandoned`).
