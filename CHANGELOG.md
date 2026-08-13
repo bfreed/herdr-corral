@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.13.0 — 2026-08-13
+
+- `hwt new` with no arguments is now interactive and context-aware: inside a canonical repository it offers that checkout's current branch as the default base; inside a worktree it defaults to the configured base (a sibling worktree) with the option to stack the new branch on the current worktree's branch; outside any repository it offers a numbered repository picker, then a base picker, then prompts for the branch name.
+- `hwt new <branch>` now also works from inside a worktree or a repo subdirectory (it maps to the canonical repository instead of erroring).
+- The palette's `n`ew-worktree flow reuses the same interview.
+
 ## 0.12.0 — 2026-08-13
 
 - `hwt open` works like `hwt cleanup` now: with no argument it offers a numbered picker (repositories, then worktrees grouped by repo); a target that doesn't resolve uniquely offers similar candidates instead of erroring.

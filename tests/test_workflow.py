@@ -941,6 +941,98 @@ class SweepTests(unittest.TestCase):
         self.assertEqual(report["skipped"][0]["reason"], "fetch failed")
 
 
+class InteractiveNewTests(unittest.TestCase):
+    CFG = {"repositories": {
+        "demo": {"path": "/canon/demo", "mode": "worktree", "base_branch": "origin/develop"},
+    }}
+
+    @staticmethod
+    def blank_args():
+        return type("Args", (), {"branch": None, "base": None, "repo": None})()
+
+    def test_outside_a_repo_picks_repo_base_and_branch(self):
+        args = self.blank_args()
+        answers = iter(["1", "1", "feature/x"])
+        with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: True)), \
+             mock.patch.object(hwt, "log"), \
+             mock.patch.object(hwt, "git", return_value=mock.Mock(returncode=1, stdout="")), \
+             mock.patch("builtins.input", side_effect=lambda *_: next(answers)):
+            hwt.interactive_new_setup(args, self.CFG)
+        self.assertEqual(args.branch, "feature/x")
+        self.assertEqual(args.base, "origin/develop")
+        self.assertEqual(args.repo, "/canon/demo")
+
+    def test_inside_canonical_defaults_to_its_current_branch(self):
+        args = self.blank_args()
+        answers = iter(["1", "feature/y"])
+
+        def fake_git(cwd, *a, **k):
+            if a[:2] == ("rev-parse", "--show-toplevel"):
+                return mock.Mock(returncode=0, stdout="/canon/demo\n")
+            if a[:2] == ("branch", "--show-current"):
+                return mock.Mock(returncode=0, stdout="develop\n")
+            return mock.Mock(returncode=1, stdout="")
+
+        with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: True)), \
+             mock.patch.object(hwt, "log"), \
+             mock.patch.object(hwt, "git", side_effect=fake_git), \
+             mock.patch.object(hwt, "resolve_configured_repo",
+                               return_value=("demo", self.CFG["repositories"]["demo"])), \
+             mock.patch("builtins.input", side_effect=lambda *_: next(answers)):
+            hwt.interactive_new_setup(args, self.CFG)
+        self.assertEqual(args.base, "develop")
+        self.assertEqual(args.branch, "feature/y")
+
+    def test_inside_worktree_offers_stacking_on_current_branch(self):
+        args = self.blank_args()
+        answers = iter(["2", "feature/stacked"])
+
+        def fake_git(cwd, *a, **k):
+            if a[:2] == ("rev-parse", "--show-toplevel"):
+                return mock.Mock(returncode=0, stdout="/wts/demo/task\n")
+            if a[:2] == ("branch", "--show-current"):
+                return mock.Mock(returncode=0, stdout="feature/base-work\n")
+            return mock.Mock(returncode=1, stdout="")
+
+        with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: True)), \
+             mock.patch.object(hwt, "log"), \
+             mock.patch.object(hwt, "git", side_effect=fake_git), \
+             mock.patch.object(hwt, "resolve_configured_repo", side_effect=hwt.SafetyError("not canonical")), \
+             mock.patch.object(hwt, "repo_for_worktree",
+                               return_value=("demo", self.CFG["repositories"]["demo"], Path("/canon/demo"))), \
+             mock.patch("builtins.input", side_effect=lambda *_: next(answers)):
+            hwt.interactive_new_setup(args, self.CFG)
+        self.assertEqual(args.base, "feature/base-work")
+        self.assertEqual(args.repo, "/canon/demo")
+
+    def test_inside_worktree_defaults_to_configured_base(self):
+        args = self.blank_args()
+        answers = iter(["1", "feature/sibling"])
+
+        def fake_git(cwd, *a, **k):
+            if a[:2] == ("rev-parse", "--show-toplevel"):
+                return mock.Mock(returncode=0, stdout="/wts/demo/task\n")
+            if a[:2] == ("branch", "--show-current"):
+                return mock.Mock(returncode=0, stdout="feature/base-work\n")
+            return mock.Mock(returncode=1, stdout="")
+
+        with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: True)), \
+             mock.patch.object(hwt, "log"), \
+             mock.patch.object(hwt, "git", side_effect=fake_git), \
+             mock.patch.object(hwt, "resolve_configured_repo", side_effect=hwt.SafetyError("not canonical")), \
+             mock.patch.object(hwt, "repo_for_worktree",
+                               return_value=("demo", self.CFG["repositories"]["demo"], Path("/canon/demo"))), \
+             mock.patch("builtins.input", side_effect=lambda *_: next(answers)):
+            hwt.interactive_new_setup(args, self.CFG)
+        self.assertEqual(args.base, "origin/develop")
+
+    def test_non_interactive_without_branch_is_an_error(self):
+        args = self.blank_args()
+        with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: False)):
+            with self.assertRaisesRegex(hwt.WorkflowError, "branch name required"):
+                hwt.interactive_new_setup(args, self.CFG)
+
+
 class OpenPickerTests(unittest.TestCase):
     CFG = {"repositories": {
         "demo": {"path": "/canon/demo", "mode": "worktree"},

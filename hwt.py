@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -937,9 +937,86 @@ def cmd_update(args) -> None:
                       "version": current, "up_to_date": current == previous}, indent=2))
 
 
+def interactive_new_setup(args, cfg: dict[str, Any]) -> None:
+    """Fill in branch/base/repo by asking, using where we're standing as context."""
+    if not sys.stdin.isatty():
+        raise WorkflowError("branch name required: hwt new <branch> (or run interactively from a terminal)")
+    top = git(Path.cwd(), "rev-parse", "--show-toplevel", check=False)
+    repo_name = None
+    context = "outside"
+    context_branch = None
+    if top.returncode == 0 and top.stdout.strip():
+        top_path = Path(top.stdout.strip())
+        try:
+            repo_name, _ = resolve_configured_repo(cfg, top_path)
+            context = "canonical"
+        except (SafetyError, WorkflowError):
+            with contextlib.suppress(WorkflowError):
+                repo_name, _, _ = repo_for_worktree(cfg, top_path)
+                context = "worktree"
+        if repo_name:
+            current = git(top_path, "branch", "--show-current", check=False)
+            context_branch = current.stdout.strip() or None
+    if repo_name is None:
+        repos = [(name, repo) for name, repo in cfg["repositories"].items()
+                 if repo.get("mode") == "worktree"]
+        if not repos:
+            raise WorkflowError("no repositories are configured for worktrees")
+        lines = [f"  {index:>2}. {name}  " + colorize(shorten_home(str(repo["path"])), "2")
+                 for index, (name, repo) in enumerate(repos, 1)]
+        repo_name = repos[choose_indexed(lines, len(repos), "repositories")][0]
+    repo = cfg["repositories"][repo_name]
+    configured_base = repo.get("base_branch", "origin/main")
+    options: list[tuple[str, str]] = []
+
+    def offer(ref: str | None, note: str) -> None:
+        if ref and all(ref != existing for existing, _ in options):
+            options.append((ref, note))
+
+    if context == "canonical":
+        offer(context_branch, "current branch here")
+        offer(configured_base, "configured base")
+    elif context == "worktree":
+        offer(configured_base, "configured base — a sibling of this worktree")
+        offer(context_branch, "this worktree's branch — stack on top of it")
+    else:
+        offer(configured_base, "configured base")
+    lines = [f"  {index:>2}. {ref}  " + colorize(f"({note})", "2")
+             for index, (ref, note) in enumerate(options, 1)]
+    lines.append(f"  {len(options) + 1:>2}. other (type a ref)")
+    base_index = choose_indexed(lines, len(options) + 1,
+                                f"base branch for the new worktree in {repo_name}")
+    if base_index == len(options):
+        base = input("Base ref: ").strip()
+        if not base:
+            raise WorkflowError("cancelled")
+    else:
+        base = options[base_index][0]
+    branch = input("New branch name: ").strip()
+    if not branch:
+        raise WorkflowError("cancelled")
+    args.branch = branch
+    args.base = base
+    args.repo = repo["path"]
+
+
 def cmd_new(args, cfg, state, herdr: Herdr):
-    repo_path=Path(args.repo) if args.repo else Path.cwd()
-    name,repo=resolve_configured_repo(cfg,repo_path)
+    if not args.branch:
+        interactive_new_setup(args, cfg)
+    if args.repo:
+        repo_path = Path(args.repo)
+    else:
+        top = git(Path.cwd(), "rev-parse", "--show-toplevel", check=False)
+        repo_path = Path(top.stdout.strip()) if top.returncode == 0 and top.stdout.strip() else Path.cwd()
+    try:
+        name,repo=resolve_configured_repo(cfg,repo_path)
+    except SafetyError:
+        # Standing in a worktree: create a sibling for its repository.
+        try:
+            name, repo, _ = repo_for_worktree(cfg, repo_path)
+        except WorkflowError:
+            raise WorkflowError(
+                "not inside a configured repository; run 'hwt new' with no arguments to pick one, or pass --repo") from None
     if repo.get("mode")!="worktree": raise WorkflowError(f"{name} is configured for workspace opening only")
     cfg = maybe_offer_init(args, cfg, name)
     repo = cfg["repositories"][name]
@@ -1445,26 +1522,7 @@ def choose_indexed(lines: list[str], count: int, header: str | None) -> int:
 
 
 def palette_new_worktree(args, cfg, state, herdr) -> None:
-    repos = [name for name, repo in cfg["repositories"].items() if repo.get("mode") == "worktree"]
-    if not repos:
-        print("no repositories configured for worktrees")
-        return
-    if len(repos) == 1:
-        name = repos[0]
-    else:
-        for index, repo_name in enumerate(repos, 1):
-            print(f"  {index}. {repo_name}")
-        try:
-            name = repos[int(input("Repository number: ").strip()) - 1]
-        except (ValueError, IndexError):
-            print("cancelled")
-            return
-    branch = input("Branch name (empty cancels): ").strip()
-    if not branch:
-        print("cancelled")
-        return
-    new_args = type("Args", (), {"branch": branch, "base": None,
-                                 "repo": cfg["repositories"][name]["path"],
+    new_args = type("Args", (), {"branch": None, "base": None, "repo": None,
                                  "background": True, "config": args.config})()
     try:
         cmd_new(new_args, cfg, state, herdr)
@@ -1684,7 +1742,7 @@ def parser() -> argparse.ArgumentParser:
     # them out of the table below it.
     sub=p.add_subparsers(dest="command",required=True,
                          metavar="{new,open,init,list,status,dev,remove,cleanup,sweep,palette,doctor,update}")
-    n=sub.add_parser("new",help="create a worktree for a new branch"); n.add_argument("branch"); n.add_argument("--base"); n.add_argument("--repo"); n.add_argument("--background",action="store_true")
+    n=sub.add_parser("new",help="create a worktree for a new branch"); n.add_argument("branch",nargs="?",help="omit to choose repository, base, and name interactively"); n.add_argument("--base"); n.add_argument("--repo"); n.add_argument("--background",action="store_true")
     o=sub.add_parser("open",help="open a repository or existing worktree"); o.add_argument("target",nargs="?",help="repository, branch, or worktree name; omit to pick from a list")
     i=sub.add_parser("init",help="interactively configure a repository"); i.add_argument("repository",nargs="?")
     sub.add_parser("list",help="configured repositories and live worktrees")

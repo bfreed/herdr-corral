@@ -32,7 +32,9 @@ The clone is the installation — `hwt update` later updates it in place. The in
 ## Daily use
 
 ```bash
-hwt new feature/my-task     # worktree + env files + deps + tabs, focused and ready
+hwt new [feature/my-task]   # worktree + env files + deps + tabs, focused and ready
+                            # omit the branch to pick repo, base, and name interactively;
+                            # inside a worktree, offers to stack on its branch
 hwt open [target]           # (re)open with the standard layout; omit to pick from a list
 hwt dev                     # start the repo's dev server on the leased port
 hwt list                    # configured repos and live worktrees
