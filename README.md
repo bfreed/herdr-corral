@@ -2,7 +2,7 @@
 
 Herd your Git worktrees in [Herdr](https://herdr.dev). Corral is a Herdr plugin plus a small `hwt` CLI that replaces a [workmux](https://github.com/raine/workmux)-style workflow for people who moved from tmux to Herdr:
 
-- **New worktree, ready to work.** Creating a worktree copies your untracked `.env` / `.env.*` files, installs dependencies (package manager detected from the lockfile), and opens exactly three tabs: `agent` (your coding agent, started automatically), `shell`, and `server`.
+- **New worktree, ready to work.** Creating a worktree copies your untracked `.env` / `.env.*` files, sets up dependencies (copy-on-write clone of the main checkout's `node_modules` when lockfiles match — near-instant on btrfs/XFS/APFS — otherwise an install via the lockfile-detected package manager), and opens exactly three tabs: `agent` (your coding agent, started automatically), `shell`, and `server`.
 - **Stable dev ports.** Every worktree leases a port from a configured range (default 4100–4199), so parallel dev servers never collide and URLs stay predictable.
 - **Merge-safe cleanup.** `hwt cleanup` deletes the worktree, the local branch, and the remote branch — without questions when the branch is provably merged into your base branch, and only with an explicit `--abandon --confirm BRANCH` when it is not.
 - **Agent-first.** Built for running one coding agent per worktree (Hermes, Claude Code, Codex, …) with isolated checkouts.

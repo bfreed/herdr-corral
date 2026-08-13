@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.0 — 2026-08-13
+
+- New default dependency policy `clone`: when the canonical checkout has a `node_modules` and its lockfile is byte-identical to the new worktree's, the directory is copied via copy-on-write (`cp --reflink=auto` on Linux, APFS clonefile on macOS, plain copy fallback) — near-instant and fully independent. Any mismatch or failure falls back to the lockfile-detected install (`auto` behavior). The init interview offers this as the default; existing `auto` configs behave as before.
+
 ## 0.10.3 — 2026-08-13
 
 - Worktree identity is now decided by git, not path conventions: any checkout whose `git-common-dir` resolves inside a configured repository is recognized (cleanup, remove, open, event bootstrap), wherever it lives — including flat ad-hoc siblings like `<repos-root>/<repo>-<name>`. Approved-roots matching remains as fallback; worktrees of unconfigured repositories are still refused, and the huge roots list is gone from the error message.

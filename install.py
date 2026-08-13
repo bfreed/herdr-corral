@@ -77,8 +77,9 @@ def render_config(repos_root: Path, worktree_root: Path, repos: list[tuple[str, 
         "",
         "# Repositories without an explicit `files` list get untracked .env / .env.*",
         "# files copied into new worktrees, and dependencies default to policy",
-        '# "auto" (lockfile-detected install). Run `hwt init` inside a repository',
-        "# to refine its settings; that writes an overlay under repos.d/.",
+        '# "clone": copy-on-write copy of the main checkout\'s node_modules when',
+        "# lockfiles match, else a lockfile-detected install. Run `hwt init` inside",
+        "# a repository to refine its settings; that writes an overlay under repos.d/.",
     ]
     for name, path, base in repos:
         lines += [

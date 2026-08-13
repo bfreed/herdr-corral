@@ -168,7 +168,10 @@ files = [
 ]
 
 [repositories."example".dependencies]
-policy = "auto"              # auto | independent | shared | shared-if-lockfile-matches
+policy = "clone"             # clone (default) | auto | independent | shared | shared-if-lockfile-matches
+# clone: copy-on-write copy of the main checkout's node_modules when lockfiles
+# match, else the lockfile-detected install (= auto). Prefer clone/auto over
+# the shared symlink policies, which can break build tools and native modules.
 
 [repositories."example".commands]
 dev = ["npm", "run", "dev", "--", "--host", "{host}", "--port", "{port}"]

@@ -1067,6 +1067,57 @@ class AutoDependencyTests(unittest.TestCase):
         run.assert_called_once_with(["npm", "install"], cwd=self.wt, check=False)
 
 
+class CloneDependencyTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.canon = Path(self.tmp.name) / "canon"
+        self.wt = Path(self.tmp.name) / "wt"
+        self.canon.mkdir(); self.wt.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_matching_lockfiles_clone_canonical_node_modules(self):
+        (self.canon / "package-lock.json").write_text("lock")
+        (self.wt / "package-lock.json").write_text("lock")
+        module = self.canon / "node_modules" / "left-pad"
+        module.mkdir(parents=True)
+        (module / "index.js").write_text("module.exports = 1")
+        result = hwt.prepare_dependencies(self.canon, self.wt, {"policy": "clone"})
+        self.assertEqual(result, "cloned")
+        self.assertTrue((self.wt / "node_modules" / "left-pad" / "index.js").is_file())
+        self.assertFalse((self.wt / "node_modules").is_symlink())
+
+    def test_lockfile_mismatch_falls_back_to_install_detection(self):
+        (self.canon / "package-lock.json").write_text("one")
+        (self.wt / "package-lock.json").write_text("two")
+        (self.canon / "node_modules").mkdir()
+        # no package.json in the worktree, so the fallback has nothing to install
+        self.assertEqual(hwt.prepare_dependencies(self.canon, self.wt, {"policy": "clone"}), "none")
+        self.assertFalse((self.wt / "node_modules").exists())
+
+    def test_missing_canonical_modules_falls_back_to_install(self):
+        (self.canon / "package-lock.json").write_text("lock")
+        (self.wt / "package-lock.json").write_text("lock")
+        (self.wt / "package.json").write_text("{}")
+        with mock.patch.object(hwt.shutil, "which", return_value="/usr/bin/npm"), \
+             mock.patch.object(hwt, "run", return_value=mock.Mock(returncode=0)) as run:
+            self.assertEqual(hwt.prepare_dependencies(self.canon, self.wt, {"policy": "clone"}), "installed")
+        run.assert_called_once_with(["npm", "ci"], cwd=self.wt, check=False)
+
+    def test_existing_worktree_modules_left_alone(self):
+        (self.wt / "node_modules").mkdir()
+        self.assertEqual(hwt.prepare_dependencies(self.canon, self.wt, {"policy": "clone"}), "present")
+
+    def test_clone_tree_plain_copy_fallback_works(self):
+        source = self.canon / "node_modules"
+        (source / "pkg").mkdir(parents=True)
+        (source / "pkg" / "a.txt").write_text("data")
+        destination = self.wt / "node_modules"
+        self.assertTrue(hwt.clone_tree(source, destination))
+        self.assertEqual((destination / "pkg" / "a.txt").read_text(), "data")
+
+
 class ConfigOverlayTests(unittest.TestCase):
     def test_repos_d_overlay_replaces_repository_entry(self):
         with tempfile.TemporaryDirectory() as tmp:

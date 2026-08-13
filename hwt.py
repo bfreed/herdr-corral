@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.10.3"
+__version__ = "0.11.0"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -298,19 +298,57 @@ def detect_install_command(worktree: Path) -> list[str] | None:
     return ["npm", "install"]
 
 
+def clone_tree(source: Path, destination: Path) -> bool:
+    """Copy a directory tree, copy-on-write where the platform allows. True on success."""
+    if sys.platform == "darwin":
+        candidates = [["cp", "-c", "-R", str(source), str(destination)]]  # APFS clonefile
+    elif os.name == "posix":
+        candidates = [["cp", "-R", "--reflink=auto", str(source), str(destination)]]
+    else:
+        candidates = []
+    for command in candidates:
+        if run(command, check=False).returncode == 0:
+            return True
+        if destination.exists():
+            shutil.rmtree(destination, ignore_errors=True)
+    try:
+        shutil.copytree(source, destination, symlinks=True)
+        return True
+    except OSError:
+        shutil.rmtree(destination, ignore_errors=True)
+        return False
+
+
 def prepare_dependencies(canonical: Path, worktree: Path, dep: dict[str, Any]) -> str:
     policy = dep.get("policy", "independent")
     directory = safe_relative(dep.get("directory", "node_modules"))
     canonical_dir = canonical / directory
     # Validate the parent without following a possibly stale dependency link.
     destination = contained_destination(worktree, (directory.parent / ".hwt-path-check").as_posix()).parent / directory.name
-    if policy == "auto":
-        # Best-effort default: detect the package manager from the lockfile and
-        # install. Failures warn instead of aborting the bootstrap.
+    if policy in ("auto", "clone"):
+        # Best-effort defaults. "clone": copy the canonical checkout's modules
+        # (copy-on-write where the filesystem supports it) when lockfiles are
+        # identical, else fall through to the lockfile-detected install, same
+        # as "auto". Failures warn instead of aborting the bootstrap.
         if destination.is_dir() and not destination.is_symlink():
             return "present"
         if destination.is_symlink():
             destination.unlink()
+        if policy == "clone":
+            clone_lock = dep.get("lockfile") or next(
+                (name for name, _ in LOCKFILE_COMMANDS if (canonical / name).is_file()), None)
+            if clone_lock:
+                try:
+                    source_dir = safe_source(canonical, directory.as_posix())
+                except (SafetyError, FileNotFoundError):
+                    source_dir = None
+                worktree_lockfile = worktree / clone_lock
+                if (source_dir is not None and source_dir.is_dir() and worktree_lockfile.is_file()
+                        and hash_file(canonical / clone_lock) == hash_file(worktree_lockfile)):
+                    if clone_tree(source_dir, destination):
+                        log(f"cloned {directory} from the canonical checkout")
+                        return "cloned"
+                    log(f"warning: cloning {directory} failed; falling back to install")
         command = detect_install_command(worktree)
         if not command:
             return "none"
@@ -690,7 +728,7 @@ def _bootstrap_locked(cfg: dict[str, Any], state: Path, worktree: Path, workspac
         ensure_layout(h,workspace,worktree,port,cfg.get("dev_host","127.0.0.1"),cfg.get("remote_host",""),bool(repo.get("start_agent",False)),repo_view,agent_kind=cfg.get("agent_kind","hermes"))
         # Tabs first, install second: the workspace appears immediately while a
         # potentially slow package-manager run happens afterwards.
-        dep_status=prepare_dependencies(canonical,worktree,repo.get("dependencies",{"policy":"auto"}))
+        dep_status=prepare_dependencies(canonical,worktree,repo.get("dependencies",{"policy":"clone"}))
     except Exception:
         release_port(state, str(worktree))
         raise
@@ -815,10 +853,16 @@ def run_init_interview(cfg: dict[str, Any], name: str, config_path: Path) -> Pat
             files = env_ops
     else:
         print("No untracked .env files found in the repository root.")
-    dep_policy = "auto"
+    dep_policy = "clone"
     install = detect_install_command(canonical)
-    if install and not ask_yes_no(f"Run '{' '.join(install)}' automatically in new worktrees?", True):
-        dep_policy = "independent"
+    if install:
+        if (canonical / "node_modules").is_dir():
+            description = ("clone node_modules from this checkout when lockfiles match, "
+                           f"otherwise run '{' '.join(install)}'")
+        else:
+            description = f"run '{' '.join(install)}'"
+        if not ask_yes_no(f"Set up dependencies automatically in new worktrees ({description})?", True):
+            dep_policy = "independent"
     suggestion = suggest_dev_command(canonical)
     rendered = " ".join(suggestion) if suggestion else "none"
     raw = input(f"Dev server command [{rendered}]: ").strip()
