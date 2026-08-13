@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.15.1 — 2026-08-13
+
+- Base-branch candidates fixed and reordered: the canonical checkout's own branch is no longer excluded (having `develop` checked out in the main clone was hiding `origin/develop` — the most wanted base), only branches checked out in *linked* worktrees are; and plain main-line names (`develop`, `main`, `staging`) sort before slash-namespaced topic branches so they always make the top-10 cut.
+
 ## 0.15.0 — 2026-08-13
 
 - `hwt init` now asks for the repository's base branch (first question), offering the current setting plus the repository's remote branches; typed values are validated and must be remote-tracking refs (cleanup verifies merges against the base). Previously the installer's `origin/HEAD` guess was carried forward silently.

@@ -1119,6 +1119,17 @@ class BaseRefTests(unittest.TestCase):
         self.assertNotIn("origin/HEAD", names)
         self.assertNotIn("origin/used-branch", names)
 
+    def test_canonical_checkout_branch_is_not_excluded_and_plain_names_come_first(self):
+        current = hwt.git(self.repo, "branch", "--show-current").stdout.strip()
+        hwt.git(self.repo, "update-ref", f"refs/remotes/origin/{current}", "HEAD")
+        hwt.git(self.repo, "update-ref", "refs/remotes/origin/hermes/topic-x", "HEAD")
+        hwt.git(self.repo, "update-ref", "refs/remotes/origin/develop", "HEAD")
+        names = hwt.remote_base_candidates(self.repo, "origin")
+        # the branch checked out in the MAIN checkout stays offered
+        self.assertIn(f"origin/{current}", names)
+        # plain main-line names sort before slash-namespaced topic branches
+        self.assertLess(names.index("origin/develop"), names.index("origin/hermes/topic-x"))
+
     def test_cmd_new_never_passes_cwd_alongside_workspace(self):
         # herdr worktree create rejects --workspace together with --cwd (exit 2)
         worktrees = self.root / ".wts"

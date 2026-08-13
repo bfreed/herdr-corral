@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.15.0"
+__version__ = "0.15.1"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -981,7 +981,11 @@ def ref_exists(repo: Path, ref: str) -> bool:
 
 
 def remote_base_candidates(canonical: Path, remote: str) -> list[str]:
-    """Remote branches by recency, excluding HEAD and branches checked out in a worktree."""
+    """Remote branches, main-line names first, then topic branches by recency.
+
+    Branches checked out in *linked* worktrees are excluded (they're being
+    worked on); the canonical checkout's own branch is NOT — it's often exactly
+    the base people want (e.g. develop checked out in the main clone)."""
     result = git(canonical, "for-each-ref", "--sort=-committerdate",
                  "--format=%(refname:short)", f"refs/remotes/{remote}", check=False)
     if result.returncode:
@@ -989,13 +993,21 @@ def remote_base_candidates(canonical: Path, remote: str) -> list[str]:
     branches = [line.strip() for line in result.stdout.splitlines()
                 if line.strip() and not line.strip().endswith("/HEAD")]
     used: set[str] = set()
-    worktrees = git(canonical, "worktree", "list", "--porcelain", check=False)
-    if worktrees.returncode == 0:
-        for line in worktrees.stdout.splitlines():
-            if line.startswith("branch refs/heads/"):
-                used.add(line.removeprefix("branch refs/heads/").strip())
-    return [branch for branch in branches
-            if "/" in branch and branch.split("/", 1)[1] not in used]
+    listing = git(canonical, "worktree", "list", "--porcelain", check=False)
+    if listing.returncode == 0:
+        canonical_real = canonical.resolve()
+        current_path: Path | None = None
+        for line in listing.stdout.splitlines():
+            if line.startswith("worktree "):
+                current_path = Path(line.removeprefix("worktree ").strip())
+            elif line.startswith("branch refs/heads/") and current_path is not None:
+                if current_path.resolve() != canonical_real:
+                    used.add(line.removeprefix("branch refs/heads/").strip())
+    names = [branch for branch in branches
+             if "/" in branch and branch.split("/", 1)[1] not in used]
+    plain = [branch for branch in names if "/" not in branch.split("/", 1)[1]]
+    slashed = [branch for branch in names if "/" in branch.split("/", 1)[1]]
+    return plain + slashed
 
 
 def interactive_new_setup(args, cfg: dict[str, Any]) -> None:
