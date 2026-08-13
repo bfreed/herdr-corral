@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.9.5"
+__version__ = "0.9.6"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -1064,16 +1064,42 @@ def normalize_worktree_item(raw: dict[str, Any], repository: str) -> dict[str, A
     return item
 
 
+def repo_is_canonical_checkout(repo_path: Path) -> bool:
+    if not repo_path.is_dir():
+        return False
+    common = git(repo_path, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)
+    if common.returncode:
+        return False
+    return is_within(Path(common.stdout.strip()).resolve(), repo_path.resolve())
+
+
 def configured_worktree_items(cfg: dict[str, Any], herdr: Any) -> list[dict[str, Any]]:
-    items = []
+    # Two configured repositories can alias the same repo (e.g. a linked
+    # worktree mistakenly registered as a repository); dedupe by checkout path,
+    # preferring the entry backed by the canonical checkout.
+    items: list[dict[str, Any]] = []
+    seen: dict[str, int] = {}
     for name, repo in cfg["repositories"].items():
         if repo.get("mode") != "worktree":
             continue
+        canonical_source = repo_is_canonical_checkout(Path(repo["path"]))
         result = herdr.call("worktree", "list", "--cwd", str(repo["path"]))["result"]
         raw_items = next((result[key] for key in ("worktrees", "items", "entries")
                           if isinstance(result.get(key), list)), [])
         for raw in raw_items:
-            items.append(normalize_worktree_item(raw, name))
+            item = normalize_worktree_item(raw, name)
+            item["_canonical_source"] = canonical_source
+            path = item.get("path")
+            key = str(Path(path).resolve()) if isinstance(path, str) and path else None
+            if key is not None and key in seen:
+                if canonical_source and not items[seen[key]].get("_canonical_source"):
+                    items[seen[key]] = item
+                continue
+            if key is not None:
+                seen[key] = len(items)
+            items.append(item)
+    for item in items:
+        item.pop("_canonical_source", None)
     return items
 
 

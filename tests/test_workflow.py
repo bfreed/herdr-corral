@@ -612,6 +612,19 @@ class RemovalTests(unittest.TestCase):
         self.assertEqual(items, [{"branch": "feature/x", "repository": "demo"}])
         fake.call.assert_called_once_with("worktree", "list", "--cwd", "/canon/demo")
 
+    def test_duplicate_worktree_entries_across_repo_aliases_are_deduped(self):
+        cfg = {"repositories": {
+            "demo": {"path": "/canon/demo", "mode": "worktree"},
+            "demo--main": {"path": "/canon/demo--main", "mode": "worktree"},
+        }}
+        fake = mock.Mock()
+        fake.call.return_value = {"result": {"worktrees": [{
+            "branch": "feature/x", "path": "/wts/demo/feature-x",
+            "is_linked_worktree": True}]}}
+        items = hwt.configured_worktree_items(cfg, fake)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["repository"], "demo")
+
     def test_live_worktree_item_resolves_open_workspace_id(self):
         item = {"open_workspace_id": "w3", "path": "/approved/wt"}
         self.assertEqual(hwt.worktree_item_ids(item), ("w3", Path("/approved/wt")))
@@ -910,6 +923,27 @@ class RenderOverlayTests(unittest.TestCase):
         self.assertEqual(repo["dependencies"]["policy"], "auto")
         self.assertEqual(repo["commands"]["dev"], ["npm", "run", "dev"])
         self.assertEqual(repo["environment"]["APP_ENV"], "development")
+
+
+class DiscoveryTests(unittest.TestCase):
+    def test_linked_worktrees_are_not_discovered_as_repositories(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "corral_install", Path(__file__).parents[1] / "install.py")
+        install = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(install)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp)
+            repo = root / "myrepo"
+            repo.mkdir()
+            hwt.git(root, "init", "-q", str(repo))
+            (repo / "f.txt").write_text("x")
+            hwt.git(repo, "add", "f.txt")
+            hwt.git(repo, "-c", "user.email=t@example.invalid", "-c", "user.name=T",
+                    "-c", "commit.gpgsign=false", "commit", "-q", "-m", "c")
+            hwt.git(repo, "worktree", "add", "-q", str(root / "myrepo--main"), "-b", "wt-branch")
+            found = install.discover_repositories(root)
+        self.assertEqual([name for name, _, _ in found], ["myrepo"])
 
 
 if __name__ == "__main__":

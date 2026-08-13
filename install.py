@@ -38,6 +38,14 @@ def discover_repositories(root: Path, exclude: Path | None = None) -> list[tuple
         top = git_output(path, "rev-parse", "--show-toplevel")
         if not top or Path(top).resolve() != path.resolve():
             continue
+        # A linked worktree is its own toplevel but keeps its git dir in the
+        # canonical repository; registering it would duplicate that repository.
+        common = git_output(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        if common:
+            try:
+                Path(common).resolve().relative_to(path.resolve())
+            except ValueError:
+                continue
         remote_head = git_output(path, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD")
         base = remote_head.removeprefix("refs/remotes/") if remote_head else None
         if not base:

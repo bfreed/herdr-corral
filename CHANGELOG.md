@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.9.6 — 2026-08-13
+
+- Repository discovery no longer registers linked worktrees found in the repos root as separate repositories (their git dir lives in the canonical repo).
+- Worktree listings dedupe entries that appear under multiple configured repositories aliasing the same repo, preferring the canonical checkout — fixes the same worktree showing twice in the `hwt cleanup` picker.
+
 ## 0.9.5 — 2026-08-13
 
 - `hwt cleanup` is now usable by humans: with no argument it lists linked worktrees as a numbered menu; with a target that has no exact match it lists similar worktrees (substring + close-match) the same way. Enter a number instead of typing branch names.
