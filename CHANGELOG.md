@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.1 — 2026-08-13
+
+- Palette layout decluttered: worktrees grouped under repository headers, each as `N. branch [annotation]` with the path (home shortened to `~`) dimmed on its own indented line; annotations colored (green cleans-instantly, yellow unpublished, red dirty). Colors respect `NO_COLOR` and non-TTY output.
+
 ## 0.10.0 — 2026-08-13
 
 - **`hwt sweep`**: batch cleanup — deletes every linked worktree that qualifies without questions (merged or nothing-unique, clean) and reports the kept ones with a ready-to-paste `--abandon` command each.

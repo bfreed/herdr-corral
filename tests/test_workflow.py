@@ -784,6 +784,31 @@ class WorktreeSafetyTests(unittest.TestCase):
             self.assertEqual(hwt.worktree_safety(self.CFG, dict(self.ITEM)), "no-unique-commits")
 
 
+class PaletteLayoutTests(unittest.TestCase):
+    def test_worktrees_group_under_repo_headers_with_indented_paths(self):
+        items = [
+            {"branch": "hermes/fix-a", "path": str(Path.home() / "GitRepos" / "wt-a"),
+             "repository": "flashcards", "is_linked_worktree": True},
+            {"branch": "hermes/fix-b", "path": "/elsewhere/wt-b",
+             "repository": "flashcards", "is_linked_worktree": True},
+            {"branch": "hermes/lidar-x", "path": "/elsewhere/wt-x",
+             "repository": "lidar", "is_linked_worktree": True},
+        ]
+        with mock.patch.object(hwt, "worktree_safety", side_effect=["merged", "dirty", "no-unique-commits"]), \
+             mock.patch.dict(os.environ, {"NO_COLOR": "1"}):
+            lines = hwt.palette_lines({}, items)
+        text = "\n".join(lines)
+        self.assertIn("\nflashcards\n", text)
+        self.assertIn("\nlidar\n", text)
+        self.assertIn("   1. hermes/fix-a  [merged — cleans instantly]", lines)
+        self.assertIn(f"      ~{os.sep}GitRepos{os.sep}wt-a", text)
+        self.assertLess(text.index("flashcards"), text.index("hermes/fix-a"))
+        self.assertLess(text.index("hermes/fix-b"), text.index("lidar"))
+
+    def test_empty_list_is_stated(self):
+        self.assertIn("  (none)", hwt.palette_lines({}, []))
+
+
 class PaletteTests(unittest.TestCase):
     def test_palette_requires_a_terminal(self):
         with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: False)):

@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.10.0"
+__version__ = "0.10.1"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -1248,6 +1248,42 @@ def worktree_safety(cfg: dict[str, Any], item: dict[str, Any]) -> str:
     return "unpublished-work"
 
 
+SAFETY_COLORS = {"merged": "32", "no-unique-commits": "32",
+                 "unpublished-work": "33", "dirty": "31", "detached": "33"}
+
+
+def colorize(text: str, code: str) -> str:
+    if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        return text
+    return f"\x1b[{code}m{text}\x1b[0m"
+
+
+def shorten_home(path: str) -> str:
+    home = str(Path.home())
+    if path.startswith(home):
+        return "~" + path[len(home):]
+    return path
+
+
+def palette_lines(cfg: dict[str, Any], items: list[dict[str, Any]]) -> list[str]:
+    lines = [colorize("Corral — worktrees", "1")]
+    if not items:
+        lines.append("  (none)")
+    current_repo = None
+    for index, item in enumerate(items, 1):
+        repo = item.get("repository", "?")
+        if repo != current_repo:
+            lines.append("")
+            lines.append(colorize(repo, "1"))
+            current_repo = repo
+        safety = worktree_safety(cfg, item)
+        label = colorize(f"[{SAFETY_LABELS.get(safety, safety)}]", SAFETY_COLORS.get(safety, "0"))
+        branch = item.get("branch") or "(detached)"
+        lines.append(f"  {index:>2}. {branch}  {label}")
+        lines.append(colorize(f"      {shorten_home(str(item.get('path', '?')))}", "2"))
+    return lines
+
+
 def palette_new_worktree(args, cfg, state, herdr) -> None:
     repos = [name for name, repo in cfg["repositories"].items() if repo.get("mode") == "worktree"]
     if not repos:
@@ -1282,12 +1318,8 @@ def cmd_palette(args, cfg, state, herdr):
         raise WorkflowError("palette is interactive; open it via the Corral popup or a terminal")
     while True:
         items = [i for i in configured_worktree_items(cfg, herdr) if i.get("is_linked_worktree", False)]
-        print("\nCorral — worktrees")
-        if not items:
-            print("  (none)")
-        for index, item in enumerate(items, 1):
-            safety = worktree_safety(cfg, item)
-            print(f"  {index}. {describe_worktree_item(item)}  [{SAFETY_LABELS.get(safety, safety)}]")
+        print()
+        print("\n".join(palette_lines(cfg, items)))
         choice = input("\n[number] clean up   [n]ew worktree   [s]weep   [q]uit > ").strip().lower()
         if choice in ("", "q", "quit"):
             return
