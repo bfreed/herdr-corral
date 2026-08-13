@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.10.3 — 2026-08-13
+
+- Worktree identity is now decided by git, not path conventions: any checkout whose `git-common-dir` resolves inside a configured repository is recognized (cleanup, remove, open, event bootstrap), wherever it lives — including flat ad-hoc siblings like `<repos-root>/<repo>-<name>`. Approved-roots matching remains as fallback; worktrees of unconfigured repositories are still refused, and the huge roots list is gone from the error message.
+
 ## 0.10.2 — 2026-08-13
 
 - Worktrees that are not open in Herdr can now be cleaned up and removed: Herdr's `worktree.remove` API is workspace-only (verified from source: `WorktreeRemoveParams { workspace_id, force }`), so closed checkouts are removed via `git worktree remove` directly. Fixes "Herdr worktree entry lacks an open workspace id or path" when picking a closed worktree in the palette.

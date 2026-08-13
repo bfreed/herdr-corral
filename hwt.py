@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.10.2"
+__version__ = "0.10.3"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -617,22 +617,37 @@ def is_in_approved_worktree_root(cfg: dict[str, Any], path: Path, *, strict: boo
 
 def repo_for_worktree(cfg: dict[str, Any], path: Path) -> tuple[str, dict[str, Any], Path]:
     target = resolve_existing(path)
+    # Strongest evidence first: a linked worktree's git common dir lives inside
+    # its canonical repository, wherever the checkout itself happens to be.
+    # Path conventions vary (sibling dirs, shared roots, flat ad-hoc names);
+    # git's answer does not.
+    common = git(target, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)
+    if common.returncode == 0 and common.stdout.strip():
+        common_dir = Path(common.stdout.strip()).resolve()
+        for name, repo in cfg.get("repositories", {}).items():
+            if "path" not in repo:
+                continue
+            try:
+                repo_path = Path(repo["path"]).expanduser().resolve(strict=True)
+            except FileNotFoundError:
+                continue
+            if target != repo_path and is_within(common_dir, repo_path):
+                return name, repo, repo_path
+    # Path-convention fallback for checkouts git cannot identify here.
     approved = approved_worktree_roots(cfg)
-    if not any(is_within(target, root) for root in approved):
-        joined = ", ".join(map(str, approved))
-        raise SafetyError(f"refusing path outside approved worktree roots [{joined}]: {target}")
-    for name, repo in cfg["repositories"].items():
-        if "path" not in repo:
-            continue
-        sibling = sibling_worktree_dir(Path(repo["path"])).resolve()
-        if sibling.exists() and is_within(target, sibling):
-            return name, repo, resolve_existing(Path(repo["path"]))
-    for root in approved:
-        for name, repo in cfg["repositories"].items():
-            repo_root = root / name
-            if repo_root.exists() and is_within(target, repo_root.resolve()):
+    if any(is_within(target, root) for root in approved):
+        for name, repo in cfg.get("repositories", {}).items():
+            if "path" not in repo:
+                continue
+            sibling = sibling_worktree_dir(Path(repo["path"])).resolve()
+            if sibling.exists() and is_within(target, sibling):
                 return name, repo, resolve_existing(Path(repo["path"]))
-    raise SafetyError(f"worktree is not beneath a configured repository namespace: {target}")
+        for root in approved:
+            for name, repo in cfg.get("repositories", {}).items():
+                repo_root = root / name
+                if repo_root.exists() and is_within(target, repo_root.resolve()):
+                    return name, repo, resolve_existing(Path(repo["path"]))
+    raise SafetyError(f"path is not a linked worktree of any configured repository: {target}")
 
 
 def validate_worktree_identity(cfg: dict[str, Any], worktree: Path) -> tuple[str, dict[str, Any], Path]:
@@ -1504,7 +1519,17 @@ def cmd_event(args,cfg,state,herdr):
             yield value
     if event in ("worktree.created","worktree.opened"):
         paths=[Path(x) for x in values(payload, {"path", "cwd", "worktree_path"})]
-        worktree=next((p for p in paths if p.exists() and is_in_approved_worktree_root(cfg, p)),None)
+        def recognized(p: Path) -> bool:
+            if not p.exists():
+                return False
+            if is_in_approved_worktree_root(cfg, p):
+                return True
+            try:
+                repo_for_worktree(cfg, p)
+                return True
+            except WorkflowError:
+                return False
+        worktree=next((p for p in paths if recognized(p)),None)
         workspace=os.environ.get("HERDR_WORKSPACE_ID") or next(iter(values(payload, {"workspace_id"})),None)
         if worktree and workspace: bootstrap(cfg,state,worktree,workspace,herdr)
     elif event=="worktree.removed":

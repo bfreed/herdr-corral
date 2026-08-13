@@ -83,6 +83,33 @@ class PathSafetyTests(unittest.TestCase):
         self.assertEqual(name, "demo")
         self.assertEqual(canonical, self.canonical.resolve())
 
+    def test_flat_ad_hoc_worktree_maps_via_git_common_dir(self):
+        self._make_canonical_a_git_repo_with_commit(self.canonical)
+        flat = self.root / "repos" / "demo-fix-pr9"
+        hwt.git(self.canonical, "worktree", "add", "-q", str(flat), "-b", "fix-pr9")
+        cfg = {
+            "worktree_root": str(self.worktrees),
+            "additional_worktree_roots": [],
+            "repositories": {"demo": {"path": str(self.canonical)}},
+        }
+        name, _, canonical = hwt.repo_for_worktree(cfg, flat)
+        self.assertEqual(name, "demo")
+        self.assertEqual(canonical, self.canonical.resolve())
+
+    def test_worktree_of_unconfigured_repository_is_rejected(self):
+        other = self.root / "repos" / "other"
+        other.mkdir()
+        self._make_canonical_a_git_repo_with_commit(other)
+        stray = self.root / "repos" / "other-fix"
+        hwt.git(other, "worktree", "add", "-q", str(stray), "-b", "fix")
+        cfg = {
+            "worktree_root": str(self.worktrees),
+            "additional_worktree_roots": [],
+            "repositories": {"demo": {"path": str(self.canonical)}},
+        }
+        with self.assertRaises(hwt.SafetyError):
+            hwt.repo_for_worktree(cfg, stray)
+
     def test_sibling_directory_of_unconfigured_repo_is_rejected(self):
         stray = self.root / "repos" / "other__worktrees" / "task"
         stray.mkdir(parents=True)
@@ -95,12 +122,19 @@ class PathSafetyTests(unittest.TestCase):
             hwt.repo_for_worktree(cfg, stray)
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.root = Path(self.tmp.name).resolve()
         self.canonical = self.root / "repos" / "demo"
         self.worktrees = self.root / "repos" / ".worktrees"
         self.canonical.mkdir(parents=True)
         self.worktrees.mkdir()
+
+    def _make_canonical_a_git_repo_with_commit(self, repo: Path) -> None:
+        hwt.git(repo.parent, "init", "-q", str(repo))
+        (repo / "f.txt").write_text("x")
+        hwt.git(repo, "add", "f.txt")
+        hwt.git(repo, "-c", "user.email=t@example.invalid", "-c", "user.name=T",
+                "-c", "commit.gpgsign=false", "commit", "-q", "-m", "c")
 
     def tearDown(self):
         self.tmp.cleanup()
