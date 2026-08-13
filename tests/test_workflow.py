@@ -1188,6 +1188,16 @@ class RenderOverlayTests(unittest.TestCase):
         self.assertEqual(repo["environment"]["APP_ENV"], "development")
 
 
+class CliHelpTests(unittest.TestCase):
+    def test_internal_subcommands_are_hidden_from_help(self):
+        text = hwt.parser().format_help()
+        self.assertNotIn("SUPPRESS", text)
+        self.assertNotIn("cleanup-workspace", text)
+        self.assertNotIn("palette-open", text)
+        for public in ("sweep", "palette", "cleanup", "doctor"):
+            self.assertIn(public, text)
+
+
 class DiscoveryTests(unittest.TestCase):
     def test_linked_worktrees_are_not_discovered_as_repositories(self):
         import importlib.util

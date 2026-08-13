@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.11.1 — 2026-08-13
+
+- `hwt -h` no longer shows `==SUPPRESS==` rows: the internal entry points (`event`, `cleanup-workspace`, `palette-open`, invoked by Herdr) are properly hidden from usage and the command table, and `list`/`status`/`doctor` gained help lines.
+
 ## 0.11.0 — 2026-08-13
 
 - New default dependency policy `clone`: when the canonical checkout has a `node_modules` and its lockfile is byte-identical to the new worktree's, the directory is copied via copy-on-write (`cp --reflink=auto` on Linux, APFS clonefile on macOS, plain copy fallback) — near-instant and fully independent. Any mismatch or failure falls back to the lockfile-detected install (`auto` behavior). The init interview offers this as the default; existing `auto` configs behave as before.

@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.11.0"
+__version__ = "0.11.1"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -1585,20 +1585,26 @@ def cmd_event(args,cfg,state,herdr):
 def parser() -> argparse.ArgumentParser:
     p=argparse.ArgumentParser(prog="hwt",description="Corral: safe Git-worktree workflow for Herdr")
     p.add_argument("--config",type=Path,default=DEFAULT_CONFIG,help=argparse.SUPPRESS)
-    sub=p.add_subparsers(dest="command",required=True)
+    # metavar hides the internal entry points (event, cleanup-workspace,
+    # palette-open, invoked by Herdr) from usage; omitting their help keeps
+    # them out of the table below it.
+    sub=p.add_subparsers(dest="command",required=True,
+                         metavar="{new,open,init,list,status,dev,remove,cleanup,sweep,palette,doctor,update}")
     n=sub.add_parser("new",help="create a worktree for a new branch"); n.add_argument("branch"); n.add_argument("--base"); n.add_argument("--repo"); n.add_argument("--background",action="store_true")
     o=sub.add_parser("open",help="open a repository or existing worktree"); o.add_argument("target")
     i=sub.add_parser("init",help="interactively configure a repository"); i.add_argument("repository",nargs="?")
-    sub.add_parser("list"); sub.add_parser("status")
+    sub.add_parser("list",help="configured repositories and live worktrees")
+    sub.add_parser("status",help="port leases and dev-server status")
     d=sub.add_parser("dev",help="start the configured dev server on a leased port"); d.add_argument("--port",type=int)
     r=sub.add_parser("remove",help="remove a worktree, keeping its branch"); r.add_argument("target"); r.add_argument("--force",action="store_true"); r.add_argument("--confirm")
     c=sub.add_parser("cleanup",help="delete worktree and branch (merged: no questions)"); c.add_argument("target",nargs="?",help="branch, path, or worktree name; omit to pick from a list"); c.add_argument("--abandon",action="store_true",help="delete even if unmerged or dirty (requires --confirm BRANCH)"); c.add_argument("--confirm")
     sub.add_parser("sweep",help="clean up every worktree that qualifies without questions")
     sub.add_parser("palette",help="interactive worktree palette (runs inside the Corral popup)")
-    sub.add_parser("doctor"); sub.add_parser("update",help="update Corral in place (git pull)")
-    e=sub.add_parser("event",help=argparse.SUPPRESS)
-    sub.add_parser("cleanup-workspace",help=argparse.SUPPRESS)
-    sub.add_parser("palette-open",help=argparse.SUPPRESS)
+    sub.add_parser("doctor",help="environment checks and update availability")
+    sub.add_parser("update",help="update Corral in place (git pull)")
+    sub.add_parser("event")
+    sub.add_parser("cleanup-workspace")
+    sub.add_parser("palette-open")
     return p
 
 
