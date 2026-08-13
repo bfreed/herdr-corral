@@ -45,12 +45,16 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.9.2"
+__version__ = "0.9.3"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
 DEFAULT_STATE = Path.home() / ".local/state/herdr-corral"
 PLUGIN_ID = "corral"
+# Herdr's built-in "new worktree" flow checks out under [worktrees].directory,
+# default ~/.herdr/worktrees/<repo>/<slug>. Approving it makes those worktrees
+# first-class Corral citizens.
+HERDR_NATIVE_WORKTREES = Path.home() / ".herdr/worktrees"
 
 
 def runtime_state_dir() -> Path:
@@ -594,12 +598,13 @@ def check_remove_allowed(dirty: bool, force: bool, confirmation: str | None, bra
 
 
 def sibling_worktree_dir(repo_path: Path) -> Path:
-    """Native Herdr/workmux convention: worktrees in <repo>__worktrees next to the repo."""
+    """workmux-style convention: worktrees in <repo>__worktrees next to the repo."""
     return repo_path.parent / f"{repo_path.name}__worktrees"
 
 
 def approved_worktree_roots(cfg: dict[str, Any]) -> list[Path]:
-    roots = [Path(cfg["worktree_root"]), *map(Path, cfg.get("additional_worktree_roots", []))]
+    roots = [Path(cfg["worktree_root"]), HERDR_NATIVE_WORKTREES,
+             *map(Path, cfg.get("additional_worktree_roots", []))]
     roots += [sibling_worktree_dir(Path(repo["path"]))
               for repo in cfg.get("repositories", {}).values() if "path" in repo]
     return [root.resolve() for root in roots]
@@ -964,7 +969,7 @@ def cmd_open(args,cfg,state,herdr:Herdr):
             wanted.add(branch_slug(args.target))
         for name,repo in cfg["repositories"].items():
             if args.target==name: matches.append(Path(repo["path"]))
-            candidates = [Path(cfg["worktree_root"])/name, sibling_worktree_dir(Path(repo["path"]))]
+            candidates = [Path(cfg["worktree_root"])/name, HERDR_NATIVE_WORKTREES/name, sibling_worktree_dir(Path(repo["path"]))]
             for wtroot in candidates:
                 if wtroot.exists(): matches += [p for p in wtroot.iterdir() if p.name in wanted]
         if len(matches)!=1: raise WorkflowError(f"target did not resolve uniquely: {args.target}")

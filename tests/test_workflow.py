@@ -69,6 +69,20 @@ class PathSafetyTests(unittest.TestCase):
         self.assertEqual(name, "demo")
         self.assertEqual(canonical, self.canonical.resolve())
 
+    def test_herdr_native_worktree_root_is_recognized(self):
+        native = self.root / "herdr-native-worktrees"
+        wt = native / "demo" / "worktree-green-river"
+        wt.mkdir(parents=True)
+        cfg = {
+            "worktree_root": str(self.worktrees),
+            "additional_worktree_roots": [],
+            "repositories": {"demo": {"path": str(self.canonical)}},
+        }
+        with mock.patch.object(hwt, "HERDR_NATIVE_WORKTREES", native):
+            name, _, canonical = hwt.repo_for_worktree(cfg, wt)
+        self.assertEqual(name, "demo")
+        self.assertEqual(canonical, self.canonical.resolve())
+
     def test_sibling_directory_of_unconfigured_repo_is_rejected(self):
         stray = self.root / "repos" / "other__worktrees" / "task"
         stray.mkdir(parents=True)

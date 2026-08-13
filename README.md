@@ -58,7 +58,9 @@ hwt cleanup feature/my-task --abandon --confirm feature/my-task
 
 The first time you create a worktree for a repository, Corral offers to configure it (which env files to copy, whether to auto-install dependencies, the dev-server command). Repositories without explicit settings get safe defaults: copy untracked `.env` / `.env.*`, auto-detect the package manager, no dev server assumed, never a test tab, never an auto-started server.
 
-**Worktree placement:** by default (`worktree_placement = "sibling"`) new worktrees go to `<repo>__worktrees/` next to each repository — the same layout Herdr's native worktree flow and workmux use, so worktrees you created before Corral are recognized, bootstrapped, and cleanable too. Set `worktree_placement = "shared-root"` to collect them under `worktree_root/<repo>/` instead.
+**Worktree placement:** by default (`worktree_placement = "sibling"`) `hwt new` puts worktrees in `<repo>__worktrees/` next to each repository (the workmux layout, so pre-Corral worktrees are recognized, bootstrapped, and cleanable). Set `worktree_placement = "shared-root"` to collect them under `worktree_root/<repo>/` instead.
+
+Worktrees created through **Herdr's own UI** (right-click → new worktree) land under Herdr's `[worktrees].directory` — default `~/.herdr/worktrees/<repo>/<slug>` — which Corral approves automatically, so those get the full bootstrap (env files, dependencies, tabs, port lease) and work with `hwt cleanup` too. To keep everything in one place, point Herdr's `[worktrees].directory` at Corral's `worktree_root` and set `worktree_placement = "shared-root"`.
 
 ## Updating
 
