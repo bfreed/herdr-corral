@@ -307,6 +307,22 @@ class LayoutTests(unittest.TestCase):
         ]
         self.assertEqual(hwt.find_workspace_for_path(fake, Path("/canon")), "w2")
 
+    def test_workspace_discovery_falls_back_to_exact_label(self):
+        fake = mock.Mock()
+        fake.call.side_effect = [
+            {"result": {"workspaces": [{"workspace_id": "w1", "label": "demo"}]}},
+            {"result": {"workspace": {"cwd": "/somewhere-else"}}},
+        ]
+        self.assertEqual(hwt.find_workspace_for_path(fake, Path("/canon"), "demo"), "w1")
+
+    def test_workspace_discovery_without_label_does_not_guess(self):
+        fake = mock.Mock()
+        fake.call.side_effect = [
+            {"result": {"workspaces": [{"workspace_id": "w1", "label": "demo"}]}},
+            {"result": {"workspace": {"cwd": "/somewhere-else"}}},
+        ]
+        self.assertIsNone(hwt.find_workspace_for_path(fake, Path("/canon")))
+
     def test_workspace_discovery_accepts_herdr_checkout_path(self):
         fake = mock.Mock()
         fake.call.side_effect = [

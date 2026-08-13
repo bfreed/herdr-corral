@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -574,7 +574,7 @@ def ensure_canonical_layout(herdr: Any, workspace: str, repo_path: Path,
 
 def ensure_canonical_workspace(herdr: Any, repo_path: Path, repo_name: str,
                                start_agent: bool, agent_kind: str = "hermes") -> str:
-    existing = find_workspace_for_path(herdr, repo_path)
+    existing = find_workspace_for_path(herdr, repo_path, repo_name)
     if existing:
         ensure_canonical_layout(herdr, existing, repo_path, repo_name, start_agent, agent_kind)
         return existing
@@ -870,10 +870,20 @@ def cmd_new(args, cfg, state, herdr: Herdr):
     run(["git","check-ref-format","--branch",branch])
     if repo.get("fetch",True): fetch_with_offline_fallback(canonical,repo.get("remote","origin"))
     canonical_workspace = ensure_canonical_workspace(herdr, canonical, name, False)
-    path=Path(cfg["worktree_root"])/name/branch_slug(branch); path.parent.mkdir(parents=True,exist_ok=True)
+    path=Path(cfg["worktree_root"])/name/branch_slug(branch)
+    created_namespace = not path.parent.exists()
+    path.parent.mkdir(parents=True,exist_ok=True)
     require_within(path.parent,Path(cfg["worktree_root"]))
     command=["worktree","create","--workspace",canonical_workspace,"--cwd",str(canonical),"--branch",branch,"--base",base,"--path",str(path),"--label",f"{name}: {branch}","--no-focus" if args.background else "--focus"]
-    obj=herdr.call(*command); workspace=json_result(obj,"result","workspace","workspace_id")
+    try:
+        obj=herdr.call(*command)
+    except WorkflowError:
+        # A failed create must not leave an empty namespace directory behind.
+        if created_namespace:
+            with contextlib.suppress(OSError):
+                path.parent.rmdir()
+        raise
+    workspace=json_result(obj,"result","workspace","workspace_id")
     summary=bootstrap(cfg,state,path,workspace,herdr)
     if not args.background: herdr.call("workspace","focus",workspace)
     print(json.dumps({
@@ -884,20 +894,42 @@ def cmd_new(args, cfg, state, herdr: Herdr):
     }, indent=2))
 
 
-def find_workspace_for_path(herdr: Herdr,path: Path) -> str | None:
-    listing=herdr.call("workspace","list")["result"]["workspaces"]
+PATH_KEYS = {"cwd", "path", "worktree_path", "checkout_path", "repo_root", "root",
+             "root_path", "workspace_root", "repo_path", "checkout", "directory"}
+
+
+def find_workspace_for_path(herdr: Herdr, path: Path, label: str | None = None) -> str | None:
+    listing = herdr.call("workspace", "list")["result"]["workspaces"]
+    target = path.resolve()
+
+    def paths(value: Any, key: str = ""):
+        if isinstance(value, dict):
+            for k, v in value.items(): yield from paths(v, k)
+        elif isinstance(value, list):
+            for v in value: yield from paths(v, key)
+        elif key in PATH_KEYS and isinstance(value, str):
+            yield value
+
+    def matches(value: str) -> bool:
+        try:
+            return Path(value).expanduser().resolve() == target
+        except (OSError, ValueError):
+            return False
+
+    details = []
     for item in listing:
-        detail=herdr.call("workspace","get",item["workspace_id"])["result"]
-        target = path.resolve()
-        def paths(value: Any, key: str = ""):
-            if isinstance(value, dict):
-                for k, v in value.items(): yield from paths(v, k)
-            elif isinstance(value, list):
-                for v in value: yield from paths(v, key)
-            elif key in {"cwd", "path", "worktree_path", "checkout_path", "repo_root"} and isinstance(value, str):
-                yield value
-        if any(Path(value).expanduser().resolve() == target for value in paths(detail)):
+        detail = herdr.call("workspace", "get", item["workspace_id"])["result"]
+        details.append((item, detail))
+        if any(matches(value) for value in paths(item)) or any(matches(value) for value in paths(detail)):
             return item["workspace_id"]
+    # Path-shape mismatches across Herdr versions must not create duplicate
+    # workspaces, so fall back to the exact label when the caller knows it.
+    if label is not None:
+        for item, detail in details:
+            labels = {item.get("label"), detail.get("label"),
+                      detail.get("workspace", {}).get("label") if isinstance(detail.get("workspace"), dict) else None}
+            if label in labels:
+                return item["workspace_id"]
     return None
 
 
@@ -917,7 +949,7 @@ def cmd_open(args,cfg,state,herdr:Herdr):
         canonical=True
     except SafetyError:
         name,repo,_=repo_for_worktree(cfg,path); canonical=False
-    existing=find_workspace_for_path(herdr,path)
+    existing=find_workspace_for_path(herdr,path,name if canonical else None)
     if existing:
         if not canonical:
             summary = bootstrap(cfg, state, path, existing, herdr)

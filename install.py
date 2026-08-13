@@ -26,12 +26,14 @@ def git_output(repo: Path, *args: str) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
-def discover_repositories(root: Path) -> list[tuple[str, Path, str]]:
+def discover_repositories(root: Path, exclude: Path | None = None) -> list[tuple[str, Path, str]]:
     found = []
     if not root.is_dir():
         return found
     for path in sorted(root.iterdir()):
         if not path.is_dir() or path.name.startswith("."):
+            continue
+        if exclude is not None and path.resolve() == exclude:
             continue
         top = git_output(path, "rev-parse", "--show-toplevel")
         if not top or Path(top).resolve() != path.resolve():
@@ -93,10 +95,27 @@ def main() -> int:
     parser.add_argument("--agent-kind", default="hermes",
                         help="agent started in the 'agent' tab (default: hermes)")
     parser.add_argument("--force-config", action="store_true")
+    parser.add_argument("--uninstall", action="store_true",
+                        help="remove the hwt launcher and unlink the plugin")
+    parser.add_argument("--purge", action="store_true",
+                        help="with --uninstall: also delete configuration and runtime state")
     parser.add_argument("--skip-plugin", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     source = Path(__file__).resolve().parent
+    if args.uninstall:
+        if shutil.which("herdr"):
+            subprocess.run(["herdr", "plugin", "unlink", PLUGIN_ID],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        launcher = Path.home() / ".local/bin/hwt"
+        if launcher.exists():
+            launcher.unlink()
+        if args.purge:
+            shutil.rmtree(Path.home() / ".config/herdr-corral", ignore_errors=True)
+            shutil.rmtree(Path.home() / ".local/state/herdr-corral", ignore_errors=True)
+        kept = "configuration kept" if not args.purge else "configuration and state deleted"
+        print(f"Corral uninstalled ({kept}). Delete the clone itself if desired: {source}")
+        return 0
     if not (source / ".git").exists():
         print("warning: this is not a git clone; `hwt update` will not work", file=sys.stderr)
     repos_root = args.repos_root.expanduser().resolve()
@@ -117,7 +136,7 @@ def main() -> int:
     launcher.chmod(0o755)
 
     config = config_dir / "config.toml"
-    repos = discover_repositories(repos_root)
+    repos = discover_repositories(repos_root, exclude=source)
     if config.exists() and not args.force_config:
         config_result = "preserved existing configuration"
     else:

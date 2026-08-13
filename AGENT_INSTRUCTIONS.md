@@ -53,7 +53,7 @@ python3 ~/.local/share/herdr-corral/install.py \
 
 Add `--dev-host 0.0.0.0 --remote-host <name>` only if the user opted in at question 3.
 
-The clone location matters: the clone **is** the installation (`hwt update` runs `git pull` in it). `~/.local/share/herdr-corral` is the convention; honor the user's preference if they have one.
+The clone location matters: the clone **is** the installation (`hwt update` runs `git pull` in it). `~/.local/share/herdr-corral` is the convention; honor the user's preference if they have one — but do **not** clone into their repositories root. The clone is tooling, not one of their projects.
 
 If `~/.local/bin` is not on PATH, add it using the user's shell conventions, then verify in a fresh shell.
 
@@ -68,14 +68,14 @@ herdr plugin list
 
 Confirm plugin `corral` is linked and enabled. `hwt doctor` failing only on a missing agent CLI is acceptable if the user declined auto-started agents.
 
-Then pick one configured repository and do a non-destructive workspace check:
+Then **ask the user** which repository to use for a live workspace check, and tell them it will create one Herdr workspace with three tabs (and start their agent in it if `start_agent` is enabled). With their approval:
 
 ```bash
 cd <repos-root>/<repository>
 hwt open <repository>
 ```
 
-Using Herdr CLI output, verify: tabs are exactly `agent`, `shell`, `server`; the agent starts only in `agent`; re-running `hwt open` creates no duplicates.
+Using Herdr CLI output, verify: tabs are exactly `agent`, `shell`, `server`; the agent starts only in `agent`; re-running `hwt open <repository>` reuses the same workspace. **If a second run creates a duplicate workspace, stop immediately** — do not retry — and report it as a bug at https://github.com/bfreed/herdr-corral/issues, including the output of `herdr workspace list` and `herdr workspace get <workspace-id>`. When the check is done, offer to close the verification workspace (find the close/remove subcommand in `herdr workspace --help`; do not guess it).
 
 ## Step 5 — configure repositories (only as far as the user wants)
 
@@ -107,6 +107,14 @@ Only add a `dev` command you verified in that repository's own files; supported 
 ## Step 6 — report
 
 Tell the user: which repositories were configured and how, test results, plugin state, the workspace verification performed, and how to update later (`hwt update`; `hwt doctor` announces available updates).
+
+## Uninstall
+
+```bash
+python3 ~/.local/share/herdr-corral/install.py --uninstall          # keep config
+python3 ~/.local/share/herdr-corral/install.py --uninstall --purge  # delete config + state too
+rm -rf ~/.local/share/herdr-corral                                  # remove the clone
+```
 
 ## Troubleshooting
 

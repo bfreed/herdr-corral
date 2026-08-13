@@ -65,6 +65,15 @@ hwt update      # git pull --ff-only + plugin relink
 hwt doctor      # also tells you when an update is available
 ```
 
+## Uninstalling
+
+```bash
+python3 ~/.local/share/herdr-corral/install.py --uninstall --purge
+rm -rf ~/.local/share/herdr-corral
+```
+
+Drop `--purge` to keep `~/.config/herdr-corral` for a later reinstall.
+
 ## Prior art
 
 Corral overlaps with several fine single-purpose plugins — use them if you only need a slice: [herdr-worktree-seed](https://github.com/jlimas/herdr-worktree-seed) (env files + node_modules seeding), [herdr-plugin-workspace-manager](https://github.com/razajamil/herdr-plugin-workspace-manager) (declarative layouts), [herdr-plugin-git-worktree-hooks](https://github.com/freethinkel/herdr-plugin-git-worktree-hooks) and [herdr-worktree-lifecycle](https://github.com/qdentity/herdr-worktree-lifecycle) (generic lifecycle hooks). Corral's reason to exist is the integrated workflow plus merge-safe cleanup.
