@@ -45,7 +45,16 @@ How you ask matters as much as what you ask:
 The questions, each with the detective work to do first:
 
 1. **Where do your Git repositories live?** First scan for plausible parents — `~/repos`, `~/code`, `~/src`, `~/dev`, `~/projects`, `~/GitRepos`, `~/Documents/GitRepos`, and anything else you find under `$HOME` whose immediate children include several Git repositories. Offer the candidates you found (with their repo counts) plus a custom-path option.
-2. **Where should worktrees go?** Offer: (a) `<repo>__worktrees/` next to each repository — the default and Herdr's native layout; existing `__worktrees` directories are recognized automatically; or (b) one collected folder → set `worktree_placement = "shared-root"` in the config and pass `--worktree-root`.
+2. **Where should worktrees go?** The goal is one location and one convention for *both* entry points: Herdr's right-click "new worktree" and `hwt new`. Investigate first:
+   - Read Herdr's current `[worktrees].directory` from `~/.config/herdr/config.toml` (default when absent: `~/.herdr/worktrees`; Herdr organizes checkouts as `<directory>/<repo>/<branch-slug>`).
+   - Scan for existing worktree collections: that Herdr directory, `<repo>__worktrees/` siblings next to repositories (the workmux layout), and any previous Corral `worktree_root`.
+
+   Then offer, telling the user what each choice does:
+   - **(a) Herdr's current directory** (recommended default) → `--worktree-root <that directory>` (placement `shared-root` is the default). No Herdr config change needed.
+   - **(b) A different shared folder** (e.g. a visible one near their repos, or an existing collection you found) → `--worktree-root <folder>`, **and tell the user you will change Herdr's `[worktrees].directory` to the same folder so right-click matches** — with their OK, edit `~/.config/herdr/config.toml` and apply it with `herdr server reload-config`.
+   - **(c) workmux-style `<repo>__worktrees/` siblings** (`--worktree-placement sibling`) → warn clearly: Herdr's own dialog only supports a single shared directory, so right-click worktrees will still go to Herdr's directory — the two entry points cannot be unified in this layout. Corral recognizes and bootstraps both locations regardless.
+
+   Existing worktrees are never moved; all known layouts stay recognized.
 3. **Should dev servers be reachable from other machines?** Detect the machine's names first: if `tailscale` is on PATH, get the DNS name from `tailscale status --json` (`.Self.DNSName`) or `tailscale ip -4`; also consider `hostname -f`. Offer: localhost only (default), each detected name, or a custom hostname. Anything except localhost-only → `--dev-host 0.0.0.0 --remote-host <name>`.
 4. **Which agent should start in the `agent` tab?** The authoritative list is Herdr's, not PATH: read the kinds `herdr agent start --kind` accepts from `herdr agent start --help` (Herdr also has its own agent detection — use whatever it reports). To judge which kinds are actually usable, remember your own shell probably has a reduced PATH: agent CLIs are typically installed into per-product home directories (`~/.grok/bin/grok`, and the same `~/.<vendor>/bin/<tool>` pattern for others) whose PATH entry lives in the user's rc files. Probe three ways before declaring an agent absent: plain `command -v`, the user's login+interactive shell (`$SHELL -lic 'command -v hermes claude codex grok opencode'`, with a timeout in case the rc file prompts), and a direct glob like `ls ~/.*/bin/ ~/.local/bin/ 2>/dev/null`. A product's CLI binary also may not be named after its brand — never conclude an agent is missing from one failed name lookup. Offer every usable kind (default `hermes` when present), plus "other" and "none". If the user says they use an agent you did not detect, believe them and verify the kind against Herdr's help output. For "none", install with the default and then set `start_agent = false` on the repositories in `config.toml`.
 
@@ -59,7 +68,7 @@ python3 ~/.local/share/herdr-corral/install.py \
   --agent-kind <ANSWER-4>
 ```
 
-Add `--dev-host 0.0.0.0 --remote-host <name>` only if the user opted in at question 3.
+Add `--dev-host 0.0.0.0 --remote-host <name>` only if the user opted in at question 3, and `--worktree-placement sibling` only for choice (c). If the user picked choice (b), also make the approved Herdr config edit now and run `herdr server reload-config`.
 
 The clone location matters: the clone **is** the installation (`hwt update` runs `git pull` in it). `~/.local/share/herdr-corral` is the convention; honor the user's preference if they have one — but do **not** clone into their repositories root. The clone is tooling, not one of their projects.
 

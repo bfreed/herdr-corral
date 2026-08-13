@@ -649,6 +649,51 @@ class RemovalTests(unittest.TestCase):
         hwt.check_remove_allowed(True, True, "feature/x", "feature/x")
 
 
+class WorkspaceCleanupActionTests(unittest.TestCase):
+    ITEM = {
+        "branch": "feature/x", "is_linked_worktree": True,
+        "open_workspace_id": "w2", "path": "/approved/wt", "repository": "demo",
+    }
+
+    def test_resolves_worktree_from_workspace_env_and_cleans(self):
+        fake = mock.Mock()
+        with mock.patch.dict(os.environ, {"HERDR_WORKSPACE_ID": "w2"}), \
+             mock.patch.object(hwt, "configured_worktree_items", return_value=[dict(self.ITEM)]), \
+             mock.patch.object(hwt, "cleanup_worktree_item", return_value={"removed": "/approved/wt"}) as core, \
+             contextlib.redirect_stdout(io.StringIO()):
+            hwt.cmd_cleanup_workspace(object(), {}, Path("/state"), fake)
+        core.assert_called_once()
+        self.assertEqual(core.call_args.kwargs, {"abandon": False, "confirm": None})
+
+    def test_requires_workspace_environment(self):
+        with mock.patch.dict(os.environ, {"HERDR_WORKSPACE_ID": ""}):
+            with self.assertRaisesRegex(hwt.WorkflowError, "HERDR_WORKSPACE_ID"):
+                hwt.cmd_cleanup_workspace(object(), {}, Path("/state"), mock.Mock())
+
+    def test_unknown_workspace_is_rejected(self):
+        with mock.patch.dict(os.environ, {"HERDR_WORKSPACE_ID": "w-unknown"}), \
+             mock.patch.object(hwt, "configured_worktree_items", return_value=[dict(self.ITEM)]):
+            with self.assertRaisesRegex(hwt.WorkflowError, "not a configured linked worktree"):
+                hwt.cmd_cleanup_workspace(object(), {}, Path("/state"), mock.Mock())
+
+    def test_refusal_is_surfaced_into_the_shell_pane_and_deletes_nothing(self):
+        fake = mock.Mock()
+        fake.tabs.return_value = [
+            {"tab_id": "t1", "label": "agent", "pane_id": "p1"},
+            {"tab_id": "t2", "label": "shell", "pane_id": "p2"},
+        ]
+        with mock.patch.dict(os.environ, {"HERDR_WORKSPACE_ID": "w2"}), \
+             mock.patch.object(hwt, "configured_worktree_items", return_value=[dict(self.ITEM)]), \
+             mock.patch.object(hwt, "cleanup_worktree_item",
+                               side_effect=hwt.WorkflowError("branch feature/x is not merged")):
+            with self.assertRaisesRegex(hwt.WorkflowError, "not merged"):
+                hwt.cmd_cleanup_workspace(object(), {}, Path("/state"), fake)
+        fake.show_reminder.assert_called_once()
+        pane, message = fake.show_reminder.call_args.args
+        self.assertEqual(pane, "p2")
+        self.assertIn("not merged", message)
+
+
 class DefaultEnvOperationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)

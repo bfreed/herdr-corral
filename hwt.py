@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.9.3"
+__version__ = "0.9.4"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -888,7 +888,7 @@ def cmd_new(args, cfg, state, herdr: Herdr):
     run(["git","check-ref-format","--branch",branch])
     if repo.get("fetch",True): fetch_with_offline_fallback(canonical,repo.get("remote","origin"))
     canonical_workspace = ensure_canonical_workspace(herdr, canonical, name, False)
-    placement = cfg.get("worktree_placement", "sibling")
+    placement = cfg.get("worktree_placement", "shared-root")
     if placement == "sibling":
         parent = sibling_worktree_dir(canonical)
     elif placement == "shared-root":
@@ -1094,13 +1094,41 @@ def cmd_cleanup(args, cfg, state, herdr):
     candidates = match_removal_items(configured_worktree_items(cfg, herdr), args.target)
     if len(candidates) != 1:
         raise WorkflowError("cleanup target must identify exactly one Herdr worktree")
-    item = candidates[0]
+    result = cleanup_worktree_item(cfg, state, herdr, candidates[0],
+                                   abandon=args.abandon, confirm=args.confirm)
+    print(json.dumps(result, indent=2))
+
+
+def cmd_cleanup_workspace(args, cfg, state, herdr):
+    """Herdr action entry point: clean up the worktree of the invoking workspace."""
+    workspace = os.environ.get("HERDR_WORKSPACE_ID", "")
+    if not workspace:
+        raise WorkflowError("cleanup-workspace requires HERDR_WORKSPACE_ID (invoke it via the Herdr action)")
+    matches = [item for item in configured_worktree_items(cfg, herdr)
+               if item.get("is_linked_worktree", False)
+               and workspace in (item.get("open_workspace_id"), item.get("workspace_id"))]
+    if len(matches) != 1:
+        raise WorkflowError("current workspace is not a configured linked worktree")
+    try:
+        result = cleanup_worktree_item(cfg, state, herdr, matches[0], abandon=False, confirm=None)
+    except WorkflowError as exc:
+        # The action runs headless; surface the refusal where the user can see it.
+        with contextlib.suppress(Exception):
+            pane = next((t.get("pane_id") for t in herdr.tabs(workspace)
+                         if t.get("label") == "shell"), None)
+            if pane:
+                herdr.show_reminder(pane, f"Corral cleanup refused: {exc}")
+        raise
+    print(json.dumps(result, indent=2))
+
+
+def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: str | None):
     branch = item.get("branch", "")
     if not branch or item.get("is_detached", False):
         raise WorkflowError("cleanup requires an attached branch")
     # A merged, clean branch is deleted without questions; abandoning unmerged
     # or dirty work is allowed but demands an exact confirmation.
-    if args.abandon and args.confirm != branch:
+    if abandon and confirm != branch:
         raise WorkflowError(f"abandoning requires exact confirmation: --abandon --confirm {branch}")
     repository = item.get("repository")
     repo = cfg.get("repositories", {}).get(repository, {})
@@ -1119,7 +1147,7 @@ def cmd_cleanup(args, cfg, state, herdr):
     with worktree_lock(state, path):
         validate_worktree_identity(cfg, path)
         dirty = bool(git(path, "status", "--porcelain").stdout.strip())
-        if dirty and not args.abandon:
+        if dirty and not abandon:
             raise WorkflowError(
                 f"worktree has uncommitted changes; rerun with --abandon --confirm {branch} to discard them")
         # Fetch and prove the merge before any deletion. Authentication failures
@@ -1128,7 +1156,7 @@ def cmd_cleanup(args, cfg, state, herdr):
         branch_ref = f"refs/heads/{branch}"
         base_ref = f"refs/remotes/{remote}/{base_name}"
         merged = git(canonical, "merge-base", "--is-ancestor", branch_ref, base_ref, check=False).returncode == 0
-        if not merged and not args.abandon:
+        if not merged and not abandon:
             raise WorkflowError(
                 f"branch {branch} is not merged into {base_branch}; "
                 f"rerun with --abandon --confirm {branch} to delete it anyway")
@@ -1142,15 +1170,15 @@ def cmd_cleanup(args, cfg, state, herdr):
         herdr.call(*remove)
         git(canonical, "update-ref", "-d", branch_ref)
         release_port(state, str(path))
-    print(json.dumps({
+    return {
         "removed": str(path),
         "local_branch_deleted": branch,
         "remote_branch_deleted": branch if remote_exists else None,
         "remote": remote,
         "merged": merged,
         "merged_into": base_branch if merged else None,
-        "abandoned": bool(args.abandon),
-    }, indent=2))
+        "abandoned": bool(abandon),
+    }
 
 
 def cmd_doctor(args,cfg,state):
@@ -1209,6 +1237,7 @@ def parser() -> argparse.ArgumentParser:
     c=sub.add_parser("cleanup",help="delete worktree and branch (merged: no questions)"); c.add_argument("target"); c.add_argument("--abandon",action="store_true",help="delete even if unmerged or dirty (requires --confirm BRANCH)"); c.add_argument("--confirm")
     sub.add_parser("doctor"); sub.add_parser("update",help="update Corral in place (git pull)")
     e=sub.add_parser("event",help=argparse.SUPPRESS)
+    sub.add_parser("cleanup-workspace",help=argparse.SUPPRESS)
     return p
 
 
@@ -1219,9 +1248,9 @@ def main(argv: list[str] | None=None) -> int:
             cmd_update(args)
             return 0
         cfg=load_config(args.config); state=runtime_state_dir(); herdr=Herdr()
-        commands={"new":cmd_new,"open":cmd_open,"init":cmd_init,"list":cmd_list,"status":cmd_status,"dev":cmd_dev,"remove":cmd_remove,"cleanup":cmd_cleanup,"doctor":cmd_doctor,"event":cmd_event}
+        commands={"new":cmd_new,"open":cmd_open,"init":cmd_init,"list":cmd_list,"status":cmd_status,"dev":cmd_dev,"remove":cmd_remove,"cleanup":cmd_cleanup,"cleanup-workspace":cmd_cleanup_workspace,"doctor":cmd_doctor,"event":cmd_event}
         fn=commands[args.command]
-        if args.command in ("new","open","list","remove","cleanup","event"): fn(args,cfg,state,herdr)
+        if args.command in ("new","open","list","remove","cleanup","cleanup-workspace","event"): fn(args,cfg,state,herdr)
         else: fn(args,cfg,state)
         return 0
     except WorkflowError as exc:

@@ -48,7 +48,8 @@ def discover_repositories(root: Path, exclude: Path | None = None) -> list[tuple
 
 
 def render_config(repos_root: Path, worktree_root: Path, repos: list[tuple[str, Path, str]],
-                  dev_host: str, remote_host: str, agent_kind: str) -> str:
+                  dev_host: str, remote_host: str, agent_kind: str,
+                  placement: str = "shared-root") -> str:
     lines = [
         f"canonical_root = {quote(str(repos_root.resolve()))}",
         f"worktree_root = {quote(str(worktree_root.resolve()))}",
@@ -56,10 +57,11 @@ def render_config(repos_root: Path, worktree_root: Path, repos: list[tuple[str, 
         f"dev_host = {quote(dev_host)}",
         f"remote_host = {quote(remote_host)}",
         f"agent_kind = {quote(agent_kind)}",
-        '# "sibling" puts new worktrees in <repo>__worktrees/ next to each repository',
-        '# (the workmux layout); "shared-root" uses worktree_root/<repo>/. Worktrees',
-        "# made by Herdr's own UI (~/.herdr/worktrees) are always recognized.",
-        'worktree_placement = "sibling"',
+        '# "shared-root": hwt new uses worktree_root/<repo>/ — keep worktree_root equal',
+        "# to Herdr's [worktrees].directory (~/.config/herdr/config.toml) so right-click",
+        '# and hwt create worktrees in the same place. "sibling": <repo>__worktrees/',
+        "# (workmux layout; Herdr's own dialog cannot follow a per-repo layout).",
+        f"worktree_placement = {quote(placement)}",
         "",
         "[ports]",
         "start = 4100",
@@ -93,7 +95,10 @@ def run_checked(argv: list[str]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repos-root", type=Path, default=Path.home() / "repos")
-    parser.add_argument("--worktree-root", type=Path)
+    parser.add_argument("--worktree-root", type=Path,
+                        help="shared worktree tree (default: ~/.herdr/worktrees, matching Herdr)")
+    parser.add_argument("--worktree-placement", choices=("shared-root", "sibling"),
+                        default="shared-root")
     parser.add_argument("--dev-host", default="127.0.0.1")
     parser.add_argument("--remote-host", default="")
     parser.add_argument("--agent-kind", default="hermes",
@@ -125,7 +130,7 @@ def main() -> int:
     repos_root = args.repos_root.expanduser().resolve()
     if not repos_root.is_dir():
         parser.error(f"repository root does not exist: {repos_root}")
-    worktree_root = (args.worktree_root or (repos_root / ".worktrees")).expanduser()
+    worktree_root = (args.worktree_root or (Path.home() / ".herdr/worktrees")).expanduser()
     worktree_root.mkdir(parents=True, exist_ok=True)
     worktree_root = worktree_root.resolve()
 
@@ -148,7 +153,8 @@ def main() -> int:
             backup = config.with_suffix(".toml.bak")
             shutil.copy2(config, backup)
         config.write_text(render_config(repos_root, worktree_root, repos,
-                                        args.dev_host, args.remote_host, args.agent_kind))
+                                        args.dev_host, args.remote_host, args.agent_kind,
+                                        args.worktree_placement))
         config.chmod(0o600)
         config_result = f"configured {len(repos)} repositories"
 
