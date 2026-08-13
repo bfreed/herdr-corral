@@ -792,7 +792,7 @@ class CleanupSelectionTests(unittest.TestCase):
     ]
 
     def test_exact_match_needs_no_interaction(self):
-        item = hwt.choose_worktree_item([dict(x) for x in self.ITEMS], "worktree/quiet-harbor-af65")
+        item = hwt.choose_worktree_item({}, [dict(x) for x in self.ITEMS], "worktree/quiet-harbor-af65")
         self.assertEqual(item["open_workspace_id"], "w5")
 
     def test_partial_target_finds_similar_worktrees(self):
@@ -804,8 +804,9 @@ class CleanupSelectionTests(unittest.TestCase):
 
     def test_no_target_with_tty_offers_numbered_choice(self):
         with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: True)), \
+             mock.patch.object(hwt, "log"), \
              mock.patch("builtins.input", return_value="2"):
-            item = hwt.choose_worktree_item([dict(x) for x in self.ITEMS], None)
+            item = hwt.choose_worktree_item({}, [dict(x) for x in self.ITEMS], None)
         self.assertEqual(item["branch"], "feature/other")
 
     def test_without_tty_lists_candidates_and_refuses(self):
@@ -813,14 +814,14 @@ class CleanupSelectionTests(unittest.TestCase):
         with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: False)), \
              mock.patch.object(hwt, "log", side_effect=logged.append):
             with self.assertRaisesRegex(hwt.WorkflowError, "re-run with one of the listed"):
-                hwt.choose_worktree_item([dict(x) for x in self.ITEMS], "quiet-harbor")
+                hwt.choose_worktree_item({}, [dict(x) for x in self.ITEMS], "quiet-harbor")
         self.assertTrue(any("worktree/quiet-harbor-af65" in line for line in logged))
 
     def test_unlinked_worktrees_are_never_offered(self):
         with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: False)), \
              mock.patch.object(hwt, "log"):
             with self.assertRaises(hwt.WorkflowError):
-                hwt.choose_worktree_item([dict(self.ITEMS[2])], None)
+                hwt.choose_worktree_item({}, [dict(self.ITEMS[2])], None)
 
 
 class WorktreeSafetyTests(unittest.TestCase):
@@ -938,6 +939,51 @@ class SweepTests(unittest.TestCase):
         report = json.loads(out.getvalue())
         self.assertEqual([c["removed"] for c in report["cleaned"]], ["/wts/c"])
         self.assertEqual(report["skipped"][0]["reason"], "fetch failed")
+
+
+class OpenPickerTests(unittest.TestCase):
+    CFG = {"repositories": {
+        "demo": {"path": "/canon/demo", "mode": "worktree"},
+        "docs": {"path": "/canon/docs", "mode": "open-only"},
+    }, "worktree_root": "/wts"}
+    ITEMS = [
+        {"branch": "hermes/fix-a", "is_linked_worktree": True,
+         "path": "/wts/demo/fix-a", "repository": "demo"},
+    ]
+
+    def test_candidates_include_repositories_and_worktrees(self):
+        with mock.patch.object(hwt, "configured_worktree_items", return_value=[dict(x) for x in self.ITEMS]):
+            entries = hwt.open_candidates(self.CFG, mock.Mock())
+        self.assertEqual([e["kind"] for e in entries], ["repository", "repository", "worktree"])
+
+    def test_no_target_with_tty_offers_numbered_choice(self):
+        args = type("Args", (), {"target": None})()
+        with mock.patch.object(hwt, "configured_worktree_items", return_value=[dict(x) for x in self.ITEMS]), \
+             mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: True)), \
+             mock.patch("builtins.input", return_value="3"), \
+             mock.patch.object(hwt, "log"), \
+             mock.patch.object(hwt, "resolve_existing", side_effect=lambda p: Path(p)):
+            path = hwt.resolve_open_target(args, self.CFG, mock.Mock())
+        self.assertEqual(path, Path("/wts/demo/fix-a"))
+
+    def test_fuzzy_target_narrows_to_single_entry(self):
+        args = type("Args", (), {"target": "fix-a"})()
+        with mock.patch.object(hwt, "configured_worktree_items", return_value=[dict(x) for x in self.ITEMS]), \
+             mock.patch.object(hwt, "resolve_existing", side_effect=lambda p: Path(p)):
+            path = hwt.resolve_open_target(args, self.CFG, mock.Mock())
+        self.assertEqual(path, Path("/wts/demo/fix-a"))
+
+    def test_no_target_without_tty_lists_and_refuses(self):
+        args = type("Args", (), {"target": None})()
+        logged = []
+        with mock.patch.object(hwt, "configured_worktree_items", return_value=[dict(x) for x in self.ITEMS]), \
+             mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: False)), \
+             mock.patch.object(hwt, "log", side_effect=logged.append):
+            with self.assertRaises(hwt.WorkflowError):
+                hwt.resolve_open_target(args, self.CFG, mock.Mock())
+        text = "\n".join(logged)
+        self.assertIn("demo", text)
+        self.assertIn("hermes/fix-a", text)
 
 
 class WorkspaceCleanupActionTests(unittest.TestCase):

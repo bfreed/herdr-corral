@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.12.0 — 2026-08-13
+
+- `hwt open` works like `hwt cleanup` now: with no argument it offers a numbered picker (repositories, then worktrees grouped by repo); a target that doesn't resolve uniquely offers similar candidates instead of erroring.
+- The `hwt cleanup` picker uses the palette's readable layout: repository group headers, two-line entries with colored safety annotations and dimmed, home-shortened paths.
+
 ## 0.11.1 — 2026-08-13
 
 - `hwt -h` no longer shows `==SUPPRESS==` rows: the internal entry points (`event`, `cleanup-workspace`, `palette-open`, invoked by Herdr) are properly hidden from usage and the command table, and `list`/`status`/`doctor` gained help lines.

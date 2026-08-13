@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.11.1"
+__version__ = "0.12.0"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -1018,21 +1018,105 @@ def find_workspace_for_path(herdr: Herdr, path: Path, label: str | None = None) 
     return None
 
 
-def cmd_open(args,cfg,state,herdr:Herdr):
-    token=Path(args.target).expanduser()
-    if token.exists(): path=resolve_existing(token)
-    else:
-        matches=[]
-        wanted = {args.target}
+def open_candidates(cfg: dict[str, Any], herdr: Any) -> list[dict[str, Any]]:
+    entries = []
+    for name, repo in cfg["repositories"].items():
+        if "path" in repo:
+            entries.append({"kind": "repository", "name": name, "path": repo["path"]})
+    for item in configured_worktree_items(cfg, herdr):
+        if item.get("is_linked_worktree", False) and item.get("path"):
+            entries.append({"kind": "worktree", "name": item.get("branch") or Path(item["path"]).name,
+                            "branch": item.get("branch"), "path": item["path"],
+                            "repository": item.get("repository")})
+    return entries
+
+
+def open_entry_keys(entry: dict[str, Any]) -> list[str]:
+    keys = [entry.get("name"), entry.get("branch"), entry.get("repository")]
+    path = entry.get("path")
+    if isinstance(path, str) and path:
+        keys.append(Path(path).name)
+    return [key for key in keys if isinstance(key, str) and key]
+
+
+def fuzzy_open_matches(entries: list[dict[str, Any]], target: str) -> list[dict[str, Any]]:
+    import difflib
+    needle = target.lower()
+    hits = [entry for entry in entries
+            if any(needle in key.lower() or key.lower() in needle for key in open_entry_keys(entry))]
+    if hits:
+        return hits
+    universe: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        for key in open_entry_keys(entry):
+            universe.setdefault(key, entry)
+    ordered = []
+    for key in difflib.get_close_matches(target, list(universe), n=5, cutoff=0.5):
+        if universe[key] not in ordered:
+            ordered.append(universe[key])
+    return ordered
+
+
+def open_listing_lines(entries: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    section = None
+    repo_header = None
+    for index, entry in enumerate(entries, 1):
+        if entry["kind"] != section:
+            section = entry["kind"]
+            if lines:
+                lines.append("")
+            lines.append(colorize("repositories" if section == "repository" else "worktrees", "1"))
+            repo_header = None
+        if section == "repository":
+            lines.append(f"  {index:>2}. {entry['name']}  " + colorize(shorten_home(str(entry["path"])), "2"))
+        else:
+            if entry.get("repository") != repo_header:
+                repo_header = entry.get("repository")
+                lines.append(colorize(f"  {repo_header}", "1"))
+            lines.append(f"  {index:>2}. {entry.get('branch') or '(detached)'}")
+            lines.append(colorize(f"      {shorten_home(str(entry['path']))}", "2"))
+    return lines
+
+
+def resolve_open_target(args, cfg: dict[str, Any], herdr: Any) -> Path:
+    target = args.target
+    if target:
+        token = Path(target).expanduser()
+        if token.exists():
+            return resolve_existing(token)
+        matches = []
+        wanted = {target}
         with contextlib.suppress(SafetyError):
-            wanted.add(branch_slug(args.target))
-        for name,repo in cfg["repositories"].items():
-            if args.target==name: matches.append(Path(repo["path"]))
-            candidates = [Path(cfg["worktree_root"])/name, HERDR_NATIVE_WORKTREES/name, sibling_worktree_dir(Path(repo["path"]))]
+            wanted.add(branch_slug(target))
+        for name, repo in cfg["repositories"].items():
+            if target == name:
+                matches.append(Path(repo["path"]))
+            candidates = [Path(cfg["worktree_root"]) / name, HERDR_NATIVE_WORKTREES / name,
+                          sibling_worktree_dir(Path(repo["path"]))]
             for wtroot in candidates:
-                if wtroot.exists(): matches += [p for p in wtroot.iterdir() if p.name in wanted]
-        if len(matches)!=1: raise WorkflowError(f"target did not resolve uniquely: {args.target}")
-        path=resolve_existing(matches[0])
+                if wtroot.exists():
+                    matches += [p for p in wtroot.iterdir() if p.name in wanted]
+        if len(matches) == 1:
+            return resolve_existing(matches[0])
+    entries = open_candidates(cfg, herdr)
+    header = None
+    if target:
+        entries = fuzzy_open_matches(entries, target)
+        if len(entries) == 1:
+            return resolve_existing(Path(entries[0]["path"]))
+        if not entries:
+            raise WorkflowError(
+                f"nothing matches {target!r}; run 'hwt open' with no argument to pick from the list")
+        header = f"no exact match for {target!r}; similar"
+    if not entries:
+        raise WorkflowError("nothing to open; no repositories are configured")
+    index = choose_indexed(open_listing_lines(entries), len(entries), header)
+    return resolve_existing(Path(entries[index]["path"]))
+
+
+def cmd_open(args,cfg,state,herdr:Herdr):
+    path = resolve_open_target(args, cfg, herdr)
     try:
         name,repo=resolve_configured_repo(cfg,path)
         canonical=True
@@ -1214,12 +1298,8 @@ def fuzzy_worktree_matches(items: list[dict[str, Any]], target: str) -> list[dic
     return ordered
 
 
-def describe_worktree_item(item: dict[str, Any]) -> str:
-    branch = item.get("branch") or "(detached)"
-    return f"{item.get('repository', '?')}  {branch}  {item.get('path', '?')}"
-
-
-def choose_worktree_item(items: list[dict[str, Any]], target: str | None) -> dict[str, Any]:
+def choose_worktree_item(cfg: dict[str, Any], items: list[dict[str, Any]],
+                         target: str | None) -> dict[str, Any]:
     linked = [item for item in items if item.get("is_linked_worktree", False)]
     if target:
         exact = match_removal_items(items, target)
@@ -1233,18 +1313,7 @@ def choose_worktree_item(items: list[dict[str, Any]], target: str | None) -> dic
         pool, header = linked, "linked worktrees"
     if not pool:
         raise WorkflowError("no linked worktrees found; run 'hwt list' to inspect Herdr's view")
-    log(f"{header}:")
-    for index, item in enumerate(pool, 1):
-        log(f"  {index}. {describe_worktree_item(item)}")
-    if not sys.stdin.isatty():
-        raise WorkflowError("re-run with one of the listed branches or paths as the target")
-    answer = input("Number (Enter cancels): ").strip()
-    if not answer:
-        raise WorkflowError("cancelled")
-    try:
-        return pool[int(answer) - 1]
-    except (ValueError, IndexError):
-        raise WorkflowError(f"invalid selection: {answer!r}") from None
+    return pool[choose_indexed(worktree_listing_lines(cfg, pool), len(pool), header)]
 
 
 def cmd_remove(args,cfg,state,herdr):
@@ -1272,7 +1341,7 @@ def cmd_remove(args,cfg,state,herdr):
 
 
 def cmd_cleanup(args, cfg, state, herdr):
-    item = choose_worktree_item(configured_worktree_items(cfg, herdr), args.target)
+    item = choose_worktree_item(cfg, configured_worktree_items(cfg, herdr), args.target)
     result = cleanup_worktree_item(cfg, state, herdr, item,
                                    abandon=args.abandon, confirm=args.confirm)
     print(json.dumps(result, indent=2))
@@ -1331,15 +1400,16 @@ def shorten_home(path: str) -> str:
     return path
 
 
-def palette_lines(cfg: dict[str, Any], items: list[dict[str, Any]]) -> list[str]:
-    lines = [colorize("Corral — worktrees", "1")]
+def worktree_listing_lines(cfg: dict[str, Any], items: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
     if not items:
         lines.append("  (none)")
     current_repo = None
     for index, item in enumerate(items, 1):
         repo = item.get("repository", "?")
         if repo != current_repo:
-            lines.append("")
+            if current_repo is not None:
+                lines.append("")
             lines.append(colorize(repo, "1"))
             current_repo = repo
         safety = worktree_safety(cfg, item)
@@ -1348,6 +1418,30 @@ def palette_lines(cfg: dict[str, Any], items: list[dict[str, Any]]) -> list[str]
         lines.append(f"  {index:>2}. {branch}  {label}")
         lines.append(colorize(f"      {shorten_home(str(item.get('path', '?')))}", "2"))
     return lines
+
+
+def palette_lines(cfg: dict[str, Any], items: list[dict[str, Any]]) -> list[str]:
+    return [colorize("Corral — worktrees", "1"), ""] + worktree_listing_lines(cfg, items)
+
+
+def choose_indexed(lines: list[str], count: int, header: str | None) -> int:
+    """Show a numbered listing (on stderr) and return the chosen zero-based index."""
+    if header:
+        log(f"{header}:")
+    for line in lines:
+        log(line)
+    if not sys.stdin.isatty():
+        raise WorkflowError("re-run with one of the listed names or paths as the target")
+    answer = input("Number (Enter cancels): ").strip()
+    if not answer:
+        raise WorkflowError("cancelled")
+    try:
+        index = int(answer) - 1
+        if not 0 <= index < count:
+            raise ValueError
+    except ValueError:
+        raise WorkflowError(f"invalid selection: {answer!r}") from None
+    return index
 
 
 def palette_new_worktree(args, cfg, state, herdr) -> None:
@@ -1591,7 +1685,7 @@ def parser() -> argparse.ArgumentParser:
     sub=p.add_subparsers(dest="command",required=True,
                          metavar="{new,open,init,list,status,dev,remove,cleanup,sweep,palette,doctor,update}")
     n=sub.add_parser("new",help="create a worktree for a new branch"); n.add_argument("branch"); n.add_argument("--base"); n.add_argument("--repo"); n.add_argument("--background",action="store_true")
-    o=sub.add_parser("open",help="open a repository or existing worktree"); o.add_argument("target")
+    o=sub.add_parser("open",help="open a repository or existing worktree"); o.add_argument("target",nargs="?",help="repository, branch, or worktree name; omit to pick from a list")
     i=sub.add_parser("init",help="interactively configure a repository"); i.add_argument("repository",nargs="?")
     sub.add_parser("list",help="configured repositories and live worktrees")
     sub.add_parser("status",help="port leases and dev-server status")

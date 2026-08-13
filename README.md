@@ -33,7 +33,7 @@ The clone is the installation — `hwt update` later updates it in place. The in
 
 ```bash
 hwt new feature/my-task     # worktree + env files + deps + tabs, focused and ready
-hwt open <repo-or-worktree> # (re)open with the standard layout, idempotently
+hwt open [target]           # (re)open with the standard layout; omit to pick from a list
 hwt dev                     # start the repo's dev server on the leased port
 hwt list                    # configured repos and live worktrees
 hwt status                  # port leases, lockfile drift, listening state
