@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.10.1"
+__version__ = "0.10.2"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -1107,12 +1107,13 @@ def cmd_list(args,cfg,state,herdr):
     print(json.dumps({"configured_repositories":cfg["repositories"],"worktrees":configured_worktree_items(cfg,herdr)},indent=2))
 
 
-def worktree_item_ids(item: dict[str, Any]) -> tuple[str, Path]:
+def worktree_item_ids(item: dict[str, Any]) -> tuple[str | None, Path]:
+    """Workspace id is None when the worktree exists on disk but is not open in Herdr."""
     workspace = item.get("open_workspace_id") or item.get("workspace_id") or item.get("workspace", {}).get("workspace_id")
     raw_path = item.get("path") or item.get("worktree_path") or item.get("cwd")
-    if not workspace or not raw_path:
-        raise WorkflowError("Herdr worktree entry lacks an open workspace id or path")
-    return workspace, Path(raw_path)
+    if not raw_path:
+        raise WorkflowError("Herdr worktree entry lacks a checkout path")
+    return workspace or None, Path(raw_path)
 
 
 def match_removal_items(items: list[dict[str, Any]], target: str) -> list[dict[str, Any]]:
@@ -1193,15 +1194,21 @@ def cmd_remove(args,cfg,state,herdr):
     if len(candidates)!=1: raise WorkflowError("removal target must identify exactly one Herdr worktree")
     item=candidates[0]; workspace,path=worktree_item_ids(item)
     with worktree_lock(state, path):
-        validate_worktree_identity(cfg, path)
+        _, _, canonical = validate_worktree_identity(cfg, path)
         branch=git(path,"branch","--show-current").stdout.strip(); dirty=bool(git(path,"status","--porcelain").stdout.strip())
         check_remove_allowed(dirty,args.force,args.confirm,branch)
         # Re-read immediately before the destructive call while holding our workflow lock.
         branch2=git(path,"branch","--show-current").stdout.strip(); dirty2=bool(git(path,"status","--porcelain").stdout.strip())
         if branch2 != branch or dirty2 != dirty: raise WorkflowError("worktree changed while removal was being validated")
-        cmd=["worktree","remove","--workspace",workspace]
-        if args.force: cmd.append("--force")
-        herdr.call(*cmd); release_port(state,str(path))
+        if workspace:
+            cmd=["worktree","remove","--workspace",workspace]
+            if args.force: cmd.append("--force")
+            herdr.call(*cmd)
+        else:
+            cmd=["worktree","remove"]
+            if args.force: cmd.append("--force")
+            git(canonical, *cmd, str(path))
+        release_port(state,str(path))
     print(json.dumps({"removed":str(path),"branch_preserved":branch},indent=2))
 
 
@@ -1438,10 +1445,17 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
         remote_exists = git(canonical, "show-ref", "--verify", "--quiet", remote_ref, check=False).returncode == 0
         if remote_exists:
             git(canonical, "push", remote, "--delete", branch)
-        remove = ["worktree", "remove", "--workspace", workspace]
-        if dirty:
-            remove.append("--force")
-        herdr.call(*remove)
+        if workspace:
+            remove = ["worktree", "remove", "--workspace", workspace]
+            if dirty:
+                remove.append("--force")
+            herdr.call(*remove)
+        else:
+            # Not open in Herdr (its remove API is workspace-only); use git directly.
+            remove = ["worktree", "remove"]
+            if dirty:
+                remove.append("--force")
+            git(canonical, *remove, str(path))
         git(canonical, "update-ref", "-d", branch_ref)
         release_port(state, str(path))
     return {

@@ -656,6 +656,40 @@ class RemovalTests(unittest.TestCase):
         item = {"open_workspace_id": "w3", "path": "/approved/wt"}
         self.assertEqual(hwt.worktree_item_ids(item), ("w3", Path("/approved/wt")))
 
+    def test_closed_worktree_item_has_no_workspace_but_keeps_path(self):
+        self.assertEqual(hwt.worktree_item_ids({"path": "/approved/wt"}),
+                         (None, Path("/approved/wt")))
+        with self.assertRaisesRegex(hwt.WorkflowError, "checkout path"):
+            hwt.worktree_item_ids({"branch": "feature/x"})
+
+    def test_cleanup_of_closed_worktree_removes_checkout_with_git(self):
+        item = {k: v for k, v in self.ITEM.items() if k != "open_workspace_id"}
+        args = self.cleanup_args()
+        fake = mock.Mock()
+        responses = [
+            mock.Mock(stdout="", returncode=0),   # status: clean
+            mock.Mock(stdout="", returncode=0),   # fetch
+            mock.Mock(stdout="", returncode=0),   # merge-base: merged
+            mock.Mock(stdout="", returncode=0),   # show-ref: remote exists
+            mock.Mock(stdout="", returncode=0),   # push --delete
+            mock.Mock(stdout="", returncode=0),   # git worktree remove
+            mock.Mock(stdout="", returncode=0),   # update-ref -d
+        ]
+        with mock.patch.object(hwt, "configured_worktree_items", return_value=[item]), \
+             mock.patch.object(hwt, "resolve_existing", side_effect=lambda path: Path(path)), \
+             mock.patch.object(hwt, "validate_worktree_identity"), \
+             mock.patch.object(hwt, "worktree_lock", return_value=contextlib.nullcontext()), \
+             mock.patch.object(hwt, "git", side_effect=responses) as git, \
+             mock.patch.object(hwt, "release_port") as release, \
+             contextlib.redirect_stdout(io.StringIO()):
+            hwt.cmd_cleanup(args, self.CFG, Path("/state"), fake)
+        fake.call.assert_not_called()
+        self.assertIn(mock.call(Path("/canon/demo"), "worktree", "remove", str(Path("/approved/wt"))),
+                      git.call_args_list)
+        self.assertIn(mock.call(Path("/canon/demo"), "update-ref", "-d", "refs/heads/feature/x"),
+                      git.call_args_list)
+        release.assert_called_once_with(Path("/state"), str(Path("/approved/wt")))
+
     def test_removal_revalidates_configured_worktree_before_git_or_herdr(self):
         cfg = {"repositories": {
             "demo": {"path": "/canon/demo", "mode": "worktree"}},
