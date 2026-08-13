@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.15.3"
+__version__ = "0.16.0"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -512,12 +512,17 @@ class Herdr:
         run([self.binary, *args])
 
     def show_reminder(self, pane_id: str, message: str) -> None:
-        run([
-            self.binary, "pane", "wait-output", pane_id, "--regex", r"[$#] ?$",
-            "--source", "visible", "--lines", "5", "--timeout", "10000", "--raw",
-        ])
+        # Wait for a shell prompt (covering $, #, %, ❯ and > prompts); a missed
+        # or slow reminder must never break the bootstrap, so failures are
+        # swallowed and the printf is attempted regardless.
+        with contextlib.suppress(WorkflowError):
+            run([
+                self.binary, "pane", "wait-output", pane_id, "--regex", "[$#%❯>] ?$",
+                "--source", "visible", "--lines", "5", "--timeout", "10000", "--raw",
+            ])
         command = f"printf '\\n%s\\n\\n' {shlex.quote(message)}"
-        run([self.binary, "pane", "run", pane_id, command])
+        with contextlib.suppress(WorkflowError):
+            run([self.binary, "pane", "run", pane_id, command])
 
 
 class FakeHerdrForTests:
@@ -580,9 +585,17 @@ def ensure_layout(herdr: Any, workspace: str, worktree: Path, port: int, host: s
             tid,pid=herdr.create_tab(workspace,worktree,label,env); by_label[label]={"tab_id":tid,"pane_id":pid,"label":label}
             if label == "server":
                 if repo.get("commands", {}).get("dev"):
-                    herdr.show_reminder(pid, "To start the development server, run: hwt dev")
-            if label == "shell" and repo.get("_suggest_init"):
-                herdr.show_reminder(pid, "New repository for Corral: run 'hwt init' here to configure env files and a dev command.")
+                    message = f"Corral: 'hwt dev' starts the dev server on port {port} — {env['HWT_LOCAL_URL']}"
+                    if env.get("HWT_REMOTE_URL"):
+                        message += f" / {env['HWT_REMOTE_URL']}"
+                else:
+                    message = "Corral: no dev command configured for this repository — set one with 'hwt init'"
+                herdr.show_reminder(pid, message)
+            if label == "shell":
+                message = "Corral: 'hwt -h' lists commands; palette via your Corral keybinding or 'herdr plugin action invoke corral.palette'"
+                if repo.get("_suggest_init"):
+                    message += " — run 'hwt init' to configure this repository"
+                herdr.show_reminder(pid, message)
     if start_agent:
         agent = by_label["agent"]
         pane_id = agent.get("pane_id")

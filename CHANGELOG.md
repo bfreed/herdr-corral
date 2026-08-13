@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.16.0 — 2026-08-13
+
+- Tab guidance is back, richer, and robust: the `server` tab always gets a message on creation — `hwt dev` + the leased port + local/remote URLs when a dev command is configured, or a pointer to `hwt init` when not — and the `shell` tab gets orientation (`hwt -h`, how to open the palette, plus the init suggestion for unconfigured repos).
+- Reminder delivery fixed for non-`$` prompts: the prompt wait now matches `❯`, `%`, and `>` as well, and a failed wait or send can no longer break the bootstrap (previously the wait expected `$`/`#` only, so starship-style prompts timed it out).
+
 ## 0.15.3 — 2026-08-13
 
 - Cleaning up or removing an open worktree no longer yanks Herdr's focus away: Herdr unconditionally switches to the removed worktree's parent repo workspace (verified in `app/worktrees.rs::close_removed_linked_worktree_workspace`), so Corral now records the focused workspace before removal and switches back afterward — unless you ran it from the workspace being removed.

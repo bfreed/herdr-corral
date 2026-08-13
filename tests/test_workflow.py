@@ -429,7 +429,7 @@ class LayoutTests(unittest.TestCase):
             api.show_reminder("w2:p3", "To start the development server, run: hwt dev")
         self.assertEqual(command.call_args_list, [
             mock.call([
-                "herdr", "pane", "wait-output", "w2:p3", "--regex", r"[$#] ?$",
+                "herdr", "pane", "wait-output", "w2:p3", "--regex", "[$#%❯>] ?$",
                 "--source", "visible", "--lines", "5", "--timeout", "10000", "--raw",
             ]),
             mock.call([
@@ -454,13 +454,20 @@ class LayoutTests(unittest.TestCase):
         hwt.ensure_layout(fake, "w1", Path("/wt/demo"), 4100, "0.0.0.0", "host.ts.net", True, repo)
         hwt.ensure_layout(fake, "w1", Path("/wt/demo"), 4100, "0.0.0.0", "host.ts.net", True, repo)
 
-        self.assertEqual(fake.reminders, [("w1:p3", "To start the development server, run: hwt dev")])
+        self.assertEqual(len(fake.reminders), 2)
+        by_pane = dict(fake.reminders)
+        self.assertIn("hwt -h", by_pane["w1:p2"])
+        self.assertIn("hwt dev", by_pane["w1:p3"])
+        self.assertIn("4100", by_pane["w1:p3"])
+        self.assertIn("http://host.ts.net:4100", by_pane["w1:p3"])
 
-    def test_repo_without_dev_command_gets_no_misleading_reminder(self):
+    def test_repo_without_dev_command_points_at_init_instead_of_hwt_dev(self):
         fake = hwt.FakeHerdrForTests()
         fake.seed_workspace("w1", "/wt/demo", ["Tab 1"])
         hwt.ensure_layout(fake, "w1", Path("/wt/demo"), 4100, "127.0.0.1", "", True, {})
-        self.assertEqual(fake.reminders, [])
+        by_pane = dict(fake.reminders)
+        self.assertNotIn("hwt dev", by_pane["w1:p3"])
+        self.assertIn("hwt init", by_pane["w1:p3"])
 
     def test_repository_environment_is_added_to_worktree_tabs(self):
         fake = mock.Mock()
