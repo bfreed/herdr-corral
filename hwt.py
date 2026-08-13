@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.14.1"
+__version__ = "0.15.0"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -168,7 +168,9 @@ def run(argv: list[str], *, cwd: Path | None = None, check: bool = True,
     result = subprocess.run(argv, cwd=cwd, env=env, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if check and result.returncode:
-        raise WorkflowError(f"command failed ({argv[0]}) with exit status {result.returncode}")
+        detail = (result.stderr or result.stdout or "").strip()
+        suffix = f": {detail.splitlines()[0][:200]}" if detail else ""
+        raise WorkflowError(f"command failed ({argv[0]}) with exit status {result.returncode}{suffix}")
     return result
 
 
@@ -850,10 +852,37 @@ def render_repo_overlay(name: str, repo: dict[str, Any], files: list[dict[str, A
     return "\n".join(lines) + "\n"
 
 
+def ask_base_branch(canonical: Path, remote: str, configured: str) -> str:
+    options: list[tuple[str, str]] = [(configured, "current setting")]
+    for candidate in remote_base_candidates(canonical, remote)[:10]:
+        if all(candidate != ref for ref, _ in options):
+            options.append((candidate, "remote branch"))
+    lines = [f"  {index:>2}. {ref}  " + colorize(f"({note})", "2")
+             for index, (ref, note) in enumerate(options, 1)]
+    lines.append(f"  {len(options) + 1:>2}. other (type a ref)")
+    index = choose_indexed(lines, len(options) + 1,
+                           "base branch for new worktrees (also cleanup's merge target)")
+    if index < len(options):
+        return options[index][0]
+    while True:
+        typed = input("Base ref (empty keeps current): ").strip()
+        if not typed:
+            return configured
+        if not typed.startswith(f"{remote}/"):
+            print(f"use a remote-tracking ref like {remote}/develop — cleanup verifies merges against it")
+            continue
+        if ref_exists(canonical, typed):
+            return typed
+        print(f"no such ref here: {typed!r}")
+
+
 def run_init_interview(cfg: dict[str, Any], name: str, config_path: Path) -> Path:
-    repo = cfg["repositories"][name]
+    repo = dict(cfg["repositories"][name])
     canonical = resolve_existing(Path(repo["path"]))
     print(f"Configuring repository {name} ({canonical})")
+    remote = repo.get("remote", "origin")
+    repo["base_branch"] = ask_base_branch(canonical, remote,
+                                          repo.get("base_branch", "origin/main"))
     env_ops = default_env_operations(canonical)
     files: list[dict[str, Any]] = []
     if env_ops:
@@ -1080,7 +1109,8 @@ def cmd_new(args, cfg, state, herdr: Herdr):
     parent.mkdir(parents=True,exist_ok=True)
     if placement == "shared-root":
         require_within(parent,Path(cfg["worktree_root"]))
-    command=["worktree","create","--workspace",canonical_workspace,"--cwd",str(canonical),"--branch",branch,"--base",base,"--path",str(path),"--label",f"{name}: {branch}","--no-focus" if args.background else "--focus"]
+    # herdr rejects --workspace together with --cwd; the workspace anchors the repo.
+    command=["worktree","create","--workspace",canonical_workspace,"--branch",branch,"--base",base,"--path",str(path),"--label",f"{name}: {branch}","--no-focus" if args.background else "--focus"]
     try:
         obj=herdr.call(*command)
     except WorkflowError:

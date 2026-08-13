@@ -1033,6 +1033,38 @@ class InteractiveNewTests(unittest.TestCase):
                 hwt.interactive_new_setup(args, self.CFG)
 
 
+class AskBaseBranchTests(unittest.TestCase):
+    def test_offers_current_setting_and_remote_candidates(self):
+        with mock.patch.object(hwt, "remote_base_candidates",
+                               return_value=["origin/develop", "origin/main"]), \
+             mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: True)), \
+             mock.patch.object(hwt, "log"), \
+             mock.patch("builtins.input", return_value="2"):
+            result = hwt.ask_base_branch(Path("/canon"), "origin", "origin/main")
+        self.assertEqual(result, "origin/develop")
+
+    def test_typed_ref_must_be_remote_tracking_and_exist(self):
+        answers = iter(["3", "develop", "origin/develop"])
+        with mock.patch.object(hwt, "remote_base_candidates", return_value=["origin/develop"]), \
+             mock.patch.object(hwt, "ref_exists", return_value=True), \
+             mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: True)), \
+             mock.patch.object(hwt, "log"), \
+             mock.patch("builtins.input", side_effect=lambda *_: next(answers)), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            result = hwt.ask_base_branch(Path("/canon"), "origin", "origin/main")
+        self.assertEqual(result, "origin/develop")
+        self.assertIn("remote-tracking", out.getvalue())
+
+    def test_empty_typed_ref_keeps_current_setting(self):
+        answers = iter(["2", ""])
+        with mock.patch.object(hwt, "remote_base_candidates", return_value=[]), \
+             mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: True)), \
+             mock.patch.object(hwt, "log"), \
+             mock.patch("builtins.input", side_effect=lambda *_: next(answers)):
+            result = hwt.ask_base_branch(Path("/canon"), "origin", "origin/main")
+        self.assertEqual(result, "origin/main")
+
+
 class DevCommandSuggestionTests(unittest.TestCase):
     def suggest(self, scripts):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1086,6 +1118,37 @@ class BaseRefTests(unittest.TestCase):
         self.assertIn("origin/feature/x", names)
         self.assertNotIn("origin/HEAD", names)
         self.assertNotIn("origin/used-branch", names)
+
+    def test_cmd_new_never_passes_cwd_alongside_workspace(self):
+        # herdr worktree create rejects --workspace together with --cwd (exit 2)
+        worktrees = self.root / ".wts"
+        worktrees.mkdir()
+        cfg = {"canonical_root": str(self.root), "worktree_root": str(worktrees),
+               "worktree_placement": "shared-root",
+               "repositories": {"demo": {"path": str(self.repo), "mode": "worktree",
+                                         "fetch": False}}}
+        branch_now = hwt.git(self.repo, "branch", "--show-current").stdout.strip()
+        args = type("Args", (), {"branch": "deleteme", "base": branch_now,
+                                 "repo": str(self.repo), "background": True,
+                                 "config": Path("/nonexistent")})()
+        fake = mock.Mock()
+        fake.call.return_value = {"result": {"workspace": {"workspace_id": "w9"}}}
+        with mock.patch.object(hwt.sys, "stdin", mock.Mock(isatty=lambda: False)), \
+             mock.patch.object(hwt, "ensure_canonical_workspace", return_value="w1"), \
+             mock.patch.object(hwt, "bootstrap", return_value={"port": 4100}), \
+             contextlib.redirect_stdout(io.StringIO()):
+            hwt.cmd_new(args, cfg, self.root / "state", fake)
+        created = fake.call.call_args_list[0].args
+        self.assertEqual(created[:2], ("worktree", "create"))
+        self.assertNotIn("--cwd", created)
+        self.assertIn("--workspace", created)
+
+    def test_run_failure_message_includes_stderr(self):
+        with mock.patch.object(hwt.subprocess, "run",
+                               return_value=mock.Mock(returncode=2, stdout="",
+                                                      stderr="usage: herdr worktree create ...\n")):
+            with self.assertRaisesRegex(hwt.WorkflowError, "usage: herdr worktree create"):
+                hwt.run(["herdr", "worktree", "create"])
 
     def test_cmd_new_rejects_nonexistent_base_before_touching_herdr(self):
         worktrees = self.root / ".wts"

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.15.0 — 2026-08-13
+
+- `hwt init` now asks for the repository's base branch (first question), offering the current setting plus the repository's remote branches; typed values are validated and must be remote-tracking refs (cleanup verifies merges against the base). Previously the installer's `origin/HEAD` guess was carried forward silently.
+- Fixed `hwt new` failing with "command failed (herdr) with exit status 2": `herdr worktree create` rejects `--workspace` together with `--cwd` (verified from source), and we passed both. This call path had never succeeded.
+- Failed external commands now include the first line of their stderr in the error message, so failures like the above diagnose themselves.
+
 ## 0.14.1 — 2026-08-13
 
 - The dev-command suggestion in `hwt init` now wires the leased port properly per framework: vite/astro/webpack scripts get `-- --host {host} --port {port}`, Next.js gets `-- -H {host} -p {port}`, and frameworks that honor the PORT/HOST environment (CRA, Express-style, Nuxt) stay bare since `hwt dev` always exports those. The prompt now explains that the command is a template run by `hwt dev` on a per-worktree leased port.
