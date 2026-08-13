@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.14.1 — 2026-08-13
+
+- The dev-command suggestion in `hwt init` now wires the leased port properly per framework: vite/astro/webpack scripts get `-- --host {host} --port {port}`, Next.js gets `-- -H {host} -p {port}`, and frameworks that honor the PORT/HOST environment (CRA, Express-style, Nuxt) stay bare since `hwt dev` always exports those. The prompt now explains that the command is a template run by `hwt dev` on a per-worktree leased port.
+
 ## 0.14.0 — 2026-08-13
 
 - The `hwt new` base picker also lists the repository's remote branches (up to 10, newest first, excluding `HEAD` and branches already checked out in a worktree).

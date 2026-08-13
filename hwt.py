@@ -45,7 +45,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.14.0"
+__version__ = "0.14.1"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -793,6 +793,9 @@ def package_manager_base(canonical: Path) -> str:
 
 
 def suggest_dev_command(canonical: Path) -> list[str] | None:
+    """Template for `hwt dev`. Frameworks that ignore the PORT/HOST env vars
+    (vite and friends) get explicit {port}/{host} flags; the rest run bare,
+    because `hwt dev` always exports PORT and HOST."""
     package = canonical / "package.json"
     if not package.is_file():
         return None
@@ -803,7 +806,13 @@ def suggest_dev_command(canonical: Path) -> list[str] | None:
     script = next((s for s in ("dev", "serve", "start") if s in scripts), None)
     if not script:
         return None
-    return [package_manager_base(canonical), "run", script]
+    base = [package_manager_base(canonical), "run", script]
+    text = str(scripts.get(script, ""))
+    if any(tool in text for tool in ("vite", "astro", "webpack")):
+        return base + ["--", "--host", "{host}", "--port", "{port}"]
+    if text.startswith("next") or "next dev" in text:
+        return base + ["--", "-H", "{host}", "-p", "{port}"]
+    return base
 
 
 def render_repo_overlay(name: str, repo: dict[str, Any], files: list[dict[str, Any]],
@@ -865,6 +874,9 @@ def run_init_interview(cfg: dict[str, Any], name: str, config_path: Path) -> Pat
             dep_policy = "independent"
     suggestion = suggest_dev_command(canonical)
     rendered = " ".join(suggestion) if suggestion else "none"
+    print("The dev command is a template run by 'hwt dev' in each worktree, on a leased")
+    print("per-worktree port: {port}/{host} placeholders are substituted, and the")
+    print("PORT/HOST environment variables are always set for servers that read them.")
     raw = input(f"Dev server command [{rendered}]: ").strip()
     if not raw:
         dev = suggestion
@@ -872,8 +884,6 @@ def run_init_interview(cfg: dict[str, Any], name: str, config_path: Path) -> Pat
         dev = None
     else:
         dev = shlex.split(raw)
-    if dev:
-        print("Tip: add {host}/{port} arguments if the server accepts them; 'hwt dev' substitutes them.")
     overlay_dir = config_path.parent / "repos.d"
     overlay_dir.mkdir(parents=True, exist_ok=True)
     overlay = overlay_dir / f"{name}.toml"

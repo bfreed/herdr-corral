@@ -1033,6 +1033,30 @@ class InteractiveNewTests(unittest.TestCase):
                 hwt.interactive_new_setup(args, self.CFG)
 
 
+class DevCommandSuggestionTests(unittest.TestCase):
+    def suggest(self, scripts):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "package.json").write_text(json.dumps({"scripts": scripts}))
+            (repo / "package-lock.json").write_text("{}")
+            return hwt.suggest_dev_command(repo)
+
+    def test_vite_scripts_get_explicit_port_flags(self):
+        self.assertEqual(self.suggest({"dev": "vite"}),
+                         ["npm", "run", "dev", "--", "--host", "{host}", "--port", "{port}"])
+
+    def test_next_scripts_get_p_flag(self):
+        self.assertEqual(self.suggest({"dev": "next dev --turbo"}),
+                         ["npm", "run", "dev", "--", "-H", "{host}", "-p", "{port}"])
+
+    def test_env_respecting_frameworks_stay_bare(self):
+        self.assertEqual(self.suggest({"start": "react-scripts start"}),
+                         ["npm", "run", "start"])
+
+    def test_no_scripts_means_no_suggestion(self):
+        self.assertIsNone(self.suggest({}))
+
+
 class BaseRefTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
