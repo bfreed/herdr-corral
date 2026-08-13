@@ -2,6 +2,7 @@ import json
 import os
 import socket
 import tempfile
+import time
 import unittest
 import contextlib
 import io
@@ -582,6 +583,7 @@ class RemovalTests(unittest.TestCase):
              mock.patch.object(hwt, "worktree_lock", return_value=contextlib.nullcontext()), \
              mock.patch.object(hwt, "git", side_effect=responses) as git, \
              mock.patch.object(hwt, "release_port") as release, \
+             mock.patch.object(hwt, "suppress_teardown"), \
              contextlib.redirect_stdout(io.StringIO()):
             hwt.cmd_cleanup(args, self.CFG, Path("/state"), fake)
         self.assertIn(mock.call(Path("/canon/demo"), "push", "origin", "--delete", "feature/x"), git.call_args_list)
@@ -648,6 +650,7 @@ class RemovalTests(unittest.TestCase):
              mock.patch.object(hwt, "worktree_lock", return_value=contextlib.nullcontext()), \
              mock.patch.object(hwt, "git", side_effect=responses) as git, \
              mock.patch.object(hwt, "release_port") as release, \
+             mock.patch.object(hwt, "suppress_teardown"), \
              contextlib.redirect_stdout(io.StringIO()) as out:
             hwt.cmd_cleanup(args, self.CFG, Path("/state"), fake)
         self.assertIn(mock.call("worktree", "remove", "--workspace", "w2"), fake.call.call_args_list)
@@ -672,6 +675,7 @@ class RemovalTests(unittest.TestCase):
              mock.patch.object(hwt, "worktree_lock", return_value=contextlib.nullcontext()), \
              mock.patch.object(hwt, "git", side_effect=responses) as git, \
              mock.patch.object(hwt, "release_port") as release, \
+             mock.patch.object(hwt, "suppress_teardown"), \
              contextlib.redirect_stdout(io.StringIO()):
             hwt.cmd_cleanup(args, self.CFG, Path("/state"), fake)
         self.assertIn(mock.call(Path("/canon/demo"), "push", "origin", "--delete", "feature/x"), git.call_args_list)
@@ -699,6 +703,7 @@ class RemovalTests(unittest.TestCase):
              mock.patch.object(hwt, "worktree_lock", return_value=contextlib.nullcontext()), \
              mock.patch.object(hwt, "git", side_effect=responses), \
              mock.patch.object(hwt, "release_port"), \
+             mock.patch.object(hwt, "suppress_teardown"), \
              contextlib.redirect_stdout(io.StringIO()):
             hwt.cmd_cleanup(args, self.CFG, Path("/state"), fake)
         return fake.call.call_args_list
@@ -778,6 +783,7 @@ class RemovalTests(unittest.TestCase):
              mock.patch.object(hwt, "worktree_lock", return_value=contextlib.nullcontext()), \
              mock.patch.object(hwt, "git", side_effect=responses) as git, \
              mock.patch.object(hwt, "release_port") as release, \
+             mock.patch.object(hwt, "suppress_teardown"), \
              contextlib.redirect_stdout(io.StringIO()):
             hwt.cmd_cleanup(args, self.CFG, Path("/state"), fake)
         fake.call.assert_not_called()
@@ -914,6 +920,216 @@ class WorktreeSafetyTests(unittest.TestCase):
         responses = [mock.Mock(returncode=1, stdout=""), mock.Mock(returncode=0, stdout="")]
         with mock.patch.object(hwt, "git", side_effect=responses):
             self.assertEqual(hwt.worktree_safety(self.CFG, dict(self.ITEM)), "no-unique-commits")
+
+
+class TeardownSuppressionTests(unittest.TestCase):
+    def test_marker_is_consumed_by_first_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            hwt.suppress_teardown(state, "/wt/x")
+            self.assertTrue(hwt.teardown_suppressed(state, "/wt/x"))
+            self.assertFalse(hwt.teardown_suppressed(state, "/wt/x"))
+
+    def test_stale_marker_does_not_suppress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            hwt.suppress_teardown(state, "/wt/x")
+            later = time.time() + hwt.TEARDOWN_SUPPRESS_TTL + 1
+            with mock.patch.object(hwt.time, "time", return_value=later):
+                self.assertFalse(hwt.teardown_suppressed(state, "/wt/x"))
+
+    def test_cleanup_suppresses_teardown_for_its_own_removal(self):
+        args = type("Args", (), {"target": "feature/x", "abandon": False, "confirm": None})()
+        fake = mock.Mock()
+        responses = [
+            mock.Mock(stdout="", returncode=0),   # status: clean
+            mock.Mock(stdout="", returncode=0),   # fetch
+            mock.Mock(stdout="", returncode=0),   # merge-base: merged
+            mock.Mock(stdout="", returncode=1),   # show-ref: no remote branch
+            mock.Mock(stdout="", returncode=0),   # update-ref -d
+        ]
+        with mock.patch.object(hwt, "configured_worktree_items", return_value=[dict(RemovalTests.ITEM)]), \
+             mock.patch.object(hwt, "resolve_existing", side_effect=lambda path: Path(path)), \
+             mock.patch.object(hwt, "validate_worktree_identity"), \
+             mock.patch.object(hwt, "worktree_lock", return_value=contextlib.nullcontext()), \
+             mock.patch.object(hwt, "git", side_effect=responses), \
+             mock.patch.object(hwt, "release_port"), \
+             mock.patch.object(hwt, "suppress_teardown") as marked, \
+             contextlib.redirect_stdout(io.StringIO()):
+            hwt.cmd_cleanup(args, RemovalTests.CFG, Path("/state"), fake)
+        marked.assert_called_once_with(Path("/state"), str(Path("/approved/wt")))
+
+
+class TeardownEventTests(unittest.TestCase):
+    CFG = {"repositories": {"demo": {
+        "path": "/canon/demo", "remote": "origin", "base_branch": "origin/main"}}}
+    PAYLOAD = {"event": "worktree.removed",
+               "data": {"type": "worktree_removed", "workspace_id": "w2", "forced": False,
+                        "worktree": {"path": "/approved/demo/wt", "branch": "feature/x",
+                                     "is_linked_worktree": True, "label": "feature/x",
+                                     "is_bare": False, "is_detached": False, "is_prunable": False}}}
+
+    def run_maybe(self, payload, *, suppressed=False, resolved=True, branch_exists=True):
+        repo = self.CFG["repositories"]["demo"]
+        found = ("demo", repo, Path("/canon/demo")) if resolved else None
+        with mock.patch.object(hwt, "teardown_suppressed", return_value=suppressed), \
+             mock.patch.object(hwt, "repo_for_removed_worktree", return_value=found), \
+             mock.patch.object(Path, "is_dir", return_value=True), \
+             mock.patch.object(hwt, "git", return_value=mock.Mock(returncode=0 if branch_exists else 1)), \
+             mock.patch.object(hwt, "run") as runner:
+            hwt.maybe_open_teardown(self.CFG, Path("/state"), payload)
+        return runner
+
+    def test_ui_removal_opens_teardown_popup_with_branch_context(self):
+        runner = self.run_maybe(self.PAYLOAD)
+        runner.assert_called_once()
+        argv = runner.call_args.args[0]
+        self.assertEqual(argv[1:5], ["plugin", "pane", "open", "--plugin"])
+        self.assertIn("teardown", argv)
+        self.assertIn("HWT_TEARDOWN_BRANCH=feature/x", argv)
+        self.assertIn("HWT_TEARDOWN_REPO=demo", argv)
+        self.assertIn("HWT_TEARDOWN_FORCED=0", argv)
+
+    def test_forced_removal_flag_reaches_the_dialog(self):
+        payload = json.loads(json.dumps(self.PAYLOAD))
+        payload["data"]["forced"] = True
+        self.assertIn("HWT_TEARDOWN_FORCED=1", self.run_maybe(payload).call_args.args[0])
+
+    def test_corral_initiated_removal_is_suppressed(self):
+        self.run_maybe(self.PAYLOAD, suppressed=True).assert_not_called()
+
+    def test_detached_checkout_has_no_branch_to_tear_down(self):
+        payload = json.loads(json.dumps(self.PAYLOAD))
+        payload["data"]["worktree"].pop("branch")
+        self.run_maybe(payload).assert_not_called()
+
+    def test_canonical_checkout_removal_is_ignored(self):
+        payload = json.loads(json.dumps(self.PAYLOAD))
+        payload["data"]["worktree"]["is_linked_worktree"] = False
+        self.run_maybe(payload).assert_not_called()
+
+    def test_unrecognized_path_is_ignored(self):
+        self.run_maybe(self.PAYLOAD, resolved=False).assert_not_called()
+
+    def test_already_deleted_branch_is_ignored(self):
+        self.run_maybe(self.PAYLOAD, branch_exists=False).assert_not_called()
+
+
+class TeardownStatusTests(unittest.TestCase):
+    REPO = {"path": "/canon/demo", "remote": "origin", "base_branch": "origin/main"}
+
+    def status_with(self, responses):
+        with mock.patch.object(hwt, "git", side_effect=responses):
+            return hwt.teardown_status(self.REPO, Path("/canon/demo"), "feature/x")
+
+    def test_merged_branch_whose_remote_was_deleted_after_pr_merge(self):
+        status = self.status_with([
+            mock.Mock(returncode=0),                 # show-ref tracking: existed
+            mock.Mock(returncode=0),                 # fetch --prune
+            mock.Mock(returncode=1),                 # show-ref tracking: pruned away
+            mock.Mock(returncode=0),                 # merge-base: merged
+            mock.Mock(returncode=0, stdout=""),      # rev-list: nothing unique
+        ])
+        self.assertEqual(status["remote_state"], "deleted")
+        self.assertTrue(status["merged"])
+        self.assertFalse(status["unique_commits"])
+
+    def test_unpushed_unmerged_branch_with_unique_commits(self):
+        status = self.status_with([
+            mock.Mock(returncode=1),                 # show-ref tracking: never existed
+            mock.Mock(returncode=0),                 # fetch --prune
+            mock.Mock(returncode=1),                 # show-ref tracking: still absent
+            mock.Mock(returncode=1),                 # merge-base: not merged
+            mock.Mock(returncode=0, stdout="abc\n"), # rev-list: unique commit
+        ])
+        self.assertEqual(status["remote_state"], "never-pushed")
+        self.assertFalse(status["merged"])
+        self.assertTrue(status["unique_commits"])
+
+    def test_offline_falls_back_to_local_tracking_ref_state(self):
+        status = self.status_with([
+            mock.Mock(returncode=0),                 # show-ref tracking: existed
+            mock.Mock(returncode=1),                 # fetch --prune: offline
+            mock.Mock(returncode=0),                 # merge-base: merged locally
+            mock.Mock(returncode=0, stdout=""),      # rev-list
+        ])
+        self.assertEqual(status["remote_state"], "unknown")
+        self.assertFalse(status["fetched"])
+        self.assertTrue(status["merged"])
+
+    def test_surviving_remote_branch_is_reported_as_existing(self):
+        status = self.status_with([
+            mock.Mock(returncode=0),                 # show-ref tracking: existed
+            mock.Mock(returncode=0),                 # fetch --prune
+            mock.Mock(returncode=0),                 # show-ref tracking: still there
+            mock.Mock(returncode=1),                 # merge-base: not merged
+            mock.Mock(returncode=0, stdout="abc\n"), # rev-list: unique commit
+        ])
+        self.assertEqual(status["remote_state"], "exists")
+        self.assertTrue(status["unique_commits"])
+
+
+class TeardownDialogTests(unittest.TestCase):
+    CFG = {"repositories": {"demo": {
+        "path": "/canon/demo", "remote": "origin", "base_branch": "origin/main"}}}
+    ENV = {"HWT_TEARDOWN_REPO": "demo", "HWT_TEARDOWN_BRANCH": "feature/x",
+           "HWT_TEARDOWN_PATH": "/approved/demo/wt", "HWT_TEARDOWN_FORCED": "0"}
+
+    @staticmethod
+    def status(**over):
+        base = {"remote": "origin", "base_branch": "origin/main", "merged": True,
+                "unique_commits": False, "remote_state": "deleted", "fetched": True}
+        base.update(over)
+        return base
+
+    def run_dialog(self, status, answers, typed=None, env=None):
+        args = type("Args", (), {})()
+        with mock.patch.dict(os.environ, env or self.ENV), \
+             mock.patch.object(hwt.sys.stdin, "isatty", return_value=True), \
+             mock.patch.object(hwt, "resolve_existing", side_effect=lambda p: Path(p)), \
+             mock.patch.object(hwt, "teardown_status", return_value=status), \
+             mock.patch.object(hwt, "ask_yes_no", side_effect=answers) as asked, \
+             mock.patch("builtins.input", side_effect=(typed or []) + [""]), \
+             mock.patch.object(hwt, "git") as git, \
+             contextlib.redirect_stdout(io.StringIO()):
+            hwt.cmd_teardown(args, self.CFG, Path("/state"))
+        return asked, git
+
+    def test_merged_branch_with_deleted_remote_deletes_local_only(self):
+        asked, git = self.run_dialog(self.status(), [True])
+        git.assert_called_once_with(Path("/canon/demo"), "update-ref", "-d", "refs/heads/feature/x")
+        self.assertTrue(asked.call_args_list[0].kwargs["default"])
+
+    def test_surviving_remote_is_offered_and_deleted_after_local(self):
+        asked, git = self.run_dialog(self.status(remote_state="exists"), [True, True])
+        self.assertIn(mock.call(Path("/canon/demo"), "update-ref", "-d", "refs/heads/feature/x"),
+                      git.call_args_list)
+        self.assertIn(mock.call(Path("/canon/demo"), "push", "origin", "--delete", "feature/x"),
+                      git.call_args_list)
+        self.assertTrue(asked.call_args_list[1].kwargs["default"])
+
+    def test_declining_the_remote_keeps_it(self):
+        _, git = self.run_dialog(self.status(remote_state="exists"), [True, False])
+        self.assertNotIn(mock.call(Path("/canon/demo"), "push", "origin", "--delete", "feature/x"),
+                         git.call_args_list)
+
+    def test_declining_local_deletion_never_asks_about_the_remote(self):
+        asked, git = self.run_dialog(self.status(remote_state="exists"), [False])
+        git.assert_not_called()
+        self.assertEqual(asked.call_count, 1)
+
+    def test_unique_commits_default_to_keep_and_require_typed_confirmation(self):
+        risky = self.status(merged=False, unique_commits=True)
+        asked, git = self.run_dialog(risky, [True], typed=["not-the-branch"])
+        self.assertFalse(asked.call_args_list[0].kwargs["default"])
+        git.assert_not_called()
+        _, git = self.run_dialog(risky, [True], typed=["feature/x"])
+        git.assert_called_once_with(Path("/canon/demo"), "update-ref", "-d", "refs/heads/feature/x")
+
+    def test_protected_branch_is_refused(self):
+        env = {**self.ENV, "HWT_TEARDOWN_BRANCH": "main"}
+        with self.assertRaises(hwt.SafetyError):
+            self.run_dialog(self.status(), [], env=env)
 
 
 class PaletteLayoutTests(unittest.TestCase):

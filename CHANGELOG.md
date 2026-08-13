@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.17.0 — 2026-08-13
+
+- New GUI teardown hook: deleting a worktree checkout from Herdr's right-click menu ("Delete worktree checkout...") now opens a Corral popup for the branch left behind. It fetches with `--prune`, reports whether the remote branch has already been deleted (the GitHub merge-then-delete flow), whether the branch is merged or all its commits exist elsewhere, then asks about deleting the local branch — defaulting to delete when safe, and requiring the branch name typed back when commits exist nowhere else. If the remote branch still exists and the local one was deleted, it offers to delete the remote too (default follows merge state).
+- Corral's own removal flows (`hwt remove`, `hwt cleanup`, sweep, palette) mark their removals in state so the event hook never opens the popup for them; protected branches, detached checkouts, and branches already gone are skipped.
+
 ## 0.16.1 — 2026-08-13
 
 - Tab reminders no longer echo a `printf` command at the prompt: the message is written straight to the pane's tty (resolved via `pane process-info` + `/proc/<shell_pid>/fd/0`), styled dim so it reads as ambient guidance, followed by a bare Enter so the shell draws a fresh prompt below it. Hosts without `/proc` (macOS) automatically fall back to the previous printf-through-the-shell delivery.

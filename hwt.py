@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
@@ -45,7 +46,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.16.1"
+__version__ = "0.17.0"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -469,6 +470,27 @@ def release_port(state_dir: Path, worktree: str) -> None:
         leases.pop(key, None)
 
 
+TEARDOWN_SUPPRESS_TTL = 600.0
+
+
+def suppress_teardown(state_dir: Path, worktree: str) -> None:
+    # Corral's own removal flows settle the branch themselves; the marker keeps
+    # the worktree.removed event hook from opening the teardown popup for them.
+    # Event delivery is asynchronous, so a state marker with a TTL is used
+    # instead of anything scoped to the removing process's lifetime.
+    with locked_json(state_dir, "teardown-suppress") as marks:
+        marks[str(Path(worktree).resolve())] = time.time()
+
+
+def teardown_suppressed(state_dir: Path, worktree: str) -> bool:
+    now = time.time()
+    with locked_json(state_dir, "teardown-suppress") as marks:
+        stamp = marks.pop(str(Path(worktree).resolve()), None)
+        for key in [k for k, v in marks.items() if now - float(v) > TEARDOWN_SUPPRESS_TTL]:
+            del marks[key]
+        return stamp is not None and now - float(stamp) <= TEARDOWN_SUPPRESS_TTL
+
+
 class Herdr:
     def __init__(self, binary: str | None = None):
         self.binary = binary or os.environ.get("HERDR_BIN_PATH", "herdr")
@@ -737,6 +759,29 @@ def validate_worktree_identity(cfg: dict[str, Any], worktree: Path) -> tuple[str
     if not is_within(expected, canonical.resolve()): raise SafetyError("configured canonical repository has a Git directory outside its approved path")
     if common != expected: raise SafetyError("worktree does not belong to configured canonical repository")
     return name, repo, canonical
+
+
+def protected_branches(repo: dict[str, Any]) -> set[str]:
+    remote = repo.get("remote", "origin")
+    base = repo.get("base_branch", f"{remote}/main")
+    base_name = base.split("/", 1)[1] if "/" in base else base
+    return {base_name, "main", "master", "develop", "development"}
+
+
+def repo_for_removed_worktree(cfg: dict[str, Any], path: Path) -> tuple[str, dict[str, Any], Path] | None:
+    """Best-effort repository lookup for a checkout that no longer exists.
+
+    Git cannot answer for a deleted path, so only the path conventions from
+    repo_for_worktree's fallback apply; unrecognized paths return None."""
+    target = path.expanduser().resolve()
+    for name, repo in cfg.get("repositories", {}).items():
+        if "path" in repo and is_within(target, sibling_worktree_dir(Path(repo["path"])).resolve()):
+            return name, repo, Path(repo["path"])
+    for root in approved_worktree_roots(cfg):
+        for name, repo in cfg.get("repositories", {}).items():
+            if "path" in repo and is_within(target, (root / name).resolve()):
+                return name, repo, Path(repo["path"])
+    return None
 
 
 def repo_is_unconfigured(repo: dict[str, Any]) -> bool:
@@ -1531,6 +1576,7 @@ def cmd_remove(args,cfg,state,herdr):
         # Re-read immediately before the destructive call while holding our workflow lock.
         branch2=git(path,"branch","--show-current").stdout.strip(); dirty2=bool(git(path,"status","--porcelain").stdout.strip())
         if branch2 != branch or dirty2 != dirty: raise WorkflowError("worktree changed while removal was being validated")
+        suppress_teardown(state, str(path))
         if workspace:
             focused = focused_workspace_id(herdr)
             cmd=["worktree","remove","--workspace",workspace]
@@ -1769,8 +1815,7 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
     base_remote, base_name = base_branch.split("/", 1)
     if base_remote != remote:
         raise WorkflowError("cleanup base_branch remote does not match configured remote")
-    protected = {base_name, "main", "master", "develop", "development"}
-    if branch in protected:
+    if branch in protected_branches(repo):
         raise SafetyError(f"refusing to clean up protected branch: {branch}")
     workspace, path = worktree_item_ids(item)
     with worktree_lock(state, path):
@@ -1799,6 +1844,7 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
                     f"available on any other branch; rerun with --abandon --confirm {branch} to delete it anyway")
         remote_ref = f"refs/remotes/{remote}/{branch}"
         remote_exists = git(canonical, "show-ref", "--verify", "--quiet", remote_ref, check=False).returncode == 0
+        suppress_teardown(state, str(path))
         if remote_exists:
             git(canonical, "push", remote, "--delete", branch)
         if workspace:
@@ -1826,6 +1872,102 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
         "abandoned": bool(abandon),
         "reason": "merged" if merged else ("abandoned" if abandon else "no-unique-commits"),
     }
+
+
+def teardown_status(repo: dict[str, Any], canonical: Path, branch: str) -> dict[str, Any]:
+    """Assess a branch whose checkout was just deleted, from the canonical repo.
+
+    remote_state distinguishes a branch whose remote copy was deleted (the
+    tracking ref existed before `fetch --prune` and is gone after — the
+    GitHub merge-then-delete flow) from one that was never pushed. Offline,
+    the remote cannot be checked and the state is "unknown"."""
+    remote = repo.get("remote", "origin")
+    base_branch = repo.get("base_branch", f"{remote}/main")
+    branch_ref = f"refs/heads/{branch}"
+    tracking_ref = f"refs/remotes/{remote}/{branch}"
+    had_tracking = git(canonical, "show-ref", "--verify", "--quiet", tracking_ref, check=False).returncode == 0
+    fetched = git(canonical, "fetch", remote, "--prune", check=False).returncode == 0
+    if fetched:
+        remote_exists = git(canonical, "show-ref", "--verify", "--quiet", tracking_ref, check=False).returncode == 0
+    else:
+        remote_exists = had_tracking
+    merged = "/" in base_branch and git(canonical, "merge-base", "--is-ancestor", branch_ref,
+                                        f"refs/remotes/{base_branch}", check=False).returncode == 0
+    probe = git(canonical, "rev-list", "-n", "1", branch_ref, "--not",
+                f"--exclude={branch_ref}", f"--exclude={tracking_ref}", "--all", check=False)
+    unique = bool(probe.returncode) or bool(probe.stdout.strip())
+    if not fetched:
+        remote_state = "unknown"
+    elif remote_exists:
+        remote_state = "exists"
+    elif had_tracking:
+        remote_state = "deleted"
+    else:
+        remote_state = "never-pushed"
+    return {"remote": remote, "base_branch": base_branch, "merged": merged,
+            "unique_commits": unique, "remote_state": remote_state, "fetched": fetched}
+
+
+def teardown_advice(branch: str, status: dict[str, Any]) -> list[str]:
+    remote = status["remote"]
+    if status["merged"]:
+        lines = [colorize(f"merged into {status['base_branch']} — safe to delete", "32")]
+    elif not status["unique_commits"]:
+        lines = [colorize("all of its commits exist on other branches — safe to delete", "32")]
+    else:
+        lines = [colorize(f"NOT merged into {status['base_branch']}; has commits found nowhere else", "33")]
+    if status["remote_state"] == "deleted":
+        lines.append(f"{remote}/{branch} has already been deleted on the remote (e.g. after a PR merge)")
+    elif status["remote_state"] == "exists":
+        lines.append(f"{remote}/{branch} still exists on the remote")
+    elif status["remote_state"] == "never-pushed":
+        lines.append(f"never pushed to {remote}")
+    else:
+        lines.append(colorize(f"{remote} unreachable — remote branch state unknown", "33"))
+    return lines
+
+
+def cmd_teardown(args, cfg, state):
+    """Interactive popup opened by the worktree.removed hook: settle the branch."""
+    branch = os.environ.get("HWT_TEARDOWN_BRANCH", "")
+    repo = cfg.get("repositories", {}).get(os.environ.get("HWT_TEARDOWN_REPO", ""))
+    if not branch or not repo:
+        raise WorkflowError("teardown opens automatically after a checkout is deleted in Herdr")
+    if not sys.stdin.isatty():
+        raise WorkflowError("teardown is interactive; it runs inside the Corral popup")
+    if branch in protected_branches(repo):
+        raise SafetyError(f"refusing to tear down protected branch: {branch}")
+    canonical = resolve_existing(Path(repo["path"]))
+    print(colorize("Corral — branch teardown", "1"))
+    print()
+    print(f"Checkout deleted: {shorten_home(os.environ.get('HWT_TEARDOWN_PATH', '?'))}")
+    if os.environ.get("HWT_TEARDOWN_FORCED") == "1":
+        print(colorize("It was force-deleted; any uncommitted changes in it are gone.", "33"))
+    print(f"Local branch {branch!r} still exists:")
+    status = teardown_status(repo, canonical, branch)
+    for line in teardown_advice(branch, status):
+        print(f"  • {line}")
+    print()
+    deletable = status["merged"] or not status["unique_commits"]
+    if not ask_yes_no(f"Delete local branch {branch!r}?", default=deletable):
+        print("Kept the branch.")
+    else:
+        if not deletable:
+            confirm = input("It has commits found nowhere else. Type the branch name to confirm: ").strip()
+            if confirm != branch:
+                print("Confirmation did not match; kept the branch.")
+                input("Enter to close ")
+                return
+        git(canonical, "update-ref", "-d", f"refs/heads/{branch}")
+        print(f"Deleted local branch {branch!r}.")
+        if status["remote_state"] == "exists":
+            print()
+            if ask_yes_no(f"Also delete {status['remote']}/{branch} on the remote?", default=status["merged"]):
+                git(canonical, "push", status["remote"], "--delete", branch)
+                print(f"Deleted {status['remote']}/{branch}.")
+            else:
+                print(f"Kept {status['remote']}/{branch}.")
+    input("Enter to close ")
 
 
 def cmd_doctor(args,cfg,state):
@@ -1879,14 +2021,43 @@ def cmd_event(args,cfg,state,herdr):
         paths=values(payload, {"path", "cwd", "worktree_path"})
         for p in paths:
             if is_in_approved_worktree_root(cfg, Path(p), strict=False): release_port(state,p)
+        maybe_open_teardown(cfg, state, payload)
+
+
+def maybe_open_teardown(cfg: dict[str, Any], state: Path, payload: dict[str, Any]) -> None:
+    """After a checkout deletion Corral did not run itself (Herdr UI's
+    "Delete worktree checkout..."), offer to settle the surviving branch."""
+    data = payload.get("data", {})
+    info = data.get("worktree", {})
+    branch, path = info.get("branch"), info.get("path")
+    if not branch or not path or not info.get("is_linked_worktree", False):
+        return
+    if teardown_suppressed(state, path):
+        return
+    found = repo_for_removed_worktree(cfg, Path(path))
+    if not found:
+        return
+    name, repo, canonical = found
+    if branch in protected_branches(repo) or not canonical.is_dir():
+        return
+    if git(canonical, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode != 0:
+        return
+    binary = os.environ.get("HERDR_BIN_PATH", "herdr")
+    # A failed popup must never fail the event hook; the branch simply stays.
+    with contextlib.suppress(WorkflowError, OSError):
+        run([binary, "plugin", "pane", "open", "--plugin", PLUGIN_ID, "--entrypoint", "teardown",
+             "--env", f"HWT_TEARDOWN_REPO={name}",
+             "--env", f"HWT_TEARDOWN_BRANCH={branch}",
+             "--env", f"HWT_TEARDOWN_PATH={path}",
+             "--env", f"HWT_TEARDOWN_FORCED={'1' if data.get('forced') else '0'}"])
 
 
 def parser() -> argparse.ArgumentParser:
     p=argparse.ArgumentParser(prog="hwt",description="Corral: safe Git-worktree workflow for Herdr")
     p.add_argument("--config",type=Path,default=DEFAULT_CONFIG,help=argparse.SUPPRESS)
     # metavar hides the internal entry points (event, cleanup-workspace,
-    # palette-open, invoked by Herdr) from usage; omitting their help keeps
-    # them out of the table below it.
+    # palette-open, teardown, invoked by Herdr) from usage; omitting their
+    # help keeps them out of the table below it.
     sub=p.add_subparsers(dest="command",required=True,
                          metavar="{new,open,init,list,status,dev,remove,cleanup,sweep,palette,doctor,update}")
     n=sub.add_parser("new",help="create a worktree for a new branch"); n.add_argument("branch",nargs="?",help="omit to choose repository, base, and name interactively"); n.add_argument("--base"); n.add_argument("--repo"); n.add_argument("--background",action="store_true")
@@ -1904,6 +2075,7 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("event")
     sub.add_parser("cleanup-workspace")
     sub.add_parser("palette-open")
+    sub.add_parser("teardown")
     return p
 
 
@@ -1917,7 +2089,7 @@ def main(argv: list[str] | None=None) -> int:
             cmd_palette_open(args)
             return 0
         cfg=load_config(args.config); state=runtime_state_dir(); herdr=Herdr()
-        commands={"new":cmd_new,"open":cmd_open,"init":cmd_init,"list":cmd_list,"status":cmd_status,"dev":cmd_dev,"remove":cmd_remove,"cleanup":cmd_cleanup,"cleanup-workspace":cmd_cleanup_workspace,"sweep":cmd_sweep,"palette":cmd_palette,"doctor":cmd_doctor,"event":cmd_event}
+        commands={"new":cmd_new,"open":cmd_open,"init":cmd_init,"list":cmd_list,"status":cmd_status,"dev":cmd_dev,"remove":cmd_remove,"cleanup":cmd_cleanup,"cleanup-workspace":cmd_cleanup_workspace,"sweep":cmd_sweep,"palette":cmd_palette,"doctor":cmd_doctor,"event":cmd_event,"teardown":cmd_teardown}
         fn=commands[args.command]
         if args.command in ("new","open","list","remove","cleanup","cleanup-workspace","sweep","palette","event"): fn(args,cfg,state,herdr)
         else: fn(args,cfg,state)
