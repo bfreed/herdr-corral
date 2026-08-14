@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.17.4 — 2026-08-13
+
+- Fixed the fallback prefix used when rendering the palette keybinding: Herdr's default `keys.prefix` is ctrl+b (per `validated_keybinds` in its source), not ctrl+a. 0.17.3 told users with an unconfigured prefix to press a dead chord.
+
 ## 0.17.3 — 2026-08-13
 
 - The shell-tab reminder now names the actual palette keystrokes ("palette: ctrl+a w") instead of "via your Corral keybinding". Corral reads the binding from Herdr's own config.toml (respecting XDG_CONFIG_HOME) — the `[[keys.command]]` entry invoking `corral.palette` — and expands a `prefix+X` binding using the configured prefix, defaulting to Herdr's ctrl+a. When no binding exists, the reminder falls back to the explicit `herdr plugin action invoke corral.palette` command.

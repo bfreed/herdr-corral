@@ -46,7 +46,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.17.3"
+__version__ = "0.17.4"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -613,7 +613,7 @@ def corral_palette_keybinding() -> str | None:
 
     Reads the same file Herdr does (XDG_CONFIG_HOME, else ~/.config/herdr) and
     renders 'prefix+X' as the real keystrokes by expanding the configured
-    prefix (Herdr's default is ctrl+a)."""
+    prefix (Herdr's default is ctrl+b, per validated_keybinds in its source)."""
     base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
     config = Path(base) / "herdr" / "config.toml"
     try:
@@ -624,7 +624,7 @@ def corral_palette_keybinding() -> str | None:
         if entry.get("type") == "plugin_action" and entry.get("command") == f"{PLUGIN_ID}.palette":
             key = str(entry.get("key", ""))
             if key.startswith("prefix+"):
-                return f"{keys.get('prefix', 'ctrl+a')} {key.removeprefix('prefix+')}"
+                return f"{keys.get('prefix', 'ctrl+b')} {key.removeprefix('prefix+')}"
             return key or None
     return None
 

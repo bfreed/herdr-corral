@@ -948,15 +948,16 @@ class PaletteKeybindingTests(unittest.TestCase):
                'command = "corral.palette"\n')
 
     def test_prefix_binding_expands_default_prefix(self):
+        # ctrl+b is Herdr's fallback for keys.prefix (validated_keybinds).
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.dict(os.environ, self.write_config(tmp, self.BINDING)):
-            self.assertEqual(hwt.corral_palette_keybinding(), "ctrl+a w")
+            self.assertEqual(hwt.corral_palette_keybinding(), "ctrl+b w")
 
     def test_prefix_binding_expands_configured_prefix(self):
-        content = '[keys]\nprefix = "ctrl+b"\n' + self.BINDING
+        content = '[keys]\nprefix = "ctrl+a"\n' + self.BINDING
         with tempfile.TemporaryDirectory() as tmp, \
              mock.patch.dict(os.environ, self.write_config(tmp, content)):
-            self.assertEqual(hwt.corral_palette_keybinding(), "ctrl+b w")
+            self.assertEqual(hwt.corral_palette_keybinding(), "ctrl+a w")
 
     def test_direct_binding_is_reported_verbatim(self):
         content = self.BINDING.replace("prefix+w", "f5")
@@ -976,9 +977,9 @@ class PaletteKeybindingTests(unittest.TestCase):
     def test_shell_reminder_names_the_resolved_binding(self):
         fake = hwt.FakeHerdrForTests()
         fake.seed_workspace("w1", "/wt/demo", ["Tab 1"])
-        with mock.patch.object(hwt, "corral_palette_keybinding", return_value="ctrl+a w"):
+        with mock.patch.object(hwt, "corral_palette_keybinding", return_value="ctrl+b w"):
             hwt.ensure_layout(fake, "w1", Path("/wt/demo"), 4100, "0.0.0.0", "", True)
-        self.assertIn("palette: ctrl+a w", dict(fake.reminders)["w1:p2"])
+        self.assertIn("palette: ctrl+b w", dict(fake.reminders)["w1:p2"])
 
     def test_shell_reminder_falls_back_to_the_action_command_when_unbound(self):
         fake = hwt.FakeHerdrForTests()
