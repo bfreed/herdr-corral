@@ -68,7 +68,7 @@ The questions, each with the preflight fields that feed it:
    > 1. `/home/user/Documents/GitRepos` — 21 repositories found (recommended)
    > 2. `/home/user/code` — 3 repositories found
    > 3. Somewhere else (tell me the path)
-2. **Where should worktrees go?** The goal is one location and one convention for *both* entry points: Herdr's right-click "new worktree" and `hwt new`. Preflight's `worktrees` field carries Herdr's current directory (`herdr_directory`, with whether it was explicitly configured and exists), any `<repo>__worktrees/` sibling collections (the workmux layout), and a previous Corral `worktree_root` if one exists.
+2. **Where should worktrees go?** The goal is one location and one convention for *both* entry points: Herdr's right-click "new worktree" and `hwt new`. Preflight's `worktrees` field carries Herdr's current directory (`herdr_directory`, with whether it was explicitly configured and exists), any `<repo>__worktrees/` sibling collections (the workmux layout), and a previous Corral `worktree_root` if one exists. If `herdr_config_readable` is false, the directory shown is only Herdr's default — tell the user their Herdr config could not be parsed and have them confirm the real location instead of presenting the default as current.
 
    Ask, showing the user what each layout literally looks like on disk (substitute their real paths and a real repo name from preflight):
 
@@ -111,7 +111,7 @@ The questions, each with the preflight fields that feed it:
    description = "Corral: worktree palette"
    ```
 
-   then run `herdr server reload-config`. Optionally offer a second binding for `corral.cleanup` (merge-checked cleanup of the focused worktree, no popup). Fine to skip: everything remains reachable via `hwt` and `herdr plugin action invoke corral.palette`.
+   then run `herdr server reload-config`. Optionally offer a second binding for `corral.cleanup` (merge-checked cleanup of the focused worktree, no popup). Fine to skip: everything remains reachable via `hwt` and `herdr plugin action invoke corral.palette`. If `suggested_palette_key` is null or `keybindings` reports `available: false`, do not invent a key — offer to skip the binding, or let the user name one and use it as given.
 
 ## Step 3 — install
 

@@ -62,10 +62,22 @@ class PreflightDetectionTests(unittest.TestCase):
 
     def test_network_without_tailscale_reports_hostname_only(self):
         with mock.patch.object(install.shutil, "which", return_value=None), \
-             mock.patch.object(install.socket, "getfqdn", return_value="box.local"):
+             mock.patch.object(install.socket, "gethostname", return_value="box"):
             report = install.preflight_network()
-        self.assertEqual(report, {"hostname": "box.local",
+        self.assertEqual(report, {"hostname": "box",
                                   "tailscale_dns_name": None, "tailscale_ip": None})
+
+    def test_herdr_binary_override_is_honored(self):
+        with mock.patch.dict(os.environ, {"HERDR_BIN_PATH": "/opt/herdr/bin/herdr"}):
+            self.assertEqual(install.herdr_binary(), "/opt/herdr/bin/herdr")
+
+    def test_prerequisites_gate_os_and_herdr_version(self):
+        with mock.patch.object(install.shutil, "which", return_value="/usr/bin/herdr"), \
+             mock.patch.object(install, "command_output", return_value="herdr 0.7.9"):
+            prereqs = install.preflight_prerequisites()
+        self.assertTrue(prereqs["os_ok"])
+        self.assertIs(prereqs["herdr_version_ok"], False)
+        self.assertEqual(prereqs["herdr_minimum"], "0.8.0")
 
 
 class PreflightKeybindingTests(unittest.TestCase):
@@ -86,6 +98,25 @@ class PreflightKeybindingTests(unittest.TestCase):
         cfg = {"keys": {"command": [
             {"key": "prefix+w", "type": "plugin_action", "command": "corral.palette"}]}}
         self.assertEqual(install.preflight_keybindings(cfg)["palette_binding"], "prefix+w")
+
+    def test_palette_match_requires_plugin_action_type_like_hwt(self):
+        cfg = {"keys": {"command": [
+            {"key": "prefix+w", "type": "shell", "command": "corral.palette"}]}}
+        self.assertIsNone(install.preflight_keybindings(cfg)["palette_binding"])
+
+    def test_exhausted_preferred_candidates_fall_back_past_letters(self):
+        commands = [{"key": f"prefix+{k}", "type": "plugin_action", "command": "x"}
+                    for k in install.PALETTE_KEY_CANDIDATES]
+        report = install.preflight_keybindings({"keys": {"command": commands}})
+        # Herdr's default letters + the preferred set cover a-z entirely, so
+        # the fallback must land on a non-letter key.
+        self.assertEqual(report["suggested_palette_key"], "prefix+0")
+
+    def test_full_exhaustion_yields_none_not_an_invented_key(self):
+        commands = [{"key": f"prefix+{k}", "type": "plugin_action", "command": "x"}
+                    for k in install.PALETTE_KEY_CANDIDATES + "0.,;'"]
+        self.assertIsNone(
+            install.preflight_keybindings({"keys": {"command": commands}})["suggested_palette_key"])
 
     def test_unreadable_config_degrades_to_unavailable(self):
         self.assertEqual(install.preflight_keybindings(None), {"available": False})

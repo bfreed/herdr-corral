@@ -151,13 +151,37 @@ def herdr_config_path() -> Path:
     return Path(base) / "herdr" / "config.toml"
 
 
+def herdr_binary() -> str:
+    # hwt.py honors HERDR_BIN_PATH everywhere; preflight and verify must too,
+    # or they report false negatives on setups the rest of Corral supports.
+    return os.environ.get("HERDR_BIN_PATH", "herdr")
+
+
+def version_tuple(value: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", value)[:3])
+
+
 def preflight_prerequisites() -> dict:
+    herdr = shutil.which(herdr_binary())
+    raw_version = command_output([herdr_binary(), "--version"]) if herdr else None
+    minimum = (read_toml(Path(__file__).resolve().parent / "herdr-plugin.toml")
+               or {}).get("min_herdr_version", "0.8.0")
+    version_ok = None
+    if raw_version:
+        try:
+            version_ok = version_tuple(raw_version) >= version_tuple(minimum)
+        except ValueError:
+            version_ok = None
     return {
+        "os": sys.platform,
+        "os_ok": os.name == "posix",
         "python_version": ".".join(map(str, sys.version_info[:3])),
         "python_ok": sys.version_info[:2] >= (3, 11),
         "git": shutil.which("git"),
-        "herdr": shutil.which("herdr"),
-        "herdr_version": command_output(["herdr", "--version"]) if shutil.which("herdr") else None,
+        "herdr": herdr,
+        "herdr_version": raw_version,
+        "herdr_version_ok": version_ok,
+        "herdr_minimum": minimum,
     }
 
 
@@ -205,6 +229,10 @@ def preflight_worktrees(home: Path, herdr_cfg: dict | None, parents: list[dict])
             pass
     corral = read_toml(home / ".config/herdr-corral/config.toml") or {}
     return {
+        # An unreadable config is not the same as an unconfigured one: the
+        # directory shown below is only Herdr's default in that case, and the
+        # interview must confirm rather than present it as current.
+        "herdr_config_readable": herdr_cfg is not None,
         "herdr_directory": str(herdr_dir),
         "herdr_directory_exists": herdr_dir.is_dir(),
         "herdr_directory_configured": bool(configured),
@@ -214,7 +242,9 @@ def preflight_worktrees(home: Path, herdr_cfg: dict | None, parents: list[dict])
 
 
 def preflight_network() -> dict:
-    report = {"hostname": socket.getfqdn(),
+    # gethostname is a pure syscall; getfqdn does reverse DNS and can block
+    # for the resolver timeout. The tailscale DNS name covers qualified names.
+    report = {"hostname": socket.gethostname(),
               "tailscale_dns_name": None, "tailscale_ip": None}
     if shutil.which("tailscale"):
         raw = command_output(["tailscale", "status", "--json"])
@@ -233,7 +263,7 @@ def preflight_network() -> dict:
 def herdr_agent_kinds() -> list[str]:
     # The accepted kinds come from Herdr's own help output; a format change
     # degrades this to an empty list rather than failing preflight.
-    help_text = command_output(["herdr", "agent", "start", "--help"]) or ""
+    help_text = command_output([herdr_binary(), "agent", "start", "--help"]) or ""
     match = re.search(r"\[possible values: ([^\]]+)\]", help_text)
     return [kind.strip() for kind in match.group(1).split(",")] if match else []
 
@@ -278,9 +308,16 @@ def preflight_keybindings(herdr_cfg: dict | None) -> dict:
     user_keys = {str(e.get("key", "")).removeprefix("prefix+")
                  for e in commands if str(e.get("key", "")).startswith("prefix+")}
     occupied = HERDR_DEFAULT_PREFIX_KEYS | user_keys
+    # Same match hwt.py's corral_palette_keybinding uses: command AND type.
     palette = next((e for e in commands
-                    if e.get("command") == f"{PLUGIN_ID}.palette"), None)
-    suggestion = next((f"prefix+{key}" for key in PALETTE_KEY_CANDIDATES
+                    if e.get("type") == "plugin_action"
+                    and e.get("command") == f"{PLUGIN_ID}.palette"), None)
+    # Herdr's defaults plus the preferred candidates cover all 26 letters, so
+    # the fallback must reach past letters; 0 and these punctuation keys are
+    # not default-bound. A None suggestion remains possible and the install
+    # instructions handle it (skip, or let the user name a key).
+    candidates = PALETTE_KEY_CANDIDATES + "0.,;'"
+    suggestion = next((f"prefix+{key}" for key in candidates
                        if key not in occupied), None)
     return {
         "available": True,
@@ -307,9 +344,11 @@ def cmd_preflight() -> int:
         "keybindings": preflight_keybindings(herdr_cfg),
     }
     print(json.dumps(report, indent=2))
-    note(f"Python {prereqs['python_version']} ({'ok' if prereqs['python_ok'] else 'needs 3.11+'});"
+    note(f"{prereqs['os']} ({'ok' if prereqs['os_ok'] else 'UNSUPPORTED'});"
+         f" Python {prereqs['python_version']} ({'ok' if prereqs['python_ok'] else 'needs 3.11+'});"
          f" git {'found' if prereqs['git'] else 'MISSING'};"
-         f" herdr {prereqs['herdr_version'] or 'MISSING'}")
+         f" herdr {prereqs['herdr_version'] or 'MISSING'}"
+         + (f" (needs >= {prereqs['herdr_minimum']})" if prereqs['herdr_version_ok'] is False else ""))
     note("Repository parents: " + (", ".join(
         f"{p['path']} ({p['repositories']})" for p in report["repository_parents"]) or "(none found)"))
     note(f"Worktrees: {report['worktrees']['herdr_directory']}"
@@ -328,9 +367,9 @@ def cmd_preflight() -> int:
 
 
 def verify_plugin_registration() -> tuple[bool, str]:
-    if shutil.which("herdr") is None:
+    if shutil.which(herdr_binary()) is None:
         return False, "herdr is not on PATH"
-    raw = command_output(["herdr", "plugin", "list", "--json"], timeout=15)
+    raw = command_output([herdr_binary(), "plugin", "list", "--json"], timeout=15)
     if not raw:
         return False, "herdr plugin list --json failed"
     try:
@@ -357,24 +396,41 @@ def cmd_verify(source: Path, tests_dir: Path | None) -> int:
     def check(name: str, ok: bool, detail: str = "") -> None:
         checks.append({"check": name, "ok": bool(ok), "detail": detail})
 
-    suite = subprocess.run(
-        [sys.executable, "-m", "unittest", "discover", "-s", str(tests_dir or source / "tests")],
-        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(source))
-    # Quiet on success: the per-test output only appears when something failed.
-    check("unit-tests", suite.returncode == 0,
-          "" if suite.returncode == 0 else suite.stdout[-4000:])
+    # A failing check must name itself, never traceback or hang: every
+    # subprocess here is bounded and OSError-guarded.
+    try:
+        suite = subprocess.run(
+            [sys.executable, "-m", "unittest", "discover", "-s", str(tests_dir or source / "tests")],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cwd=str(source), timeout=300)
+        # Quiet on success: per-test output only appears when something failed.
+        check("unit-tests", suite.returncode == 0,
+              "" if suite.returncode == 0 else suite.stdout[-4000:])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        check("unit-tests", False, f"suite did not complete: {exc}")
     launcher = Path.home() / ".local/bin/hwt"
-    launcher_ok = launcher.exists() and subprocess.run(
-        [str(launcher), "--help"], stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL).returncode == 0
-    check("hwt-launcher", launcher_ok, str(launcher))
+    try:
+        launcher_ok = launcher.exists() and subprocess.run(
+            [str(launcher), "--help"], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=30).returncode == 0
+        check("hwt-launcher", launcher_ok, str(launcher))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        check("hwt-launcher", False, f"{launcher}: {exc}")
     config = Path.home() / ".config/herdr-corral/config.toml"
     check("configuration", config.exists(), str(config))
-    # Doctor-equivalent repository checks: every configured path is a git repo.
+    # Doctor-equivalent environment checks: the configured roots exist and
+    # every configured repository path is a git repository.
     corral_cfg = read_toml(config)
     if corral_cfg is None:
+        check("configured-roots", False, "configuration is unreadable")
         check("repositories", False, "configuration is unreadable")
     else:
+        missing_roots = sorted(
+            key for key in ("canonical_root", "worktree_root")
+            if corral_cfg.get(key) and not Path(corral_cfg[key]).expanduser().is_dir())
+        check("configured-roots", not missing_roots,
+              "exist" if not missing_roots else "missing: " + ", ".join(
+                  f"{key}={corral_cfg[key]}" for key in missing_roots))
         broken = sorted(
             name for name, repo in corral_cfg.get("repositories", {}).items()
             if "path" in repo and not (Path(repo["path"]).is_dir()
