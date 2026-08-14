@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.18.0 — 2026-08-13
+
+- The guided install now takes ~4 approved commands instead of dozens. `install.py --preflight` performs every prerequisite check and machine detection in one read-only invocation (repository parents with counts, Herdr's worktree directory and collections, tailscale/hostname candidates, usable agent CLIs via a three-way probe, keybindings with a free palette-key suggestion that also avoids Herdr's built-in defaults), emitting JSON for the agent and a summary for the human. `install.py --verify` replaces the four verification commands: quiet test suite (output only on failure), launcher, configuration, and plugin-linkage checks with one pass/fail verdict.
+- The live workspace check is gone from the install flow; the final report tells the user their first `hwt open` is the live check and what to expect from it. `AGENT_INSTRUCTIONS.md` rewritten accordingly — agents no longer improvise detection commands.
+- Preflight degrades instead of blocking: no tailscale, an unreadable Herdr config, a hanging login shell, or Python older than 3.11 (tomllib is imported lazily) each produce a partial report, never a crash.
+
 ## 0.17.4 — 2026-08-13
 
 - Fixed the fallback prefix used when rendering the palette keybinding: Herdr's default `keys.prefix` is ctrl+b (per `validated_keybinds` in its source), not ctrl+a. 0.17.3 told users with an unconfigured prefix to press a dead chord.

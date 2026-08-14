@@ -1,6 +1,6 @@
 id = "corral"
 name = "Corral"
-version = "0.17.4"
+version = "0.18.0"
 min_herdr_version = "0.8.0"
 description = "Herd your Git worktrees: env files, dependencies, agent/shell/server tabs, and merge-safe cleanup"
 platforms = ["linux", "macos"]

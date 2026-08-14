@@ -46,7 +46,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.17.4"
+__version__ = "0.18.0"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
