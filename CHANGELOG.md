@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.17.3 — 2026-08-13
+
+- The shell-tab reminder now names the actual palette keystrokes ("palette: ctrl+a w") instead of "via your Corral keybinding". Corral reads the binding from Herdr's own config.toml (respecting XDG_CONFIG_HOME) — the `[[keys.command]]` entry invoking `corral.palette` — and expands a `prefix+X` binding using the configured prefix, defaulting to Herdr's ctrl+a. When no binding exists, the reminder falls back to the explicit `herdr plugin action invoke corral.palette` command.
+
 ## 0.17.2 — 2026-08-13
 
 - The `worktree.removed` hook now releases the port lease for any removed checkout, not just those under approved worktree roots — deleting an ad-hoc-located worktree from Herdr's UI no longer strands a lease (which counted against the port range until manually cleared). Releasing is a no-op for paths that never held one.

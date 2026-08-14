@@ -46,7 +46,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.17.2"
+__version__ = "0.17.3"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -608,6 +608,27 @@ def tab_pane(tab: dict[str, Any]) -> str:
     raise WorkflowError("pane id unavailable for tab")
 
 
+def corral_palette_keybinding() -> str | None:
+    """The user's palette binding from Herdr's own config, or None when unbound.
+
+    Reads the same file Herdr does (XDG_CONFIG_HOME, else ~/.config/herdr) and
+    renders 'prefix+X' as the real keystrokes by expanding the configured
+    prefix (Herdr's default is ctrl+a)."""
+    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    config = Path(base) / "herdr" / "config.toml"
+    try:
+        keys = tomllib.loads(config.read_text()).get("keys", {})
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    for entry in keys.get("command", []):
+        if entry.get("type") == "plugin_action" and entry.get("command") == f"{PLUGIN_ID}.palette":
+            key = str(entry.get("key", ""))
+            if key.startswith("prefix+"):
+                return f"{keys.get('prefix', 'ctrl+a')} {key.removeprefix('prefix+')}"
+            return key or None
+    return None
+
+
 def ensure_layout(herdr: Any, workspace: str, worktree: Path, port: int, host: str,
                   remote_host: str, start_agent: bool, repo: dict[str, Any] | None = None,
                   agent_kind: str = "hermes") -> None:
@@ -639,7 +660,10 @@ def ensure_layout(herdr: Any, workspace: str, worktree: Path, port: int, host: s
                     message = "Corral: no dev command configured for this repository — set one with 'hwt init'"
                 herdr.show_reminder(pid, message)
             if label == "shell":
-                message = "Corral: 'hwt -h' lists commands; palette via your Corral keybinding or 'herdr plugin action invoke corral.palette'"
+                binding = corral_palette_keybinding()
+                palette = (f"palette: {binding}" if binding
+                           else "palette via 'herdr plugin action invoke corral.palette'")
+                message = f"Corral: 'hwt -h' lists commands; {palette}"
                 if repo.get("_suggest_init"):
                     message += " — run 'hwt init' to configure this repository"
                 herdr.show_reminder(pid, message)

@@ -936,6 +936,58 @@ class WorktreeSafetyTests(unittest.TestCase):
             self.assertEqual(hwt.worktree_safety(self.CFG, dict(self.ITEM)), "no-unique-commits")
 
 
+class PaletteKeybindingTests(unittest.TestCase):
+    @staticmethod
+    def write_config(tmp: str, content: str) -> dict[str, str]:
+        herdr_dir = Path(tmp) / "herdr"
+        herdr_dir.mkdir()
+        (herdr_dir / "config.toml").write_text(content)
+        return {"XDG_CONFIG_HOME": tmp}
+
+    BINDING = ('[[keys.command]]\nkey = "prefix+w"\ntype = "plugin_action"\n'
+               'command = "corral.palette"\n')
+
+    def test_prefix_binding_expands_default_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.dict(os.environ, self.write_config(tmp, self.BINDING)):
+            self.assertEqual(hwt.corral_palette_keybinding(), "ctrl+a w")
+
+    def test_prefix_binding_expands_configured_prefix(self):
+        content = '[keys]\nprefix = "ctrl+b"\n' + self.BINDING
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.dict(os.environ, self.write_config(tmp, content)):
+            self.assertEqual(hwt.corral_palette_keybinding(), "ctrl+b w")
+
+    def test_direct_binding_is_reported_verbatim(self):
+        content = self.BINDING.replace("prefix+w", "f5")
+        with tempfile.TemporaryDirectory() as tmp, \
+             mock.patch.dict(os.environ, self.write_config(tmp, content)):
+            self.assertEqual(hwt.corral_palette_keybinding(), "f5")
+
+    def test_missing_config_or_binding_yields_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": tmp}):
+                self.assertIsNone(hwt.corral_palette_keybinding())
+            other = ('[[keys.command]]\nkey = "prefix+z"\ntype = "plugin_action"\n'
+                     'command = "other.thing"\n')
+            with mock.patch.dict(os.environ, self.write_config(tmp, other)):
+                self.assertIsNone(hwt.corral_palette_keybinding())
+
+    def test_shell_reminder_names_the_resolved_binding(self):
+        fake = hwt.FakeHerdrForTests()
+        fake.seed_workspace("w1", "/wt/demo", ["Tab 1"])
+        with mock.patch.object(hwt, "corral_palette_keybinding", return_value="ctrl+a w"):
+            hwt.ensure_layout(fake, "w1", Path("/wt/demo"), 4100, "0.0.0.0", "", True)
+        self.assertIn("palette: ctrl+a w", dict(fake.reminders)["w1:p2"])
+
+    def test_shell_reminder_falls_back_to_the_action_command_when_unbound(self):
+        fake = hwt.FakeHerdrForTests()
+        fake.seed_workspace("w1", "/wt/demo", ["Tab 1"])
+        with mock.patch.object(hwt, "corral_palette_keybinding", return_value=None):
+            hwt.ensure_layout(fake, "w1", Path("/wt/demo"), 4100, "0.0.0.0", "", True)
+        self.assertIn("herdr plugin action invoke corral.palette", dict(fake.reminders)["w1:p2"])
+
+
 class TeardownSuppressionTests(unittest.TestCase):
     def test_marker_is_consumed_by_first_check(self):
         with tempfile.TemporaryDirectory() as tmp:
