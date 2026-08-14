@@ -219,6 +219,31 @@ class VerifyTests(unittest.TestCase):
         suite = next(c for c in verdict["checks"] if c["check"] == "unit-tests")
         self.assertEqual(suite["detail"], "")
 
+    @posix_only
+    def test_configured_repository_that_is_not_a_git_repo_fails_verify(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            stub = home / "stub-tests"
+            stub.mkdir()
+            (stub / "test_fine.py").write_text(
+                "import unittest\n\nclass T(unittest.TestCase):\n"
+                "    def test_yes(self):\n        pass\n")
+            bin_dir = home / ".local" / "bin"
+            bin_dir.mkdir(parents=True)
+            write_script(bin_dir / "hwt", "exit 0")
+            config_dir = home / ".config" / "herdr-corral"
+            config_dir.mkdir(parents=True)
+            (config_dir / "config.toml").write_text(
+                f'[repositories."gone"]\npath = "{home / "nowhere"}"\n')
+            with mock.patch.object(install.shutil, "which", return_value="/usr/bin/herdr"), \
+                 mock.patch.object(install, "command_output",
+                                   return_value=self.plugin_payload()):
+                status, verdict, _ = self.run_verify(home, stub)
+        self.assertEqual(status, 1)
+        repos = next(c for c in verdict["checks"] if c["check"] == "repositories")
+        self.assertFalse(repos["ok"])
+        self.assertIn("gone", repos["detail"])
+
     def test_unregistered_plugin_fails_the_plugin_check(self):
         empty = json.dumps({"result": {"plugins": []}})
         with mock.patch.object(install.shutil, "which", return_value="/usr/bin/herdr"), \

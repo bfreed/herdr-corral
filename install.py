@@ -370,6 +370,18 @@ def cmd_verify(source: Path, tests_dir: Path | None) -> int:
     check("hwt-launcher", launcher_ok, str(launcher))
     config = Path.home() / ".config/herdr-corral/config.toml"
     check("configuration", config.exists(), str(config))
+    # Doctor-equivalent repository checks: every configured path is a git repo.
+    corral_cfg = read_toml(config)
+    if corral_cfg is None:
+        check("repositories", False, "configuration is unreadable")
+    else:
+        broken = sorted(
+            name for name, repo in corral_cfg.get("repositories", {}).items()
+            if "path" in repo and not (Path(repo["path"]).is_dir()
+                                       and (Path(repo["path"]) / ".git").exists()))
+        count = len(corral_cfg.get("repositories", {}))
+        check("repositories", not broken,
+              f"{count} configured" if not broken else "not a git repository: " + ", ".join(broken))
     plugin_ok, plugin_detail = verify_plugin_registration()
     check("herdr-plugin", plugin_ok, plugin_detail)
     for entry in checks:
