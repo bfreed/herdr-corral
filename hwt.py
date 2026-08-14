@@ -46,7 +46,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "0.17.1"
+__version__ = "0.17.2"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -2019,9 +2019,10 @@ def cmd_event(args,cfg,state,herdr):
         workspace=os.environ.get("HERDR_WORKSPACE_ID") or next(iter(values(payload, {"workspace_id"})),None)
         if worktree and workspace: bootstrap(cfg,state,worktree,workspace,herdr)
     elif event=="worktree.removed":
-        paths=values(payload, {"path", "cwd", "worktree_path"})
-        for p in paths:
-            if is_in_approved_worktree_root(cfg, Path(p), strict=False): release_port(state,p)
+        # No approved-root guard: releasing is a no-op for paths that never
+        # held a lease, and ad-hoc worktree locations must get theirs back too.
+        for p in values(payload, {"path", "cwd", "worktree_path"}):
+            release_port(state, p)
         maybe_open_teardown(cfg, state, payload)
 
 

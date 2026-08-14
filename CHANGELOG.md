@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.17.2 — 2026-08-13
+
+- The `worktree.removed` hook now releases the port lease for any removed checkout, not just those under approved worktree roots — deleting an ad-hoc-located worktree from Herdr's UI no longer strands a lease (which counted against the port range until manually cleared). Releasing is a no-op for paths that never held one.
+
 ## 0.17.1 — 2026-08-13
 
 - Internal, no behavior change: the merged / unique-commits verdict that existed in three copies (palette safety labels, merge-checked cleanup, and the teardown popup) is now single-sourced in `branch_disposition`, so the advice shown always matches what the deletion paths actually enforce.

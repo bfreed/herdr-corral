@@ -359,6 +359,19 @@ class LayoutTests(unittest.TestCase):
                 hwt.cmd_event(object(), cfg, root / "state", mock.Mock())
             release.assert_called_once_with(root / "state", str(wt))
 
+    def test_removed_event_releases_lease_for_ad_hoc_worktree_location(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); primary = root / "primary"; primary.mkdir()
+            wt = root / "elsewhere" / "gone"
+            cfg = {"worktree_root": str(primary), "additional_worktree_roots": []}
+            payload = json.dumps({"worktree_path": str(wt)})
+            with mock.patch.dict(os.environ, {
+                "HERDR_PLUGIN_EVENT": "worktree.removed",
+                "HERDR_PLUGIN_EVENT_JSON": payload,
+            }, clear=False), mock.patch.object(hwt, "release_port") as release:
+                hwt.cmd_event(object(), cfg, root / "state", mock.Mock())
+            release.assert_called_once_with(root / "state", str(wt))
+
     def test_bootstrap_failure_releases_new_port_lease(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp)
