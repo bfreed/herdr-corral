@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.0.0 — 2026-08-14
+
+Corral's first stable release. The 0.18.0 changes below shipped hours earlier unversioned-as-stable and are re-tagged here as 1.0.0; nothing else changed.
+
 ## 0.18.0 — 2026-08-13
 
 - The guided install now takes ~4 approved commands instead of dozens. `install.py --preflight` performs every prerequisite check and machine detection in one read-only invocation (repository parents with counts, Herdr's worktree directory and collections, tailscale/hostname candidates, usable agent CLIs via a three-way probe, keybindings with a free palette-key suggestion that also avoids Herdr's built-in defaults), emitting JSON for the agent and a summary for the human. `install.py --verify` replaces the four verification commands: quiet test suite (output only on failure), launcher, configuration, and plugin-linkage checks with one pass/fail verdict.
