@@ -10,6 +10,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -46,7 +47,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -165,8 +166,8 @@ def resolve_configured_repo(cfg: dict[str, Any], path: Path) -> tuple[str, dict[
 
 
 def run(argv: list[str], *, cwd: Path | None = None, check: bool = True,
-        env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(argv, cwd=cwd, env=env, text=True,
+        env: dict[str, str] | None = None, input: str | None = None) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(argv, cwd=cwd, env=env, text=True, input=input,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if check and result.returncode:
         detail = (result.stderr or result.stdout or "").strip()
@@ -175,8 +176,9 @@ def run(argv: list[str], *, cwd: Path | None = None, check: bool = True,
     return result
 
 
-def git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return run(["git", "-C", str(cwd), *args], check=check)
+def git(cwd: Path, *args: str, check: bool = True,
+        input: str | None = None) -> subprocess.CompletedProcess[str]:
+    return run(["git", "-C", str(cwd), *args], check=check, input=input)
 
 
 def branch_slug(branch: str) -> str:
@@ -468,6 +470,181 @@ def release_port(state_dir: Path, worktree: str) -> None:
     key = str(Path(worktree).resolve())
     with locked_json(state_dir, "ports") as leases:
         leases.pop(key, None)
+
+
+def leased_port(state_dir: Path, worktree: str) -> int | None:
+    key = str(Path(worktree).resolve())
+    with locked_json(state_dir, "ports") as leases:
+        port = leases.get(key)
+    return int(port) if port is not None else None
+
+
+DELETED_SUFFIX = " (deleted)"
+
+
+def _linux_processes() -> list[dict[str, Any]]:
+    listening: dict[str, int] = {}  # socket inode -> TCP port in LISTEN state
+    for table in ("tcp", "tcp6"):
+        with contextlib.suppress(OSError):
+            for line in Path(f"/proc/net/{table}").read_text().splitlines()[1:]:
+                fields = line.split()
+                if len(fields) > 9 and fields[3] == "0A":
+                    listening[fields[9]] = int(fields[1].rsplit(":", 1)[1], 16)
+    uid = os.getuid()
+    procs = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            if entry.stat().st_uid != uid:
+                continue
+            cwd = os.readlink(entry / "cwd")
+            ppid = int((entry / "stat").read_text().rsplit(")", 1)[1].split()[1])
+            command = (entry / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+            ports = set()
+            for fd in (entry / "fd").iterdir():
+                with contextlib.suppress(OSError):
+                    link = os.readlink(fd)
+                    if link.startswith("socket:[") and link[8:-1] in listening:
+                        ports.add(listening[link[8:-1]])
+        except (OSError, ValueError, IndexError):
+            continue  # exited mid-scan, or not ours to inspect
+        deleted = cwd.endswith(DELETED_SUFFIX)
+        procs.append({"pid": int(entry.name), "ppid": ppid, "command": command,
+                      "cwd": cwd[:-len(DELETED_SUFFIX)] if deleted else cwd,
+                      "cwd_deleted": deleted, "ports": sorted(ports)})
+    return procs
+
+
+def _lsof_processes() -> list[dict[str, Any]]:
+    uid = str(os.getuid())
+    procs: dict[int, dict[str, Any]] = {}
+    for line in run(["ps", "-axo", "pid=,ppid=,uid=,command="], check=False).stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) >= 3 and parts[2] == uid:
+            procs[int(parts[0])] = {"pid": int(parts[0]), "ppid": int(parts[1]),
+                                    "command": parts[3] if len(parts) > 3 else "",
+                                    "cwd": None, "cwd_deleted": False, "ports": []}
+    for selection, field in ((["-d", "cwd"], "cwd"), (["-P", "-iTCP", "-sTCP:LISTEN"], "ports")):
+        pid = None
+        for line in run(["lsof", "-n", "-a", "-u", uid, *selection, "-Fpn"], check=False).stdout.splitlines():
+            if line.startswith("p"):
+                pid = int(line[1:])
+            elif line.startswith("n") and pid in procs:
+                if field == "cwd":
+                    procs[pid]["cwd"] = line[1:]
+                elif line.rsplit(":", 1)[-1].isdigit():
+                    procs[pid]["ports"].append(int(line.rsplit(":", 1)[-1]))
+    for proc in procs.values():
+        if proc["cwd"] and not Path(proc["cwd"]).exists():
+            proc["cwd_deleted"] = True
+    return [p for p in procs.values() if p["cwd"]]
+
+
+def user_processes() -> list[dict[str, Any]]:
+    """The current user's processes: pid, ppid, command, cwd (cwd_deleted when
+    its directory is gone) and TCP listening ports. Other users' processes are
+    never returned, so never stopped. Empty where they cannot be inspected."""
+    try:
+        if Path("/proc/net/tcp").exists():
+            return _linux_processes()
+        if os.name == "posix" and shutil.which("lsof"):
+            return _lsof_processes()
+    except OSError:
+        pass
+    return []
+
+
+def server_trees(procs: list[dict[str, Any]], is_target: Callable[[dict[str, Any]], bool]) -> list[dict[str, Any]]:
+    """Listening processes selected by is_target, plus their descendants (an
+    esbuild child holds no socket but dies with its server). Wrappers above a
+    server (npm run, sh -c) exit on their own once it does, and are left alone
+    so a shell or agent that launched the server is never touched — nor is
+    this process or anything it runs under."""
+    by_pid = {p["pid"]: p for p in procs}
+    protected, pid = set(), os.getpid()
+    while pid in by_pid and pid not in protected:
+        protected.add(pid)
+        pid = by_pid[pid]["ppid"]
+    protected.add(os.getpid())
+    children: dict[int, list[int]] = {}
+    for proc in procs:
+        children.setdefault(proc["ppid"], []).append(proc["pid"])
+    chosen: dict[int, dict[str, Any]] = {}
+    pending = [p["pid"] for p in procs if p["ports"] and is_target(p)]
+    while pending:
+        pid = pending.pop()
+        if pid in chosen or pid in protected:
+            continue
+        chosen[pid] = by_pid[pid]
+        pending.extend(children.get(pid, []))
+    return list(chosen.values())
+
+
+def _alive(pid: int) -> bool:
+    with contextlib.suppress(OSError, IndexError):
+        # A zombie has exited; only its parent's wait() is pending.
+        if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
+def stop_processes(procs: list[dict[str, Any]], grace: float = 5.0) -> list[dict[str, Any]]:
+    """SIGTERM, wait up to `grace` seconds, then SIGKILL whatever remains."""
+    for proc in procs:
+        with contextlib.suppress(OSError):
+            os.kill(proc["pid"], signal.SIGTERM)
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline and any(_alive(p["pid"]) for p in procs):
+        time.sleep(0.1)
+    report = []
+    for proc in procs:
+        killed = _alive(proc["pid"])
+        if killed:
+            with contextlib.suppress(OSError):
+                os.kill(proc["pid"], signal.SIGKILL)
+        report.append({"pid": proc["pid"], "command": proc["command"][:200], "cwd": proc["cwd"],
+                       "ports": proc["ports"], "signal": "KILL" if killed else "TERM"})
+    return report
+
+
+def stop_worktree_servers(state_dir: Path, worktree: Path) -> list[dict[str, Any]]:
+    """Stop dev servers belonging to a worktree being removed: anything
+    listening from inside it, plus whatever holds its leased port — whether
+    started by `hwt dev` in the server tab or by an agent in the background."""
+    root = Path(os.path.realpath(worktree))
+    port = leased_port(state_dir, str(worktree))
+    def belongs(proc: dict[str, Any]) -> bool:
+        return is_within(Path(proc["cwd"]), root) or (port is not None and port in proc["ports"])
+    return stop_processes(server_trees(user_processes(), belongs))
+
+
+def checkout_gone(cwd: Path, root: Path) -> bool:
+    """No checkout (a directory holding .git) still encloses cwd below root;
+    a deleted build folder inside a live checkout is not an orphan."""
+    for parent in [cwd, *cwd.parents]:
+        if parent == root or not is_within(parent, root):
+            return True
+        if (parent / ".git").exists():
+            return False
+    return True
+
+
+def orphan_servers(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Servers still running from a deleted directory under an approved
+    worktree root whose checkout is gone: survivors of a removal that never
+    stopped them (a plain `git worktree remove`, a pre-1.1 cleanup)."""
+    roots = approved_worktree_roots(cfg)
+    def orphaned(proc: dict[str, Any]) -> bool:
+        cwd = Path(proc["cwd"])
+        return proc["cwd_deleted"] and any(is_within(cwd, r) and checkout_gone(cwd, r) for r in roots)
+    return server_trees(user_processes(), orphaned)
 
 
 TEARDOWN_SUPPRESS_TTL = 600.0
@@ -1624,11 +1801,50 @@ def cmd_cleanup(args, cfg, state, herdr):
 
 SAFETY_LABELS = {
     "merged": "merged — cleans instantly",
+    "squash-merged": "squash-merged — cleans instantly",
     "no-unique-commits": "nothing unique — cleans instantly",
     "unpublished-work": "has unpublished commits",
     "dirty": "dirty",
     "detached": "detached HEAD",
 }
+
+# Plumbing-stable diff output for patch-id: the branch diff and the base log
+# must be rendered identically, whatever the user's diff configuration.
+PATCH_FLAGS = ("--no-color", "--no-ext-diff", "--no-textconv", "--no-renames")
+
+
+def squash_merged(canonical: Path, branch_ref: str, base_ref: str) -> bool:
+    """Whether the branch's changes already landed on base as different
+    commits — a squash merge, or a rebase-and-merge.
+
+    Two independent proofs, either sufficient: merging the branch into base
+    would change nothing (merge-tree), or a single base commit carries exactly
+    the branch's whole diff (patch-id — this one survives base later editing
+    the same lines, which makes merge-tree conflict). A branch with no net
+    change proves nothing, so commits that cancel out still need confirmation.
+    Any failed probe proves nothing."""
+    probe = git(canonical, "merge-base", base_ref, branch_ref, check=False)
+    if probe.returncode:
+        return False
+    fork = probe.stdout.strip()
+    diff = git(canonical, "diff", *PATCH_FLAGS, fork, branch_ref, check=False)
+    if diff.returncode or not diff.stdout.strip():
+        return False
+    merged = git(canonical, "merge-tree", "--write-tree", base_ref, branch_ref, check=False)
+    base_tree = git(canonical, "rev-parse", f"{base_ref}^{{tree}}", check=False)
+    if merged.returncode == 0 and base_tree.returncode == 0 and \
+            merged.stdout.split()[:1] == base_tree.stdout.split()[:1]:
+        return True
+    branch_id = git(canonical, "patch-id", "--stable", input=diff.stdout, check=False)
+    log_out = git(canonical, "log", "-p", "--no-merges", "--pretty=medium", *PATCH_FLAGS,
+                  f"{fork}..{base_ref}", check=False)
+    if branch_id.returncode or log_out.returncode or not branch_id.stdout.strip():
+        return False
+    base_ids = git(canonical, "patch-id", "--stable", input=log_out.stdout, check=False)
+    if base_ids.returncode:
+        return False
+    wanted = branch_id.stdout.split()[0]
+    return any(line.split()[:1] == [wanted] for line in base_ids.stdout.splitlines())
 
 
 def branch_disposition(repo: dict[str, Any], canonical: Path, branch: str) -> dict[str, Any]:
@@ -1639,21 +1855,25 @@ def branch_disposition(repo: dict[str, Any], canonical: Path, branch: str) -> di
     counts only commits that would survive nowhere if the local branch and its
     own remote copy both vanished — cleanup deletes the pair, and teardown
     offers the remote copy as a follow-up deletion — so a fresh, fully
-    cherry-picked, or rebased-elsewhere branch loses nothing. A failed probe
-    counts as unique: errors may block a deletion, never excuse one."""
+    cherry-picked, or rebased-elsewhere branch loses nothing. Unique commits
+    whose changes provably landed on base anyway (squash_merged) count as
+    merged. A failed probe counts as unique: errors may block a deletion,
+    never excuse one."""
     remote = repo.get("remote", "origin")
     base_branch = repo.get("base_branch", f"{remote}/main")
     branch_ref = f"refs/heads/{branch}"
     merged = "/" in base_branch and git(canonical, "merge-base", "--is-ancestor", branch_ref,
                                         f"refs/remotes/{base_branch}", check=False).returncode == 0
-    unique = False
+    unique = squashed = False
     if not merged:
         probe = git(canonical, "rev-list", "-n", "1", branch_ref, "--not",
                     f"--exclude={branch_ref}", f"--exclude=refs/remotes/{remote}/{branch}",
                     "--all", check=False)
         unique = bool(probe.returncode) or bool(probe.stdout.strip())
+        if unique and "/" in base_branch:
+            squashed = merged = squash_merged(canonical, branch_ref, f"refs/remotes/{base_branch}")
     return {"remote": remote, "base_branch": base_branch, "branch_ref": branch_ref,
-            "merged": merged, "unique_commits": unique}
+            "merged": merged, "squash_merged": squashed, "unique_commits": unique}
 
 
 def worktree_safety(cfg: dict[str, Any], item: dict[str, Any]) -> str:
@@ -1669,12 +1889,14 @@ def worktree_safety(cfg: dict[str, Any], item: dict[str, Any]) -> str:
     if not repo_path:
         return "unknown"
     verdict = branch_disposition(repo, Path(repo_path), branch)
+    if verdict["squash_merged"]:
+        return "squash-merged"
     if verdict["merged"]:
         return "merged"
     return "unpublished-work" if verdict["unique_commits"] else "no-unique-commits"
 
 
-SAFETY_COLORS = {"merged": "32", "no-unique-commits": "32",
+SAFETY_COLORS = {"merged": "32", "squash-merged": "32", "no-unique-commits": "32",
                  "unpublished-work": "33", "dirty": "31", "detached": "33"}
 
 
@@ -1792,9 +2014,20 @@ def cmd_sweep(args, cfg, state, herdr):
         except WorkflowError as exc:
             skipped.append({"worktree": item.get("path"), "branch": item.get("branch"),
                             "repository": item.get("repository"), "reason": str(exc)})
-    print(json.dumps({"cleaned": cleaned, "skipped": skipped}, indent=2))
+    stopped = stop_processes(orphan_servers(cfg))
+    print(json.dumps({"cleaned": cleaned, "skipped": skipped, "stopped_orphan_servers": stopped}, indent=2))
     if skipped:
         log(f"{len(skipped)} worktree(s) kept; each reason above includes the command to discard it deliberately")
+
+
+def cmd_reap(args, cfg, state):
+    """Stop dev servers left running from deleted worktree checkouts."""
+    orphans = orphan_servers(cfg)
+    if args.dry_run:
+        print(json.dumps({"orphan_servers": [{k: p[k] for k in ("pid", "command", "cwd", "ports")}
+                                             for p in orphans]}, indent=2))
+    else:
+        print(json.dumps({"stopped": stop_processes(orphans)}, indent=2))
 
 
 def cmd_cleanup_workspace(args, cfg, state, herdr):
@@ -1879,6 +2112,9 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
         suppress_teardown(state, str(path))
         if remote_exists:
             git(canonical, "push", remote, "--delete", branch)
+        # Before removal: a server outlives its checkout (and Herdr's tab
+        # closing never reaches one an agent started in the background).
+        stopped = stop_worktree_servers(state, path)
         if workspace:
             focused = focused_workspace_id(herdr)
             remove = ["worktree", "remove", "--workspace", workspace]
@@ -1902,7 +2138,9 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
         "merged": merged,
         "merged_into": base_branch if merged else None,
         "abandoned": bool(abandon),
-        "reason": "merged" if merged else ("abandoned" if abandon else "no-unique-commits"),
+        "stopped_servers": stopped,
+        "reason": ("squash-merged" if verdict["squash_merged"] else "merged") if merged
+                  else ("abandoned" if abandon else "no-unique-commits"),
     }
 
 
@@ -1936,7 +2174,8 @@ def teardown_status(repo: dict[str, Any], canonical: Path, branch: str) -> dict[
 def teardown_advice(branch: str, status: dict[str, Any]) -> list[str]:
     remote = status["remote"]
     if status["merged"]:
-        lines = [colorize(f"merged into {status['base_branch']} — safe to delete", "32")]
+        how = "squash-merged" if status.get("squash_merged") else "merged"
+        lines = [colorize(f"{how} into {status['base_branch']} — safe to delete", "32")]
     elif not status["unique_commits"]:
         lines = [colorize("all of its commits exist on other branches — safe to delete", "32")]
     else:
@@ -2010,7 +2249,11 @@ def cmd_doctor(args,cfg,state):
     latest = latest_remote_version()
     update = {"installed": __version__, "latest": latest,
               "update_available": bool(latest and version_tuple(latest) > version_tuple(__version__))}
-    print(json.dumps({"ok":all(x["ok"] for x in checks),"update":update,"checks":checks},indent=2))
+    orphans = [{k: p[k] for k in ("pid", "command", "cwd", "ports")} for p in orphan_servers(cfg)]
+    print(json.dumps({"ok":all(x["ok"] for x in checks),"update":update,"checks":checks,
+                      "orphan_servers":orphans},indent=2))
+    if orphans:
+        log(f"{len(orphans)} process(es) still running from deleted worktrees; run: hwt reap")
     if update["update_available"]:
         log(f"Update available ({__version__} -> {latest}); run: hwt update")
     if not all(x["ok"] for x in checks): raise SystemExit(1)
@@ -2043,6 +2286,11 @@ def cmd_event(args,cfg,state,herdr):
         workspace=os.environ.get("HERDR_WORKSPACE_ID") or next(iter(values(payload, {"workspace_id"})),None)
         if worktree and workspace: bootstrap(cfg,state,worktree,workspace,herdr)
     elif event=="worktree.removed":
+        # Only the removed linked checkout itself, never other paths in the
+        # payload (the workspace's), and before its lease is released.
+        info = payload.get("data", {}).get("worktree", {})
+        if info.get("path") and info.get("is_linked_worktree", False):
+            stop_worktree_servers(state, Path(info["path"]))
         # No approved-root guard: releasing is a no-op for paths that never
         # held a lease, and ad-hoc worktree locations must get theirs back too.
         for p in values(payload, {"path", "cwd", "worktree_path"}):
@@ -2085,7 +2333,7 @@ def parser() -> argparse.ArgumentParser:
     # palette-open, teardown, invoked by Herdr) from usage; omitting their
     # help keeps them out of the table below it.
     sub=p.add_subparsers(dest="command",required=True,
-                         metavar="{new,open,init,list,status,dev,remove,cleanup,sweep,palette,doctor,update}")
+                         metavar="{new,open,init,list,status,dev,remove,cleanup,sweep,reap,palette,doctor,update}")
     n=sub.add_parser("new",help="create a worktree for a new branch"); n.add_argument("branch",nargs="?",help="omit to choose repository, base, and name interactively"); n.add_argument("--base"); n.add_argument("--repo"); n.add_argument("--background",action="store_true")
     o=sub.add_parser("open",help="open a repository or existing worktree"); o.add_argument("target",nargs="?",help="repository, branch, or worktree name; omit to pick from a list")
     i=sub.add_parser("init",help="interactively configure a repository"); i.add_argument("repository",nargs="?")
@@ -2095,6 +2343,7 @@ def parser() -> argparse.ArgumentParser:
     r=sub.add_parser("remove",help="remove a worktree, keeping its branch"); r.add_argument("target"); r.add_argument("--force",action="store_true"); r.add_argument("--confirm")
     c=sub.add_parser("cleanup",help="delete worktree and branch (merged: no questions)"); c.add_argument("target",nargs="?",help="branch, path, or worktree name; omit to pick from a list"); c.add_argument("--abandon",action="store_true",help="delete even if unmerged or dirty (requires --confirm BRANCH)"); c.add_argument("--confirm")
     sub.add_parser("sweep",help="clean up every worktree that qualifies without questions")
+    rp=sub.add_parser("reap",help="stop dev servers left running from deleted worktrees"); rp.add_argument("--dry-run",action="store_true",help="list them without stopping anything")
     sub.add_parser("palette",help="interactive worktree palette (runs inside the Corral popup)")
     sub.add_parser("doctor",help="environment checks and update availability")
     sub.add_parser("update",help="update Corral in place (git pull)")
@@ -2115,7 +2364,7 @@ def main(argv: list[str] | None=None) -> int:
             cmd_palette_open(args)
             return 0
         cfg=load_config(args.config); state=runtime_state_dir(); herdr=Herdr()
-        commands={"new":cmd_new,"open":cmd_open,"init":cmd_init,"list":cmd_list,"status":cmd_status,"dev":cmd_dev,"remove":cmd_remove,"cleanup":cmd_cleanup,"cleanup-workspace":cmd_cleanup_workspace,"sweep":cmd_sweep,"palette":cmd_palette,"doctor":cmd_doctor,"event":cmd_event,"teardown":cmd_teardown}
+        commands={"new":cmd_new,"open":cmd_open,"init":cmd_init,"list":cmd_list,"status":cmd_status,"dev":cmd_dev,"remove":cmd_remove,"cleanup":cmd_cleanup,"cleanup-workspace":cmd_cleanup_workspace,"sweep":cmd_sweep,"reap":cmd_reap,"palette":cmd_palette,"doctor":cmd_doctor,"event":cmd_event,"teardown":cmd_teardown}
         fn=commands[args.command]
         if args.command in ("new","open","list","remove","cleanup","cleanup-workspace","sweep","palette","event"): fn(args,cfg,state,herdr)
         else: fn(args,cfg,state)

@@ -39,6 +39,7 @@ hwt open [target]           # (re)open with the standard layout; omit to pick fr
 hwt dev                     # start the repo's dev server on the leased port
 hwt list                    # configured repos and live worktrees
 hwt status                  # port leases, lockfile drift, listening state
+hwt reap [--dry-run]        # stop dev servers left running from deleted worktrees
 hwt init                    # (re)configure the current repo interactively
 ```
 
@@ -51,12 +52,14 @@ hwt cleanup feature/my-task --abandon --confirm feature/my-task
                                               # not merged / dirty? affirmatively discard it
 ```
 
-`cleanup` fetches first and proves the merge with `git merge-base --is-ancestor` before touching anything, refuses protected branches (`main`, `master`, `develop`, your configured base), and releases the port lease. The guard protects **work that exists nowhere else**, not branch names: an unmerged branch whose every commit is reachable from some other ref — a fresh worktree branch with no commits of its own, or one fully rebased/cherry-picked elsewhere — is also cleaned up without questions. (The branch's own remote copy doesn't count as "elsewhere", since cleanup deletes that too.)
+`cleanup` fetches first and proves the merge before touching anything, refuses protected branches (`main`, `master`, `develop`, your configured base), stops the worktree's dev servers, and releases the port lease. A merge is proven by `git merge-base --is-ancestor`, or, for **squash and rebase merges** (which put different commits on base), by either of two content checks: merging the branch into base would change nothing (`git merge-tree`), or a base commit carries exactly the branch's whole diff (`git patch-id`, which still matches after base later edits the same lines). A commit made after the squash merge fails both checks, so the branch is kept. The guard protects **work that exists nowhere else**, not branch names: an unmerged branch whose every commit is reachable from some other ref — a fresh worktree branch with no commits of its own, or one fully rebased/cherry-picked elsewhere — is also cleaned up without questions. (The branch's own remote copy doesn't count as "elsewhere", since cleanup deletes that too.)
+
+**Dev servers.** Before removing a checkout, `cleanup` stops every process listening from inside it or on its leased port, whether started by `hwt dev` in the server tab or by an agent in the background, along with their child processes. Each gets SIGTERM, then SIGKILL after 5 seconds, and the JSON result lists them under `stopped_servers`. Wrapper processes (`npm run`, `sh -c`) exit on their own, and shells, agents, and other users' processes are never touched. Deleting a checkout from Herdr's UI does the same through the `worktree.removed` hook. Servers that outlived an earlier removal keep running from the deleted folder: `hwt sweep` stops them, `hwt doctor` reports them, and `hwt reap` stops just those (`--dry-run` lists them). Process inspection uses `/proc` on Linux and `lsof` on macOS.
 
 No typing required, two ways:
 
 - **`hwt sweep`** — cleans *every* worktree that qualifies without questions in one shot, and reports the kept ones with the exact `--abandon` command for each.
-- **The Corral palette** — a popup (bind it to a key, below) listing every worktree with a safety annotation (`merged — cleans instantly`, `nothing unique — cleans instantly`, `has unpublished commits`, `dirty`). Pick a number to clean it, `n` to create a worktree, `s` to sweep, `q` to close.
+- **The Corral palette** — a popup (bind it to a key, below) listing every worktree with a safety annotation (`merged — cleans instantly`, `squash-merged — cleans instantly`, `nothing unique — cleans instantly`, `has unpublished commits`, `dirty`). Pick a number to clean it, `n` to create a worktree, `s` to sweep, `q` to close.
 
 ## Keybindings
 

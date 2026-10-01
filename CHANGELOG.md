@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.1.0 — 2026-09-30
+
+- **Squash-merged branches clean up without `--abandon --confirm`.** A squash or rebase merge leaves the branch's own commits nowhere else, so the ancestry check reported them as unmerged work. `cleanup`, `sweep`, the palette, and the teardown popup now also accept a branch whose changes provably landed on base: merging it would change nothing (`git merge-tree --write-tree`), or one base commit's patch equals the branch's whole diff (`git patch-id --stable`, which still holds after base later edits the same lines). Either proof is enough. A commit made after the merge, a partly landed branch, or commits that cancel out still require confirmation, and a failed probe still blocks deletion. The palette shows `squash-merged — cleans instantly`, and the cleanup result reports `reason: "squash-merged"`. Requires Git 2.38+ for the merge-tree check; on older Git the patch-id check alone applies.
+- **Cleanup stops the worktree's dev servers.** Previously only the port lease was released, and servers kept running from the deleted folder. Before removing a checkout, `cleanup` (and the `worktree.removed` hook, for deletions made in Herdr's UI) stops every same-user process listening from inside it or on its leased port, along with their child processes: SIGTERM, then SIGKILL after 5 seconds. Wrapper, shell, and agent processes are left alone. Results appear under `stopped_servers`.
+- **`hwt reap`** stops servers already orphaned: listeners whose working directory is a deleted folder under an approved worktree root with no surviving checkout around it. `--dry-run` lists them. `hwt sweep` reaps too (`stopped_orphan_servers`), and `hwt doctor` reports them without failing.
+
 ## 1.0.0 — 2026-08-14
 
 Corral's first stable release. The 0.18.0 changes below shipped hours earlier unversioned-as-stable and are re-tagged here as 1.0.0; nothing else changed.

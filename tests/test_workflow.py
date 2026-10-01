@@ -30,6 +30,18 @@ needs_symlinks = unittest.skipUnless(_symlinks_supported(), "symlinks unavailabl
 posix_only = unittest.skipUnless(os.name == "posix", "POSIX permissions required")
 
 
+class StubProbes:
+    """Squash detection and server reaping are tested on their own; elsewhere
+    they would consume mocked git responses or inspect real processes."""
+    def setUp(self):
+        super().setUp()
+        for name, value in (("squash_merged", False), ("stop_worktree_servers", []),
+                            ("orphan_servers", [])):
+            patcher = mock.patch.object(hwt, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+
 class PathSafetyTests(unittest.TestCase):
     def test_repo_for_worktree_accepts_explicit_additional_root(self):
         native = self.root / "native"
@@ -539,7 +551,7 @@ class LayoutTests(unittest.TestCase):
         self.assertEqual(fake.agent_starts, 1)
 
 
-class RemovalTests(unittest.TestCase):
+class RemovalTests(StubProbes, unittest.TestCase):
     CFG = {"repositories": {"demo": {
         "path": "/canon/demo", "mode": "worktree", "remote": "origin",
         "base_branch": "origin/main",
@@ -907,7 +919,7 @@ class CleanupSelectionTests(unittest.TestCase):
                 hwt.choose_worktree_item({}, [dict(self.ITEMS[2])], None)
 
 
-class WorktreeSafetyTests(unittest.TestCase):
+class WorktreeSafetyTests(StubProbes, unittest.TestCase):
     CFG = {"repositories": {"demo": {
         "path": "/canon/demo", "remote": "origin", "base_branch": "origin/main"}}}
     ITEM = {"branch": "feature/x", "path": "/nonexistent-wt", "repository": "demo"}
@@ -934,6 +946,300 @@ class WorktreeSafetyTests(unittest.TestCase):
         responses = [mock.Mock(returncode=1, stdout=""), mock.Mock(returncode=0, stdout="")]
         with mock.patch.object(hwt, "git", side_effect=responses):
             self.assertEqual(hwt.worktree_safety(self.CFG, dict(self.ITEM)), "no-unique-commits")
+
+
+class SquashMergeTests(unittest.TestCase):
+    """Real repositories: a branch squash-merged into base, base possibly
+    moving on afterwards, as GitHub's squash-and-merge leaves it."""
+    LINES = "".join(f"{c}\n" for c in "abcdefghij")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name) / "repo"
+        hwt.git(Path(self.tmp.name), "init", "-q", "-b", "main", str(self.repo))
+        self.write(self.LINES)
+        self.commit("init")
+        self.sh("switch", "-q", "-c", "feature/x")
+        self.edit("b", "B"); self.commit("one")
+        self.edit("c", "C"); self.commit("two")
+        self.sh("switch", "-q", "main")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def sh(self, *args):
+        return hwt.git(self.repo, "-c", "user.email=t@example.invalid", "-c", "user.name=T",
+                       "-c", "commit.gpgsign=false", *args)
+
+    def write(self, text):
+        (self.repo / "f.txt").write_text(text)
+
+    def edit(self, old, new):
+        path = self.repo / "f.txt"
+        path.write_text(path.read_text().replace(f"{old}\n", f"{new}\n"))
+
+    def commit(self, message):
+        self.sh("add", "f.txt")
+        self.sh("commit", "-q", "-m", message)
+
+    def squash_into_main(self):
+        self.sh("merge", "-q", "--squash", "feature/x")
+        self.commit("feature/x (#1)")
+
+    def squashed(self):
+        return hwt.squash_merged(self.repo, "refs/heads/feature/x", "refs/heads/main")
+
+    def test_squash_merge_with_base_moving_on_is_detected(self):
+        self.squash_into_main()
+        self.edit("j", "J"); self.commit("later")
+        self.assertTrue(self.squashed())
+
+    def test_squash_merge_survives_base_later_editing_the_same_lines(self):
+        # merge-tree conflicts here; the patch-id proof still holds.
+        self.squash_into_main()
+        self.edit("B", "BB"); self.commit("overlap")
+        self.assertTrue(self.squashed())
+
+    def test_unmerged_branch_is_not_squash_merged(self):
+        self.edit("j", "J"); self.commit("unrelated")
+        self.assertFalse(self.squashed())
+
+    def test_commit_after_the_squash_merge_keeps_the_branch(self):
+        self.squash_into_main()
+        self.sh("switch", "-q", "feature/x")
+        self.edit("d", "D"); self.commit("follow-up")
+        self.sh("switch", "-q", "main")
+        self.assertFalse(self.squashed())
+
+    def test_partially_landed_branch_is_not_squash_merged(self):
+        self.edit("b", "B"); self.commit("only half of it")
+        self.assertFalse(self.squashed())
+
+    def test_branch_whose_commits_cancel_out_proves_nothing(self):
+        self.sh("switch", "-q", "-c", "feature/noop", "main")
+        self.edit("e", "E"); self.commit("change")
+        self.edit("E", "e"); self.commit("revert")
+        self.sh("switch", "-q", "main")
+        self.assertFalse(hwt.squash_merged(self.repo, "refs/heads/feature/noop", "refs/heads/main"))
+
+    def test_disposition_and_palette_label_report_squash_merged(self):
+        self.squash_into_main()
+        self.sh("update-ref", "refs/remotes/origin/main", "main")
+        repo = {"path": str(self.repo), "remote": "origin", "base_branch": "origin/main"}
+        verdict = hwt.branch_disposition(repo, self.repo, "feature/x")
+        self.assertTrue(verdict["merged"])
+        self.assertTrue(verdict["squash_merged"])
+        item = {"branch": "feature/x", "path": "/nonexistent-wt", "repository": "demo"}
+        self.assertEqual(hwt.worktree_safety({"repositories": {"demo": repo}}, item), "squash-merged")
+
+    def test_true_merge_is_not_labelled_squash(self):
+        self.sh("merge", "-q", "--no-ff", "-m", "merge", "feature/x")
+        self.sh("update-ref", "refs/remotes/origin/main", "main")
+        repo = {"path": str(self.repo), "remote": "origin", "base_branch": "origin/main"}
+        verdict = hwt.branch_disposition(repo, self.repo, "feature/x")
+        self.assertTrue(verdict["merged"])
+        self.assertFalse(verdict["squash_merged"])
+
+
+class SquashCleanupTests(StubProbes, unittest.TestCase):
+    def test_squash_merged_branch_cleans_without_confirmation(self):
+        args = RemovalTests.cleanup_args()
+        fake = mock.Mock()
+        responses = [
+            mock.Mock(stdout="", returncode=0),           # status: clean
+            mock.Mock(stdout="", returncode=0),           # fetch
+            mock.Mock(stdout="", returncode=1),           # merge-base: not an ancestor
+            mock.Mock(stdout="abc123\n", returncode=0),   # rev-list: unique commits
+            mock.Mock(stdout="", returncode=1),           # show-ref: remote already deleted
+            mock.Mock(stdout="", returncode=0),           # update-ref -d
+        ]
+        with mock.patch.object(hwt, "configured_worktree_items", return_value=[dict(RemovalTests.ITEM)]), \
+             mock.patch.object(hwt, "resolve_existing", side_effect=lambda path: Path(path)), \
+             mock.patch.object(hwt, "validate_worktree_identity"), \
+             mock.patch.object(hwt, "worktree_lock", return_value=contextlib.nullcontext()), \
+             mock.patch.object(hwt, "squash_merged", return_value=True), \
+             mock.patch.object(hwt, "git", side_effect=responses), \
+             mock.patch.object(hwt, "release_port"), \
+             mock.patch.object(hwt, "suppress_teardown"), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            hwt.cmd_cleanup(args, RemovalTests.CFG, Path("/state"), fake)
+        result = json.loads(out.getvalue())
+        self.assertEqual(result["reason"], "squash-merged")
+        self.assertEqual(result["merged_into"], "origin/main")
+        self.assertIn(mock.call("worktree", "remove", "--workspace", "w2"), fake.call.call_args_list)
+
+    def test_teardown_advice_names_the_squash(self):
+        status = {"remote": "origin", "base_branch": "origin/main", "merged": True,
+                  "squash_merged": True, "unique_commits": True, "remote_state": "deleted"}
+        self.assertIn("squash-merged into origin/main", hwt.teardown_advice("feature/x", status)[0])
+
+
+def proc(pid, ppid=1, cwd="/elsewhere", ports=(), deleted=False, command="node vite"):
+    return {"pid": pid, "ppid": ppid, "cwd": cwd, "cwd_deleted": deleted,
+            "ports": list(ports), "command": command}
+
+
+class ServerSelectionTests(unittest.TestCase):
+    def test_listener_and_its_descendants_are_chosen_wrappers_are_not(self):
+        procs = [proc(10, cwd="/wt", command="npm run dev"),          # wrapper: no socket
+                 proc(11, ppid=10, cwd="/wt", ports=[4100]),          # the server
+                 proc(12, ppid=11, cwd="/wt", command="esbuild"),     # its helper
+                 proc(13, cwd="/wt", command="bash")]                 # a shell there
+        chosen = hwt.server_trees(procs, lambda p: p["cwd"] == "/wt")
+        self.assertEqual(sorted(p["pid"] for p in chosen), [11, 12])
+
+    def test_never_selects_this_process_or_its_ancestors(self):
+        me, parent = os.getpid(), 999_001
+        procs = [proc(parent, ppid=1, cwd="/wt", ports=[9000], command="agent"),
+                 proc(me, ppid=parent, cwd="/wt", ports=[9001], command="hwt")]
+        self.assertEqual(hwt.server_trees(procs, lambda p: True), [])
+
+    def test_worktree_servers_match_by_cwd_or_leased_port(self):
+        procs = [proc(20, cwd="/approved/wt/app", ports=[5173]),      # inside the checkout
+                 proc(21, cwd="/somewhere/else", ports=[4100]),       # holds the leased port
+                 proc(22, cwd="/somewhere/else", ports=[4101]),       # unrelated server
+                 proc(23, cwd="/approved/wt")]                        # not listening
+        with mock.patch.object(hwt, "user_processes", return_value=procs), \
+             mock.patch.object(hwt, "leased_port", return_value=4100), \
+             mock.patch.object(hwt.os.path, "realpath", side_effect=lambda p: str(p)), \
+             mock.patch.object(hwt, "stop_processes", side_effect=lambda ps: ps) as stop:
+            hwt.stop_worktree_servers(Path("/state"), Path("/approved/wt"))
+        self.assertEqual(sorted(p["pid"] for p in stop.call_args.args[0]), [20, 21])
+
+    def test_orphans_are_deleted_checkouts_under_approved_roots_only(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            live = root / "demo" / "live"
+            (live / ".git").mkdir(parents=True)
+            procs = [proc(30, cwd=str(root / "demo" / "gone"), ports=[4100], deleted=True),
+                     proc(31, cwd=str(live / "dist"), ports=[4101], deleted=True),    # rebuilt folder
+                     proc(32, cwd=str(root / "demo" / "live"), ports=[4102]),         # healthy
+                     proc(33, cwd="/tmp/unrelated", ports=[4103], deleted=True)]      # not Corral's
+            cfg = {"worktree_root": str(root), "repositories": {}}
+            with mock.patch.object(hwt, "user_processes", return_value=procs):
+                self.assertEqual([p["pid"] for p in hwt.orphan_servers(cfg)], [30])
+
+
+@unittest.skipUnless(Path("/proc/net/tcp").exists(), "Linux /proc required")
+class ServerStoppingIntegrationTests(unittest.TestCase):
+    SERVER = ("import socket, subprocess, sys, time, signal\n"
+              "if 'stubborn' in sys.argv: signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+              "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+              "s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen()\n"
+              "print(child.pid, flush=True); time.sleep(60)\n")
+
+    def start(self, cwd, *extra):
+        import subprocess
+        server = subprocess.Popen([sys.executable, "-c", self.SERVER, *extra], cwd=cwd,
+                                  stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (server.kill(), server.wait()))
+        child = int(server.stdout.readline())
+        self.addCleanup(lambda: hwt._alive(child) and os.kill(child, 9))
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if any(p["pid"] == server.pid and p["ports"] for p in hwt.user_processes()):
+                return server, child
+            time.sleep(0.05)
+        self.fail("test server never started listening")
+
+    def test_worktree_server_and_its_child_are_stopped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server, child = self.start(tmp)
+            report = hwt.stop_worktree_servers(Path(tmp) / "state", Path(tmp))
+            server.wait(timeout=5)
+            self.assertEqual({r["pid"] for r in report}, {server.pid, child})
+            self.assertTrue(all(r["signal"] == "TERM" for r in report))
+            self.assertFalse(hwt._alive(child))
+
+    def test_server_ignoring_sigterm_is_killed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            server, _ = self.start(tmp, "stubborn")
+            targets = hwt.server_trees(hwt.user_processes(), lambda p: p["pid"] == server.pid)
+            report = hwt.stop_processes(targets, grace=0.5)
+            server.wait(timeout=5)
+            self.assertEqual(next(r for r in report if r["pid"] == server.pid)["signal"], "KILL")
+
+    def test_server_in_deleted_worktree_is_found_as_orphan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            wt = root / "demo" / "wt"
+            wt.mkdir(parents=True)
+            server, _ = self.start(wt)
+            wt.rmdir()
+            orphans = hwt.orphan_servers({"worktree_root": str(root), "repositories": {}})
+            self.assertIn(server.pid, [p["pid"] for p in orphans])
+
+
+class ServerReapingCommandTests(StubProbes, unittest.TestCase):
+    def test_cleanup_stops_servers_before_removing_the_checkout(self):
+        fake = mock.Mock()
+        order = mock.Mock()
+        fake.call.side_effect = lambda *a: order.herdr(*a) or {}
+        server = {"pid": 7, "command": "node vite", "cwd": "/approved/wt", "ports": [4100], "signal": "TERM"}
+        responses = [mock.Mock(stdout="", returncode=0)] * 6
+        with mock.patch.object(hwt, "configured_worktree_items", return_value=[dict(RemovalTests.ITEM)]), \
+             mock.patch.object(hwt, "resolve_existing", side_effect=lambda path: Path(path)), \
+             mock.patch.object(hwt, "validate_worktree_identity"), \
+             mock.patch.object(hwt, "worktree_lock", return_value=contextlib.nullcontext()), \
+             mock.patch.object(hwt, "git", side_effect=responses), \
+             mock.patch.object(hwt, "release_port"), \
+             mock.patch.object(hwt, "suppress_teardown"), \
+             mock.patch.object(hwt, "stop_worktree_servers",
+                               side_effect=lambda *a: (order.stop(*a), [server])[1]), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            hwt.cmd_cleanup(RemovalTests.cleanup_args(), RemovalTests.CFG, Path("/state"), fake)
+        removal = mock.call.herdr("worktree", "remove", "--workspace", "w2")
+        self.assertLess(order.mock_calls.index(mock.call.stop(Path("/state"), Path("/approved/wt"))),
+                        order.mock_calls.index(removal))
+        self.assertEqual(json.loads(out.getvalue())["stopped_servers"], [server])
+
+    def test_removed_event_stops_only_the_linked_checkouts_servers(self):
+        payload = {"event": "worktree.removed",
+                   "data": {"workspace_id": "w2", "forced": False,
+                            "workspace": {"cwd": "/canon/demo"},
+                            "worktree": {"path": "/approved/demo/wt", "branch": "feature/x",
+                                         "is_linked_worktree": True}}}
+        with mock.patch.dict(os.environ, {"HERDR_PLUGIN_EVENT": "worktree.removed",
+                                          "HERDR_PLUGIN_EVENT_JSON": json.dumps(payload)}), \
+             mock.patch.object(hwt, "release_port"), \
+             mock.patch.object(hwt, "maybe_open_teardown"):
+            hwt.cmd_event(object(), {}, Path("/state"), mock.Mock())
+        hwt.stop_worktree_servers.assert_called_once_with(Path("/state"), Path("/approved/demo/wt"))
+
+    def test_removed_event_for_unlinked_checkout_stops_nothing(self):
+        payload = {"data": {"worktree": {"path": "/canon/demo", "is_linked_worktree": False}}}
+        with mock.patch.dict(os.environ, {"HERDR_PLUGIN_EVENT": "worktree.removed",
+                                          "HERDR_PLUGIN_EVENT_JSON": json.dumps(payload)}), \
+             mock.patch.object(hwt, "release_port"), \
+             mock.patch.object(hwt, "maybe_open_teardown"):
+            hwt.cmd_event(object(), {}, Path("/state"), mock.Mock())
+        hwt.stop_worktree_servers.assert_not_called()
+
+    def test_reap_dry_run_lists_without_stopping(self):
+        orphan = proc(40, cwd="/wts/gone", ports=[4100], deleted=True)
+        hwt.orphan_servers.return_value = [orphan]
+        with mock.patch.object(hwt, "stop_processes") as stop, \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            hwt.cmd_reap(type("Args", (), {"dry_run": True})(), {}, Path("/state"))
+        stop.assert_not_called()
+        self.assertEqual(json.loads(out.getvalue())["orphan_servers"][0]["pid"], 40)
+
+    def test_reap_stops_orphans(self):
+        orphan = proc(40, cwd="/wts/gone", ports=[4100], deleted=True)
+        hwt.orphan_servers.return_value = [orphan]
+        with mock.patch.object(hwt, "stop_processes", return_value=[{"pid": 40}]) as stop, \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            hwt.cmd_reap(type("Args", (), {"dry_run": False})(), {}, Path("/state"))
+        stop.assert_called_once_with([orphan])
+        self.assertEqual(json.loads(out.getvalue())["stopped"], [{"pid": 40}])
+
+    def test_sweep_also_reaps_orphans(self):
+        hwt.orphan_servers.return_value = [proc(41, deleted=True)]
+        with mock.patch.object(hwt, "configured_worktree_items", return_value=[]), \
+             mock.patch.object(hwt, "stop_processes", return_value=[{"pid": 41}]), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            hwt.cmd_sweep(object(), {}, Path("/state"), mock.Mock())
+        self.assertEqual(json.loads(out.getvalue())["stopped_orphan_servers"], [{"pid": 41}])
 
 
 class PaletteKeybindingTests(unittest.TestCase):
@@ -989,7 +1295,7 @@ class PaletteKeybindingTests(unittest.TestCase):
         self.assertIn("herdr plugin action invoke corral.palette", dict(fake.reminders)["w1:p2"])
 
 
-class TeardownSuppressionTests(unittest.TestCase):
+class TeardownSuppressionTests(StubProbes, unittest.TestCase):
     def test_marker_is_consumed_by_first_check(self):
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp)
@@ -1082,7 +1388,7 @@ class TeardownEventTests(unittest.TestCase):
         self.run_maybe(self.PAYLOAD, branch_exists=False).assert_not_called()
 
 
-class TeardownStatusTests(unittest.TestCase):
+class TeardownStatusTests(StubProbes, unittest.TestCase):
     REPO = {"path": "/canon/demo", "remote": "origin", "base_branch": "origin/main"}
 
     def status_with(self, responses):
@@ -1242,7 +1548,7 @@ class PaletteTests(unittest.TestCase):
         core.assert_called_once()
 
 
-class SweepTests(unittest.TestCase):
+class SweepTests(StubProbes, unittest.TestCase):
     def test_sweep_cleans_qualifying_and_reports_skipped_with_commands(self):
         items = [
             {"branch": "feature/a", "is_linked_worktree": True, "path": "/wts/a", "repository": "demo"},
