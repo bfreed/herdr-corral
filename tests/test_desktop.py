@@ -201,7 +201,48 @@ class RemoveWorktreeTests(DesktopTestCase):
                                   side_effect=lambda *a: (at_removal.extend(self.core.killed), real(*a))):
             self.herdr.remove_worktree(self.repo, "spWT", self.checkout, force=False)
         self.assertEqual(at_removal, [tab])
+        # Not yet: the cleanup still has the branch, its remote copy and the lease to delete.
+        self.assertEqual(self.core.killed, [tab])
+        self.herdr.end_own_terminals()
         self.assertEqual(self.core.killed, [tab, self.mine])
+        self.herdr.end_own_terminals()
+        self.assertEqual(self.core.killed, [tab, self.mine], "once")
+
+    def test_hwt_ends_its_own_terminal_after_the_whole_command(self):
+        order = []
+
+        class Core:
+            desktop = True
+            def __init__(self, *a): pass
+            def end_own_terminals(self): order.append("own terminal ended")
+
+        def cleanup(args, cfg, state, herdr):
+            order.append("branch, remote branch and lease deleted")
+            print("{}")
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(hwt, "load_config", return_value={"repositories": {}}), \
+                mock.patch.object(hwt, "runtime_state_dir", return_value=Path(tmp)), \
+                mock.patch.object(hwt, "HerdrCore", Core), \
+                mock.patch.object(hwt, "cmd_cleanup", side_effect=cleanup), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(hwt.main(["--frontend", "desktop", "cleanup", "wt"]), 0)
+        self.assertEqual(order, ["branch, remote branch and lease deleted", "own terminal ended"])
+        self.assertEqual(out.getvalue(), "{}\n")
+
+    def test_a_failed_command_keeps_hwts_own_terminal(self):
+        class Core:
+            desktop = True
+            def __init__(self, *a): pass
+            def end_own_terminals(self): raise AssertionError("its error must stay readable")
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(hwt, "load_config", return_value={"repositories": {}}), \
+                mock.patch.object(hwt, "runtime_state_dir", return_value=Path(tmp)), \
+                mock.patch.object(hwt, "HerdrCore", Core), \
+                mock.patch.object(hwt, "cmd_cleanup", side_effect=hwt.WorkflowError("refused")), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(hwt.main(["--frontend", "desktop", "cleanup", "wt"]), 2)
 
     def test_closing_a_space_ends_its_terminals_but_not_hwts_own(self):
         self.herdr.call("workspace", "close", "spWT")

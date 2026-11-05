@@ -49,7 +49,7 @@ class SafetyError(WorkflowError):
 
 WINDOWS = os.name == "nt"  # patched in tests; never patch os.name (pathlib reads it)
 
-__version__ = "1.4.4"
+__version__ = "1.4.5"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -1407,6 +1407,7 @@ class HerdrCore:
 
     def __init__(self, binary: str | None = None):
         self.binary = binary or hc_binary()
+        self.own_terminals: list[dict[str, Any]] = []
 
     def _json(self, *args: str) -> Any:
         result = run([self.binary, *args, "--json"])
@@ -1523,9 +1524,17 @@ class HerdrCore:
             raise WorkflowError(f"{path} has modified or untracked files; removing it needs --force")
         own = self.end_space(workspace) if workspace else []
         remove_checkout(canonical, path, force)
-        for term in own:
+        # hwt's own terminal goes only when the whole command is done (see
+        # end_own_terminals): ending it now would end hwt before the branch,
+        # its remote copy and the lease are deleted.
+        self.own_terminals += own
+
+    def end_own_terminals(self) -> None:
+        """After the command: end the terminal hwt runs in, when its space was removed."""
+        for term in self.own_terminals:
             with contextlib.suppress(WorkflowError):
                 run([self.binary, "kill", term["address"]])
+        self.own_terminals = []
 
     def end_space(self, workspace: str) -> list[dict[str, Any]]:
         """End a space's terminals, and wait for what ran in them, except the
@@ -3695,6 +3704,10 @@ def main(argv: list[str] | None=None) -> int:
         fn=commands[args.command]
         if args.command in ("new","open","list","remove","cleanup","cleanup-workspace","sweep","palette","event"): fn(args,cfg,state,herdr)
         else: fn(args,cfg,state)
+        if is_desktop(herdr):
+            # Its result is printed first: ending hwt's own terminal ends hwt.
+            sys.stdout.flush(); sys.stderr.flush()
+            herdr.end_own_terminals()
         return 0
     except WorkflowError as exc:
         print(f"hwt: {exc}",file=sys.stderr); return 2
