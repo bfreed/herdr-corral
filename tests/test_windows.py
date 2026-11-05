@@ -14,7 +14,7 @@ import time
 import tomllib
 import types
 import unittest
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parents[1]))
@@ -288,7 +288,7 @@ class WindowsCopyTests(unittest.TestCase):
             self.assertEqual(hwt.retry_command(plain), "hwt cleanup " + str(plain))
             self.assertEqual(hwt.retry_command(spaced), 'hwt cleanup "' + str(spaced) + '"')
         with as_posix():
-            self.assertEqual(hwt.retry_command(Path("/home/b/my wts/x")), "hwt cleanup '/home/b/my wts/x'")
+            self.assertEqual(hwt.retry_command(PurePosixPath("/home/b/my wts/x")), "hwt cleanup '/home/b/my wts/x'")
 
     def test_a_removal_that_fails_on_a_folder_in_use_says_so(self):
         failure = hwt.WorkflowError("command failed (git) with exit status 255: "
