@@ -15,6 +15,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).parents[1]))
 
 import hwt
+import install
 
 
 def _can_symlink() -> bool:
@@ -437,6 +438,34 @@ class ConfigErrorTests(unittest.TestCase):
                 self.assertEqual(hwt.main(["--config", str(config), "list"]), 2)
             self.assertIn("demo.toml", said.getvalue())
             self.assertNotIn("Traceback", said.getvalue())
+
+    def test_a_config_without_repositories_works(self):
+        """install.py writes no [repositories] table when --repos-root holds no
+        clones; doctor (the installer's next step) and info crashed with KeyError."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "repos").mkdir(); (root / "wts").mkdir()
+            repo = root / "elsewhere" / "demo"; repo.mkdir(parents=True)
+            git(repo, "init", "-q")
+            config = root / "config.toml"
+            config.write_text(install.render_config(root / "repos", root / "wts", [],
+                                                    "127.0.0.1", "", "claude"),
+                              encoding="utf-8")  # as install.py writes it; it has an em dash
+            self.assertEqual(hwt.load_config(config)["repositories"], {})
+            with mock.patch.object(hwt, "latest_remote_version", return_value=None), \
+                 mock.patch.object(hwt, "orphan_servers", return_value=[]), \
+                 contextlib.redirect_stdout(io.StringIO()) as out, \
+                 contextlib.redirect_stderr(io.StringIO()) as said:
+                # Other checks (HERDR_ENV, tools on PATH, the Windows launcher)
+                # depend on the machine and may fail, exiting 1; only a crash matters.
+                with contextlib.suppress(SystemExit):
+                    hwt.main(["--config", str(config), "doctor"])
+                report = json.loads(out.getvalue())
+                self.assertFalse([c for c in report["checks"] if c["check"].startswith("repo:")])
+                self.assertIn("No repositories are configured yet", said.getvalue())
+                out.truncate(0); out.seek(0)
+                self.assertEqual(hwt.main(["--config", str(config), "info", str(repo)]), 0)
+                self.assertIsNone(json.loads(out.getvalue())["repository"])
 
 
 if __name__ == "__main__":

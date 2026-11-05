@@ -3,6 +3,7 @@ import io
 import json
 import os
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -288,6 +289,28 @@ class VerifyTests(unittest.TestCase):
             ok, detail = install.verify_plugin_registration()
         self.assertFalse(ok)
         self.assertEqual(detail, "herdr is not on PATH")
+
+
+class InstallTests(unittest.TestCase):
+    def install(self, home: Path, *argv: str) -> str:
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(home), "USERPROFILE": str(home)}), \
+             mock.patch.object(sys, "argv", ["install.py", "--skip-plugin", *argv]), \
+             mock.patch.object(install, "add_to_user_path", return_value=False), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+            self.assertEqual(install.main(), 0)
+        return stderr.getvalue()
+
+    def test_a_repos_root_without_clones_is_warned_about(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "repos").mkdir()
+            said = self.install(home)
+            self.assertIn("no Git repositories directly under", said)
+            self.assertIn("--force-config", said)
+            (home / "repos" / "demo").mkdir()
+            subprocess.run(["git", "init", "-q", str(home / "repos" / "demo")], check=True)
+            self.assertNotIn("no Git repositories", self.install(home, "--force-config"))
 
 
 if __name__ == "__main__":
