@@ -130,6 +130,11 @@ class NewWorktreeTests(DesktopTestCase):
         by_label = {t["labels"]["corral.tab"]: t for t in self.core.space_of(result["workspace_id"])}
         for label in ("shell", "server"):
             argv = by_label[label]["argv"]
+            if os.name == "nt":  # PowerShell sets them (hc run has no --env)
+                self.assertEqual(argv[-2], "-Command")
+                self.assertIn(f"${{env:PORT}} = '{result['port']}'", argv[-1])
+                self.assertIn(f"${{env:HWT_REMOTE_URL}} = 'http://box.example:{result['port']}'", argv[-1])
+                continue
             self.assertEqual(argv[0], "env")
             self.assertIn(f"PORT={result['port']}", argv)
             self.assertIn(f"HWT_REMOTE_URL=http://box.example:{result['port']}", argv)
@@ -334,6 +339,33 @@ class DesktopInstallTests(unittest.TestCase):
             self.assertEqual(config["frontend"], "desktop")
             self.assertIn("demo", config["repositories"])
             self.assertTrue((home / ".local/bin/hwt").exists())
+
+
+@unittest.skipUnless(os.name == "nt", "the Windows installer run")
+class WindowsDesktopInstallTests(unittest.TestCase):
+    def test_desktop_install_writes_hwt_cmd_that_runs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "repos" / "demo").mkdir(parents=True)
+            subprocess.run(["git", "init", "-q", str(home / "repos" / "demo")], check=True)
+            bin_dir = home / ".local" / "bin"
+            # bin already on PATH, so the run leaves the user's registry PATH alone.
+            env = {**os.environ, "USERPROFILE": str(home), "HOME": str(home),
+                   "PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]}
+            result = subprocess.run(
+                [sys.executable, str(Path(hwt.__file__).with_name("install.py")),
+                 "--desktop", "--repos-root", str(home / "repos")],
+                env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            config = tomllib.loads((home / ".config/herdr-corral/config.toml").read_text(encoding="utf-8"))
+            self.assertEqual(config["frontend"], "desktop")
+            self.assertEqual(Path(config["repositories"]["demo"]["path"]), (home / "repos" / "demo").resolve())
+            launcher = bin_dir / "hwt.cmd"
+            self.assertTrue(launcher.exists())
+            info = subprocess.run([str(launcher), "--frontend", "desktop", "info", str(home / "repos" / "demo")],
+                                  env=env, text=True, capture_output=True, encoding="utf-8")
+            self.assertEqual(info.returncode, 0, info.stderr)
+            self.assertEqual(json.loads(info.stdout)["repository"], "demo")
 
 
 if __name__ == "__main__":

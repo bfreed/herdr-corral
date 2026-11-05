@@ -45,9 +45,11 @@ git clone https://github.com/bfreed/herdr-corral ~/.local/share/herdr-corral
 python3 ~/.local/share/herdr-corral/install.py --preflight
 ```
 
+On Windows, run these in PowerShell with `py -3` (or `python`) in place of `python3`, and `$HOME\.local\share\herdr-corral` as the clone path; the rest of this guide applies as written, with `hwt` becoming `hwt.cmd` in `%USERPROFILE%\.local\bin`.
+
 The clone location matters: the clone **is** the installation (`hwt update` runs `git pull` in it). `~/.local/share/herdr-corral` is the convention; honor the user's preference if they have one — but do **not** clone into their repositories root. The clone is tooling, not one of their projects.
 
-Preflight is read-only and writes nothing. It prints a JSON report on stdout — the machine-readable source for every interview question below — and a short human summary on stderr. It covers: `prerequisites` (Python 3.11+, `git`, `herdr` and its version; Linux or macOS only — Windows is not supported yet), `repository_parents` (candidate folders with repository counts), `worktrees` (Herdr's configured directory, existing collections), `network` (tailscale DNS name/IP, hostname), `agents` (Herdr's accepted kinds and which are actually usable — probed via PATH, the user's login shell, and vendor bin directories), and `keybindings` (current bindings plus a suggested free palette key).
+Preflight is read-only and writes nothing. It prints a JSON report on stdout — the machine-readable source for every interview question below — and a short human summary on stderr. It covers: `prerequisites` (Python 3.11+, `git`, `herdr` and its version; Linux, macOS or Windows), `repository_parents` (candidate folders with repository counts), `worktrees` (Herdr's configured directory, existing collections), `network` (tailscale DNS name/IP, hostname), `agents` (Herdr's accepted kinds and which are actually usable — probed via PATH, the user's login shell, and vendor bin directories), and `keybindings` (current bindings plus a suggested free palette key).
 
 Report anything failing in `prerequisites` before continuing. If Herdr is missing, install it per its current official instructions (https://herdr.dev). Do not invent commands. Do not run detection commands of your own — if preflight did not surface something, ask the user instead.
 
@@ -124,7 +126,7 @@ python3 ~/.local/share/herdr-corral/install.py \
 
 Add `--dev-host 0.0.0.0 --remote-host <name>` only if the user opted in at question 3, and `--worktree-placement sibling` only if they chose the `__worktrees`-sibling layout in question 2. If they chose a shared folder other than Herdr's current one, also make the approved Herdr config edit now and run `herdr server reload-config`.
 
-If `~/.local/bin` is not on PATH, add it using the user's shell conventions, then verify in a fresh shell.
+If `~/.local/bin` is not on PATH, add it using the user's shell conventions, then verify in a fresh shell. (On Windows the installer adds it to the user PATH itself; only a new terminal is needed.)
 
 ## Step 4 — verify
 

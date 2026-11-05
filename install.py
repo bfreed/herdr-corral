@@ -4,6 +4,7 @@ the clone itself is the installation, which is what lets `hwt update` work."""
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import re
@@ -13,7 +14,12 @@ import subprocess
 import sys
 from pathlib import Path
 
+WINDOWS = os.name == "nt"
+# Windows decodes child output in the ANSI code page by default; git and herdr write UTF-8.
+UTF8 = {"encoding": "utf-8", "errors": "replace"} if WINDOWS else {}
 PLUGIN_ID = "corral"
+# Windows links a generated copy of the manifest from here (write_windows_plugin).
+WINDOWS_PLUGIN_DIR = ".windows-plugin"
 
 # Plain (unshifted) prefix+<key> bindings Herdr occupies by default, from
 # KeysConfig::default in Herdr's src/config/model.rs. A user [[keys.command]]
@@ -37,7 +43,7 @@ def quote(value: str) -> str:
 
 def git_output(repo: Path, *args: str) -> str | None:
     result = subprocess.run(
-        ["git", "-C", str(repo), *args], text=True,
+        ["git", "-C", str(repo), *args], text=True, **UTF8,
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     return result.stdout.strip() if result.returncode == 0 else None
@@ -126,7 +132,7 @@ def note(message: str) -> None:
 
 def command_output(argv: list[str], timeout: float = 10.0) -> str | None:
     try:
-        result = subprocess.run(argv, text=True, stdout=subprocess.PIPE,
+        result = subprocess.run(argv, text=True, stdout=subprocess.PIPE, **UTF8,
                                 stderr=subprocess.DEVNULL, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -143,14 +149,121 @@ def read_toml(path: Path) -> dict | None:
         return {}
     try:
         import tomllib
-        return tomllib.loads(path.read_text())
+        return tomllib.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
 
 
 def herdr_config_path() -> Path:
-    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
-    return Path(base) / "herdr" / "config.toml"
+    """Where the Herdr TUI reads config.toml (its src/config/io.rs): HERDR_CONFIG_PATH,
+    else XDG_CONFIG_HOME/herdr, else ~/.config/herdr; on Windows %APPDATA%\\herdr."""
+    if os.environ.get("HERDR_CONFIG_PATH"):
+        return Path(os.environ["HERDR_CONFIG_PATH"])
+    base = os.environ.get("XDG_CONFIG_HOME")
+    if not base and WINDOWS:
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData/Roaming")
+    return Path(base or Path.home() / ".config") / "herdr" / "config.toml"
+
+
+def launcher_path(bin_dir: Path | None = None) -> Path:
+    """The hwt launcher: a shell script, or hwt.cmd on Windows."""
+    bin_dir = bin_dir or Path.home() / ".local/bin"
+    return bin_dir / ("hwt.cmd" if WINDOWS else "hwt")
+
+
+def windows_launcher(python: str, script: Path) -> str:
+    """hwt.cmd: runs hwt.py with the Python that installed it. %% is a literal %."""
+    quote = lambda value: '"' + str(value).replace("%", "%%") + '"'
+    # -X utf8: files and pipes in UTF-8, as on Linux and macOS.
+    return f"@{quote(python)} -X utf8 {quote(script)} %*\r\n"
+
+
+def write_launcher(bin_dir: Path, source: Path) -> Path:
+    launcher = launcher_path(bin_dir)
+    if not WINDOWS:
+        launcher.write_text(f'#!/bin/sh\nexec python3 "{source / "hwt.py"}" "$@"\n')
+        launcher.chmod(0o755)
+        return launcher
+    text = windows_launcher(sys.executable, source / "hwt.py")
+    try:
+        launcher.write_bytes(text.encode("oem"))  # cmd.exe reads batch files in the OEM code page
+    except (LookupError, UnicodeEncodeError):
+        launcher.write_bytes(("@chcp 65001 >nul\r\n" + text).encode("utf-8"))
+    return launcher
+
+
+def add_to_user_path(folder: Path) -> bool:
+    """Windows: add folder to the user's PATH (HKCU\\Environment) for programs
+    started from now on, and tell running ones. True when it was added."""
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0,
+                        winreg.KEY_READ | winreg.KEY_WRITE) as key:
+        try:
+            value, kind = winreg.QueryValueEx(key, "Path")
+        except FileNotFoundError:
+            value, kind = "", winreg.REG_EXPAND_SZ
+        entries = [entry for entry in str(value).split(";") if entry]
+        same = lambda entry: os.path.normcase(os.path.normpath(os.path.expandvars(entry)))
+        if same(str(folder)) in {same(entry) for entry in entries}:
+            return False
+        if kind not in (winreg.REG_SZ, winreg.REG_EXPAND_SZ):
+            kind = winreg.REG_EXPAND_SZ
+        winreg.SetValueEx(key, "Path", 0, kind, ";".join(entries + [str(folder)]))
+    os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + str(folder)
+    broadcast_environment()
+    return True
+
+
+def broadcast_environment() -> None:
+    """Windows: tell running programs the user's environment changed, so
+    Explorer and Herdr's new terminals pick the new PATH up."""
+    with contextlib.suppress(Exception):
+        import ctypes
+        result = ctypes.c_size_t()
+        # HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG
+        ctypes.windll.user32.SendMessageTimeoutW(0xFFFF, 0x1A, 0, "Environment", 2, 5000,
+                                                 ctypes.byref(result))
+
+
+def toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    return json.dumps(str(value), ensure_ascii=False)  # TOML has no surrogate-pair escapes
+
+
+def write_windows_plugin(source: Path, python: str | None = None) -> Path:
+    """Herdr runs a hook's argv as given, from the plugin's folder, and on Windows
+    `python3` is rarely on PATH (the py launcher or python is). One manifest
+    can't carry both, since Herdr refuses duplicate action and pane ids even per
+    platform. So Windows links a generated copy whose commands run this Python
+    and the clone's hwt.py by full path. Returns the folder to link."""
+    import tomllib
+    manifest = tomllib.loads((source / "herdr-plugin.toml").read_text(encoding="utf-8"))
+    manifest["platforms"] = ["windows"]
+    lines = [f"{key} = {toml_value(value)}" for key, value in manifest.items()
+             if not isinstance(value, (dict, list)) or key == "platforms"]
+    lines.insert(0, "# Generated by install.py from herdr-plugin.toml; rewritten on install and hwt update.")
+    for section, items in manifest.items():
+        if not (isinstance(items, list) and items and isinstance(items[0], dict)):
+            continue
+        for item in items:
+            command = item.get("command")
+            if isinstance(command, list) and command[:2] == ["python3", "hwt.py"]:
+                item["command"] = [python or sys.executable, "-X", "utf8", str(source / "hwt.py"), *command[2:]]
+            lines += ["", f"[[{section}]]"] + [f"{k} = {toml_value(v)}" for k, v in item.items()]
+    folder = source / WINDOWS_PLUGIN_DIR
+    folder.mkdir(exist_ok=True)
+    (folder / "herdr-plugin.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return folder
+
+
+def plugin_folder(source: Path) -> Path:
+    """The folder `herdr plugin link` gets: the clone, or on Windows its generated manifest."""
+    return write_windows_plugin(source) if WINDOWS else source
 
 
 def herdr_binary() -> str:
@@ -176,7 +289,7 @@ def preflight_prerequisites() -> dict:
             version_ok = None
     return {
         "os": sys.platform,
-        "os_ok": os.name == "posix",
+        "os_ok": os.name in ("posix", "nt"),
         "python_version": ".".join(map(str, sys.version_info[:3])),
         "python_ok": sys.version_info[:2] >= (3, 11),
         "git": shutil.which("git"),
@@ -410,7 +523,7 @@ def cmd_verify(source: Path, tests_dir: Path | None) -> int:
               "" if suite.returncode == 0 else suite.stdout[-4000:])
     except (OSError, subprocess.TimeoutExpired) as exc:
         check("unit-tests", False, f"suite did not complete: {exc}")
-    launcher = Path.home() / ".local/bin/hwt"
+    launcher = launcher_path()
     try:
         launcher_ok = launcher.exists() and subprocess.run(
             [str(launcher), "--help"], stdout=subprocess.DEVNULL,
@@ -472,6 +585,7 @@ def main() -> int:
     parser.add_argument("--purge", action="store_true",
                         help="with --uninstall: also delete configuration and runtime state")
     parser.add_argument("--skip-plugin", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--windows-plugin", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--desktop", action="store_true",
                         help="for Herdr Desktop: no TUI plugin, frontend = \"desktop\"")
     args = parser.parse_args()
@@ -481,13 +595,17 @@ def main() -> int:
         return cmd_preflight()
     if args.verify:
         return cmd_verify(source, args.verify_tests_dir)
+    if args.windows_plugin:  # for `hwt update`: rewrite the manifest, print its folder
+        print(write_windows_plugin(source))
+        return 0
     if args.uninstall:
         if shutil.which("herdr"):
             subprocess.run(["herdr", "plugin", "unlink", PLUGIN_ID],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        launcher = Path.home() / ".local/bin/hwt"
+        launcher = launcher_path()
         if launcher.exists():
             launcher.unlink()
+        shutil.rmtree(source / WINDOWS_PLUGIN_DIR, ignore_errors=True)
         if args.purge:
             shutil.rmtree(Path.home() / ".config/herdr-corral", ignore_errors=True)
             shutil.rmtree(Path.home() / ".local/state/herdr-corral", ignore_errors=True)
@@ -509,9 +627,7 @@ def main() -> int:
     config_dir.mkdir(parents=True, exist_ok=True)
     (config_dir / "repos.d").mkdir(exist_ok=True)
 
-    launcher = bin_dir / "hwt"
-    launcher.write_text(f'#!/bin/sh\nexec python3 "{source / "hwt.py"}" "$@"\n')
-    launcher.chmod(0o755)
+    launcher = write_launcher(bin_dir, source)
 
     config = config_dir / "config.toml"
     repos = discover_repositories(repos_root, exclude=source)
@@ -524,7 +640,7 @@ def main() -> int:
         config.write_text(render_config(repos_root, worktree_root, repos,
                                         args.dev_host, args.remote_host, args.agent_kind,
                                         args.worktree_placement,
-                                        "desktop" if args.desktop else "tui"))
+                                        "desktop" if args.desktop else "tui"), encoding="utf-8")
         config.chmod(0o600)
         config_result = f"configured {len(repos)} repositories"
 
@@ -533,13 +649,16 @@ def main() -> int:
             raise SystemExit("Herdr is not on PATH; install Herdr, then rerun this installer")
         subprocess.run(["herdr", "plugin", "unlink", PLUGIN_ID], stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL)
-        run_checked(["herdr", "plugin", "link", str(source), "--enabled"])
+        run_checked(["herdr", "plugin", "link", str(plugin_folder(source)), "--enabled"])
 
     print(f"Installed the hwt launcher at {launcher} (running from {source})")
     print(f"Configuration: {config} ({config_result})")
     print(f"Discovered repositories: {', '.join(name for name, _, _ in repos) or '(none)'}")
     if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
-        print(f"Add {bin_dir} to PATH before using hwt")
+        if WINDOWS and add_to_user_path(bin_dir):
+            print(f"Added {bin_dir} to your user PATH; open a new terminal to use hwt")
+        elif not WINDOWS:
+            print(f"Add {bin_dir} to PATH before using hwt")
     print("Next: review config.toml, then run: hwt doctor")
     return 0
 

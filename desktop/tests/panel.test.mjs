@@ -4,11 +4,21 @@
 // `herdr-app check desktop/corral` checks the real native elements.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { readFile, mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join as pjoin, dirname as pdirname } from "node:path";
 
 const source = (await readFile(new URL("../corral/mods/corral/main.js", import.meta.url), "utf8"))
   .replace(/^import [^;]+;\n/gm, "")
   .replace("export default class Corral", "class Corral");
+const VERSION = source.match(/const VERSION = "([^"]+)"/)[1];
+const esc = (text) => text.replace(/[.\\]/g, (c) => `\\${c}`); // for a RegExp
+
+// A Windows machine, as its probe reports it.
+const WIN_PY = "C:\\Py313\\python.exe";
+const WIN_HWT = "C:\\Users\\b\\.local\\share\\herdr-corral\\hwt.py";
+const WIN_HC = "C:\\Users\\b\\AppData\\Local\\Programs\\herdr-core\\hc.exe";
 
 function element() {
   const node = { id: "", children: [], click: null };
@@ -30,20 +40,28 @@ function element() {
 const textOf = (n) => (typeof n === "string" ? n : (n?.children ?? []).map(textOf).join(" "));
 const find = (n, id) => (n?.id === id ? n : (n?.children ?? []).map((c) => find(c, id)).find(Boolean));
 
-function harness({ probe = {}, info = null, hwt = {}, space = {}, terms = [], tabs = null, width = 260, files = {} } = {}) {
+function harness({ probe = {}, info = null, hwt = {}, space = {}, terms = [], tabs = null, width = 260, files = {},
+                   windows = false, pythons = ["py"], oldPythons = [], gitSh = false, execError = null,
+                   home = "/mac/.config/herdr-app" } = {}) {
   const calls = { exec: [], run: [], notify: [], writes: [] };
   const store = {};
   const block = { id: "b7", type: "block", content: { mod: "corral" }, size: { px: width } };
   const theSpace = { id: "hermes/sp1", machine: "hermes", folder: "/r/demo", named: false,
                      tabs: tabs ?? [{ id: "hermes/tb0", index: 1, named: false }], ...space };
   const state = { spaces: [theSpace], panes: [{ tab: theSpace.tabs[0]?.id, cwd: theSpace.folder }], terms };
-  const lines = [`hwt=${probe.hwt ?? "/h/.local/bin/hwt"}`, probe.git === false ? "" : "git=1",
+  const lines = [`os=${gitSh ? "MINGW64_NT-10.0" : "Linux"}`, `hwt=${probe.hwt ?? "/h/.local/bin/hwt"}`, probe.git === false ? "" : "git=1",
                  `py=${probe.py === false ? 0 : 1}`, `common=${probe.common ?? "/r/demo/.git"}`];
-  if (probe.hwt !== "") lines.push(`version=hwt ${probe.version ?? "1.2.0"}`, "@@info", JSON.stringify(info));
+  if (probe.hwt !== "") lines.push(`version=hwt ${probe.version ?? VERSION}`, "@@info", JSON.stringify(info));
+  const installed = probe.hwt !== "";
+  const winLines = ["os=Windows", `python=${WIN_PY}`, `py=${probe.py === false ? 0 : 1}`, probe.git === false ? "git=0" : "git=1",
+                    `common=${probe.common ?? "C:/r/demo/.git"}`, `hc=${WIN_HC}`,
+                    `hwt=${installed ? "C:\\Users\\b\\.local\\bin\\hwt.cmd" : ""}`, `run=${JSON.stringify(installed ? [WIN_PY, WIN_HWT] : [])}`];
+  if (installed) winLines.push(`version=hwt ${probe.version ?? VERSION}`, "@@info", JSON.stringify(info));
+  const notFound = (cmd) => { throw new Error(`herdr.exec: cannot run ${cmd}: program not found`); };
   const globals = {
     View: class {}, div: element, v_flex: element, h_flex: element, svg: element,
     shared: (k) => store[k], setShared: (k, v) => { store[k] = v; return null; },
-    appHome: () => "/mac/.config/herdr-app",
+    appHome: () => home,
     readTextFile: async (path, opts) => files[`${opts?.on ?? "local"}:${path}`] ?? null,
     writeTextFile: async (path, text, expected) => {
       assert.equal(files[`local:${path}`] ?? null, expected, "writes only over what it read");
@@ -69,6 +87,25 @@ function harness({ probe = {}, info = null, hwt = {}, space = {}, terms = [], ta
     notify: (n) => { calls.notify.push(n); return "n"; },
     exec: async (cmd, args, opts) => {
       calls.exec.push({ cmd, args, on: opts?.on });
+      const reply = (sub) => {
+        let out = hwt[sub] ?? {};
+        if (Array.isArray(out)) out = out.shift() ?? {}; // one reply per call
+        return out.error ? { code: 2, stdout: "", stderr: `hwt: ${out.error}\r\n` } : { code: 0, stdout: JSON.stringify(out), stderr: "" };
+      };
+      if (windows && cmd !== "sh") {
+        const c = args.indexOf("-c");
+        if (c >= 0 && args[c + 1].includes("@@info")) {
+          if (oldPythons.includes(cmd)) return { code: 0, stdout: "os=Windows\r\npython=C:\\Py39\\python.exe\r\npy=0\r\ngit=1\r\ncommon=C:/r/demo/.git\r\nhwt=\r\nrun=[]\r\n", stderr: "" };
+          if (!pythons.includes(cmd) && cmd !== WIN_PY) notFound(cmd);
+          return { code: 0, stdout: winLines.join("\r\n") + "\r\n", stderr: "" }; // Windows line endings
+        }
+        if (cmd === WIN_PY && args[0] === WIN_HWT) return reply(args[2] === "desktop" ? args[3] : args[1]);
+        if (cmd === "git" && !pythons.length) return { code: 0, stdout: "C:/r/demo/.git\r\n", stderr: "" };
+        if (cmd === WIN_HC && args[0] === "ls") return { code: 0, stdout: JSON.stringify({ terminals: [{ address: "t9" }] }), stderr: "" };
+        return { code: 0, stdout: "{}", stderr: "" };
+      }
+      if (windows && !gitSh) notFound("sh");
+      if (execError) throw new Error(execError);
       const script = args[1];
       if (script.includes("@@info")) return { code: 0, stdout: lines.join("\n") + "\n", stderr: "" };
       if (script === 'exec "$@"') {
@@ -93,7 +130,9 @@ function harness({ probe = {}, info = null, hwt = {}, space = {}, terms = [], ta
     n.click({}, cx);
     await settle();
   };
-  const hwtCalls = () => calls.exec.filter((e) => e.args[1] === 'exec "$@"').map((e) => e.args.slice(6));
+  const hwtCalls = () => windows
+    ? calls.exec.filter((e) => e.cmd === WIN_PY && e.args[0] === WIN_HWT).map((e) => e.args.slice(3))
+    : calls.exec.filter((e) => e.args[1] === 'exec "$@"').map((e) => e.args.slice(6));
   return { panel, cx, calls, state, store, settle, draw, click, hwtCalls };
 }
 
@@ -113,7 +152,7 @@ test("no Corral on the machine: Install clones the pinned release for the repo's
   assert.match(textOf(h.draw()), /repositories in \/r\b/);
   await h.click("install");
   const install = h.calls.exec.find((e) => e.args[1].includes("install.py"));
-  assert.deepEqual(install.args.slice(3), ["v1.2.0", "/r", "https://github.com/bfreed/herdr-corral"]);
+  assert.deepEqual(install.args.slice(3), [`v${VERSION}`, "/r", "https://github.com/bfreed/herdr-corral"]);
   assert.equal(install.on, "hermes");
 });
 
@@ -258,9 +297,9 @@ test("a machine whose Corral ships a newer panel: Update panel copies its files 
     [`hermes:${dir}/mod.json`]: "{}",
     [`hermes:${dir}/icon.svg`]: "<svg/>",
   };
-  const h = harness({ files, info: configured({ panel: { version: "1.3.0", dir, files: ["icon.svg", "main.js", "mod.json"] } }) });
+  const h = harness({ files, info: configured({ panel: { version: "9.0.0", dir, files: ["icon.svg", "main.js", "mod.json"] } }) });
   await h.settle();
-  assert.match(textOf(h.draw()), /Corral on hermes has panel 1\.3\.0; this one is 1\.2\.0/);
+  assert.match(textOf(h.draw()), new RegExp(`Corral on hermes has panel 9\\.0\\.0; this one is ${esc(VERSION)}`));
   await h.click("update-panel");
   assert.deepEqual(h.calls.writes, ["/mac/.config/herdr-app/mods/corral/icon.svg", "/mac/.config/herdr-app/mods/corral/main.js"],
                    "unchanged mod.json isn't rewritten; main.js (which reloads the panel) goes last");
@@ -268,7 +307,7 @@ test("a machine whose Corral ships a newer panel: Update panel copies its files 
 });
 
 test("no update offered for the same or an older panel, and none over a folder that isn't this panel", async () => {
-  const same = harness({ info: configured({ panel: { version: "1.2.0", dir: "/d", files: ["main.js"] } }) });
+  const same = harness({ info: configured({ panel: { version: VERSION, dir: "/d", files: ["main.js"] } }) });
   await same.settle();
   assert.equal(find(same.draw(), "update-panel"), undefined);
   const older = harness({ info: configured({ panel: { version: "1.1.9", dir: "/d", files: ["main.js"] } }) });
@@ -280,4 +319,172 @@ test("no update offered for the same or an older panel, and none over a folder t
   await stranger.click("update-panel");
   assert.deepEqual(stranger.calls.writes, []);
   assert.match(textOf(stranger.draw()), /isn't in \/mac\/\.config\/herdr-app\/mods\/corral/);
+});
+
+// ---- a space on a Windows machine (whatever system this window runs on) ----
+
+const winConfigured = (over = {}) => configured({
+  top: "C:\\r\\demo", main: "C:\\r\\demo", canonical_root: "C:\\r",
+  worktrees: [{ path: "C:\\r\\demo", branch: "develop", main: true, port: null, listening: false, dev_url: null },
+              { path: "C:\\w\\demo\\fix-1", branch: "fix", main: false, port: 4111, listening: true, dev_url: "http://box:4111" }],
+  ...over,
+});
+const winSpace = { folder: "C:\\r\\demo" };
+
+test("Windows: no sh there, so the probe runs in Python, and hwt runs as python <clone>\\hwt.py", async () => {
+  const h = harness({ windows: true, space: winSpace, info: winConfigured(),
+                      hwt: { new: { repository: "demo", branch: "feat", workspace_id: "sp9", tabs: {} } } });
+  await h.settle();
+  assert.deepEqual(h.calls.exec.map((e) => e.cmd), ["sh", "py"], "tries sh, then the py launcher");
+  assert.deepEqual(h.calls.exec[1].args.slice(0, 2), ["-3", "-c"]);
+  assert.equal(h.calls.exec[1].args.at(-1), "C:\\r\\demo");
+  assert.match(textOf(h.draw()), /New worktree of demo/i);
+  h.panel.input.type("feat");
+  await h.click("new");
+  assert.deepEqual(h.hwtCalls(), [["new", "feat", "--repo", "C:\\r\\demo", "--background"]]);
+  assert.ok(h.calls.exec.every((e) => e.on === "hermes"));
+});
+
+test("Windows: the machine is remembered, and later probes use the Python that answered", async () => {
+  const h = harness({ windows: true, pythons: ["python"], space: winSpace, info: winConfigured() });
+  await h.settle();
+  assert.deepEqual(h.calls.exec.map((e) => e.cmd), ["sh", "py", "python"]);
+  h.calls.exec.length = 0;
+  h.panel.at = 0;
+  h.panel.tick(h.cx);
+  await h.settle();
+  assert.deepEqual(h.calls.exec.map((e) => e.cmd), [WIN_PY], "no sh, straight to the Python it found");
+});
+
+test("Windows with Git's sh on PATH is still Windows", async () => {
+  const h = harness({ windows: true, gitSh: true, space: winSpace, info: winConfigured() });
+  await h.settle();
+  assert.deepEqual(h.calls.exec.map((e) => e.cmd), ["sh", "py"]);
+  assert.match(textOf(h.draw()), /New worktree of demo/i);
+});
+
+test("Windows paths: a space whose folder differs in case and separators still shows its worktree as open", async () => {
+  const h = harness({ windows: true, space: winSpace, info: winConfigured() });
+  h.state.spaces.push({ id: "hermes/sp2", machine: "hermes", folder: "c:/W/demo/fix-1/src", tabs: [{ id: "hermes/tb5", index: 1 }] });
+  h.state.panes.push({ tab: "hermes/tb5", cwd: "c:/W/demo/fix-1/src" });
+  await h.settle();
+  assert.match(textOf(find(h.draw(), "wt-0")), /fix 4111 open/);
+  await h.click("wt-0");
+  assert.deepEqual(h.calls.run.at(-1), ["space.select", { id: "hermes/sp2" }]);
+  assert.deepEqual(h.hwtCalls(), [], "selected, not reopened");
+});
+
+test("Windows: this worktree is found though git and hwt write its path differently", async () => {
+  const info = winConfigured({ top: "C:\\w\\demo\\fix-1", linked: true, branch: "fix" });
+  info.worktrees[1].path = "C:/w/demo/fix-1"; // as an older hwt passes git's on
+  const h = harness({ windows: true, space: { folder: "C:\\w\\demo\\fix-1" }, info });
+  await h.settle();
+  assert.match(textOf(h.draw()), /Dev server running/);
+});
+
+test("Windows: Install runs the installer in Python, for the repo's parent folder", async () => {
+  const h = harness({ windows: true, probe: { hwt: "" }, space: winSpace });
+  await h.settle();
+  assert.match(textOf(h.draw()), /repositories in C:\\r\b/);
+  await h.click("install");
+  const install = h.calls.exec.find((e) => e.args.some((a) => String(a).includes('"--desktop"')));
+  assert.equal(install.cmd, WIN_PY);
+  assert.deepEqual(install.args.slice(2), [`v${VERSION}`, "C:\\r", "https://github.com/bfreed/herdr-corral"]);
+});
+
+test("Windows without Python: says so, and still knows the folder's repository", async () => {
+  const h = harness({ windows: true, pythons: [], probe: { hwt: "" }, space: winSpace });
+  await h.settle();
+  assert.deepEqual(h.calls.exec.map((e) => e.cmd), ["sh", "py", "python", "python3", "git"]);
+  assert.match(textOf(h.draw()), /needs Python 3\.11\+ on hermes/);
+  assert.equal(find(h.draw(), "install"), undefined);
+});
+
+test("Windows: Start dev server types hwt dev through hc, or opens a tab running python hwt.py dev", async () => {
+  const info = winConfigured({ top: "C:\\w\\demo\\fix-1", linked: true, branch: "fix" });
+  info.worktrees[1].listening = false;
+  const h = harness({ windows: true, space: { folder: "C:\\w\\demo\\fix-1" }, info });
+  await h.settle();
+  await h.click("dev");
+  const hc = h.calls.exec.filter((e) => e.cmd === WIN_HC).map((e) => e.args);
+  assert.deepEqual(hc, [["ls", "--json", "--label", "herdr.space=sp1", "--label", "corral.tab=server"],
+                       ["send", "t9", `& '${WIN_PY}' '${WIN_HWT}' dev`]]);
+  assert.equal(h.panel.hwtArgv("dev").join(" "), `${WIN_PY} ${WIN_HWT} dev`);
+});
+
+test("Windows: Update panel reads and writes with Windows separators", async () => {
+  const here = "C:\\Users\\b\\.config\\herdr-app\\mods\\corral";
+  const dir = "C:\\Users\\b\\.local\\share\\herdr-corral\\desktop\\corral\\mods\\corral";
+  const files = {
+    [`local:${here}\\main.js`]: "// Corral panel old",
+    [`hermes:${dir}\\main.js`]: "// Corral panel new",
+  };
+  const h = harness({ windows: true, space: winSpace, home: "C:\\Users\\b\\.config\\herdr-app", files,
+                      info: winConfigured({ panel: { version: "9.0.0", dir, files: ["main.js"] } }) });
+  await h.settle();
+  await h.click("update-panel");
+  assert.deepEqual(h.calls.writes, [`${here}\\main.js`]);
+});
+
+test("Windows: an hwt error with Windows line endings reads cleanly", async () => {
+  const h = harness({ windows: true, space: winSpace, info: winConfigured(), hwt: { cleanup: { error: "refusing to clean up protected branch: fix" } } });
+  await h.settle();
+  await h.click("wt-x-0");
+  await h.click("delete");
+  assert.match(textOf(h.draw()), /refusing to clean up protected branch: fix(?!\r)/);
+  assert.doesNotMatch(textOf(h.draw()), /\r/);
+});
+
+test("a POSIX machine whose exec fails for another reason isn't taken for Windows", async () => {
+  const h = harness({ execError: "hc exec: cannot start hc: program not found", info: configured() });
+  await h.settle();
+  assert.deepEqual(h.calls.exec.map((e) => e.cmd), ["sh"], "no Python probes");
+  assert.match(textOf(h.draw()), /cannot start hc: program not found/);
+  h.panel.at = 0;
+  h.panel.tick(h.cx);
+  await h.settle();
+  assert.deepEqual(h.calls.exec.map((e) => e.cmd), ["sh", "sh"], "still tried as POSIX");
+});
+
+test("Windows: a Python too old is passed over for one that's new enough", async () => {
+  const h = harness({ windows: true, oldPythons: ["py"], pythons: ["python"], space: winSpace, info: winConfigured() });
+  await h.settle();
+  assert.deepEqual(h.calls.exec.map((e) => e.cmd), ["sh", "py", "python"]);
+  assert.equal(h.panel.st.python, WIN_PY);
+  assert.match(textOf(h.draw()), /New worktree of demo/i);
+});
+
+test("Windows: with only a Python too old, says Python 3.11+ is needed", async () => {
+  const h = harness({ windows: true, oldPythons: ["py"], pythons: [], probe: { hwt: "" }, space: winSpace });
+  await h.settle();
+  assert.match(textOf(h.draw()), /needs Python 3\.11\+ on hermes/);
+});
+
+// The Windows probe is Python: run it for real (any OS) against a repository
+// and the hwt.cmd install.py writes, with this checkout's hwt.py.
+test("the Windows probe script finds the repository and runs hwt through its hwt.cmd", async (t) => {
+  const python = process.platform === "win32" ? "python" : "python3";
+  let interpreter;
+  try { interpreter = execFileSync(python, ["-c", "import sys; print(sys.executable)"], { encoding: "utf8" }).trim(); }
+  catch { return t.skip(`no ${python}`); }
+  const probe = source.match(/const WIN_PROBE = `([\s\S]*?)`;/)[1];
+  const home = await mkdtemp(pjoin(tmpdir(), "corral-probe-"));
+  const repo = pjoin(home, "repos", "demo");
+  await mkdir(repo, { recursive: true });
+  execFileSync("git", ["init", "-q", repo]);
+  const hwtPy = new URL("../../hwt.py", import.meta.url);
+  const script = process.platform === "win32" ? hwtPy.pathname.replace(/^\//, "").replace(/\//g, "\\") : hwtPy.pathname;
+  await mkdir(pjoin(home, ".local", "bin"), { recursive: true });
+  await writeFile(pjoin(home, ".local", "bin", "hwt.cmd"), `@"${interpreter}" -X utf8 "${script}" %*\r\n`);
+  const git = execFileSync(python, ["-c", "import shutil; print(shutil.which('git'))"], { encoding: "utf8" }).trim();
+  const env = { ...process.env, HOME: home, USERPROFILE: home, PATH: pdirname(git) };
+  const out = execFileSync(interpreter, ["-c", probe, repo], { env, encoding: "utf8" }).replace(/\r\n/g, "\n");
+  const lines = Object.fromEntries(out.split("\n@@info\n")[0].split("\n").filter(Boolean).map((l) => [l.slice(0, l.indexOf("=")), l.slice(l.indexOf("=") + 1)]));
+  assert.equal(lines.os, "Windows");
+  assert.equal(lines.py, "1");
+  assert.equal(lines.git, "1");
+  assert.match(lines.common, /[\\/]repos[\\/]demo[\\/]\.git$/);
+  assert.deepEqual(JSON.parse(lines.run), [interpreter, "-X", "utf8", script]);
+  assert.equal(lines.version, `hwt ${VERSION}`);
+  assert.ok(out.includes("\n@@info\n"), "then hwt info's output");
 });
