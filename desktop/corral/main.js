@@ -5,15 +5,17 @@
 // It also names the tabs Corral starts (agent, shell, server): herdr-core
 // can't name tabs, so Corral labels their terminals corral.tab=<name>.
 
-import { View, div } from "gpui-kit";
+import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { exec, spaces, panes, focused, terminals, run, theme, notify, window, layout, settings } from "herdr";
+import { exec, spaces, panes, focused, terminals, run, theme, notify, window, layout, settings, shared, setShared } from "herdr";
 
 const RELEASE = "v1.2.0"; // the Corral release Install checks out
 const REPO = "https://github.com/bfreed/herdr-corral";
 const NEEDS = [1, 2, 0]; // the oldest hwt this panel works with
 const TAB_ORDER = ["agent", "shell", "server"];
 const REFRESH_MS = 15000; // ports and dev servers change on their own
+const RAIL = 40; // collapsed width
+const TOGGLE_ICON = "mods/workspace-chrome/sidebar.svg"; // Herdr's own sidebar toggle
 
 // A login shell, so the person's PATH (~/.local/bin) applies on every machine.
 const sh = (script, args, on, timeout) =>
@@ -49,6 +51,16 @@ const local = (id) => String(id).split("/").pop(); // remote ids carry a machine
 const inside = (p, dir) => p === dir || p.startsWith(dir + "/");
 const errorText = (r) => (r.stderr || r.stdout || "").trim().split("\n").filter(Boolean).slice(-3).join(" ").replace(/^hwt: /, "").slice(0, 400);
 
+// The layout block showing this panel (Herdr docks it with an id of its own).
+function blockOf(node) {
+  if (node?.content?.mod === "corral") return node;
+  for (const child of node?.children ?? []) {
+    const found = blockOf(child);
+    if (found) return found;
+  }
+  return null;
+}
+
 // Where a space is now: its first terminal's live folder, else where it was made.
 function place(s, paneList) {
   const tabs = new Set((s.tabs ?? []).map((c) => c.id));
@@ -62,7 +74,7 @@ export default class Corral extends View {
     this.at = 0;
     this.busy = ""; // what's running, for the person
     this.error = "";
-    this.confirming = false; // Clean up asks once more
+    this.deleting = null; // { path, branch, refused? }: a Clean up being confirmed
     this.base = null; // Set up's chosen base branch
     this.named = new Set(); // tab ids already named
     this.ordered = new Set(); // space ids already put in order
@@ -85,9 +97,9 @@ export default class Corral extends View {
     this.tidyTabs();
     const v = this.view();
     const key = v ? `${v.machine ?? ""}|${v.folder}` : "";
-    if (this.busy) return;
+    if (this.busy || this.collapsed()) return;
     if (key !== this.key || Date.now() - this.at > REFRESH_MS) {
-      if (key !== this.key) { this.error = ""; this.confirming = false; this.base = null; }
+      if (key !== this.key) { this.error = ""; this.deleting = null; this.base = null; }
       this.key = key;
       this.at = Date.now();
       if (v) this.refresh(cx, v, key);
@@ -136,7 +148,6 @@ export default class Corral extends View {
       try { await work(); }
       catch (e) { this.error = String(e?.message ?? e); }
       this.busy = "";
-      this.confirming = false;
       this.at = 0; // refresh now
       cx.notify();
     });
@@ -215,12 +226,44 @@ export default class Corral extends View {
     });
   }
 
-  cleanup(cx, info) {
-    if (!this.confirming) { this.confirming = true; return cx.notify(); }
-    this.act(cx, `Cleaning up ${info.branch}…`, async () => {
-      const out = await this.hwt(["cleanup", info.top], 300000);
-      notify({ title: "Corral", body: `Deleted ${out.local_branch_deleted} (${out.reason})`, level: "success" });
+  // Corral's merge-checked cleanup. When Corral keeps a branch for a reason
+  // its --abandon would override (unmerged commits, uncommitted changes), the
+  // panel says why and offers "Delete <branch> anyway" as a separate click.
+  cleanup(cx, c, abandon = false) {
+    this.act(cx, `${abandon ? "Deleting" : "Cleaning up"} ${c.branch}…`, async () => {
+      try {
+        const out = await this.hwt(["cleanup", c.path, ...(abandon ? ["--abandon", "--confirm", c.branch] : [])], 300000);
+        this.deleting = null;
+        notify({ title: "Corral", body: `Deleted ${out.local_branch_deleted} (${out.reason})`, level: "success" });
+      } catch (e) {
+        const message = String(e?.message ?? e);
+        if (abandon || !message.includes("--abandon")) { this.deleting = null; throw e; }
+        this.deleting = { path: c.path, branch: c.branch, refused: message.replace(/;?\s*rerun with --abandon.*$/, "").trim() };
+      }
     });
+  }
+
+  askDelete(cx, c) {
+    if (this.busy || !c.branch) return;
+    this.deleting = { path: c.path, branch: c.branch };
+    cx.notify();
+  }
+
+  // Collapsing narrows the panel's own layout block to a rail, as Herdr's sidebar does.
+  collapsed() {
+    return (blockOf(layout())?.size?.px ?? Infinity) < 120;
+  }
+
+  toggle() {
+    const block = blockOf(layout());
+    if (!block) return;
+    if (this.collapsed()) {
+      run("layout.resize", { id: block.id, px: shared("corral.width") ?? 260 });
+      this.at = 0; // catch up on what changed while folded
+    } else {
+      setShared("corral.width", block.size?.px ?? 260);
+      run("layout.resize", { id: block.id, px: RAIL });
+    }
   }
 
   startServer(cx, info) {
@@ -296,6 +339,35 @@ export default class Corral extends View {
       .children(children);
   }
 
+  toggleButton(id, tip) {
+    const t = theme();
+    return div().id(id).size(24).flex_none().flex().items_center().justify_center().rounded(5).cursor_pointer()
+      .text_color(t.dim).hover((s) => s.bg(t.hover).text_color(t.foreground)).tooltip(tip)
+      .on_click(() => this.toggle()).child(svg(TOGGLE_ICON).size(15));
+  }
+
+  // The confirm (or the refusal and "Delete anyway") under a worktree being cleaned up.
+  deleteBox(c, base) {
+    const t = theme();
+    const d = this.deleting;
+    if (!d || d.path !== c.path) return null;
+    const cancel = this.button("delete-cancel", "Cancel", (cx) => { this.deleting = null; cx.notify(); });
+    const box = v_flex().gap(6).p(8).rounded(5).border(1).border_color(t.blocked);
+    if (d.refused) {
+      return box
+        .child(this.note(`Corral kept ${d.branch}: ${d.refused}.`, t.foreground))
+        .child(this.note("Delete anyway also deletes its uncommitted changes and the commits only it has. This can't be undone."))
+        .child(h_flex().gap(6).flex_wrap()
+          .child(this.button("delete-anyway", `Delete ${d.branch} anyway`, (cx) => this.cleanup(cx, c, true), { danger: true }))
+          .child(cancel));
+    }
+    return box
+      .child(this.note(`Deletes the worktree and the branch ${d.branch}, here and on the remote. Only if it's merged into ${base} (or has nothing of its own) and has no uncommitted changes; otherwise Corral keeps it and says why.`))
+      .child(h_flex().gap(6).flex_wrap()
+        .child(this.button("delete", "Delete worktree and branch", (cx) => this.cleanup(cx, c), { danger: true }))
+        .child(cancel));
+  }
+
   dot(on) {
     const t = theme();
     return div().w(7).h(7).flex_none().rounded(4).bg(on ? t.working : t.border);
@@ -308,15 +380,20 @@ export default class Corral extends View {
     if (linked.length === 0) return [this.note("No worktrees yet.")];
     return linked.map((c, i) => {
       const there = this.spaceFor(c.path, all, machine);
-      const current = info.top === c.path;
-      return h_flex().id(`wt-${i}`).h(26).px(6).gap(6).items_center().rounded(5).cursor_pointer()
+      const current = info.top === c.path; // its Clean up is in "This worktree"
+      const box = current ? null : this.deleteBox(c, info.base_branch);
+      const row = h_flex().id(`wt-${i}`).h(26).px(6).gap(6).items_center().rounded(5).cursor_pointer()
         .when(current, (el) => el.bg(t.selected))
         .when(!current, (el) => el.hover((s) => s.bg(t.hover)))
         .on_click((_e, cx) => this.open(cx, c, all))
         .child(this.dot(c.listening))
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(c.branch ?? basename(c.path)))
         .when(Boolean(c.port), (el) => el.child(div().flex_none().text_size(11).text_color(t.dim).child(String(c.port))))
-        .when(Boolean(there) && !current, (el) => el.child(div().flex_none().text_size(11).text_color(t.accent).child("open")));
+        .when(Boolean(there) && !current, (el) => el.child(div().flex_none().text_size(11).text_color(t.accent).child("open")))
+        .when(Boolean(c.branch) && !current, (el) => el.child(div().id(`wt-x-${i}`).px(3).flex_none().text_color(t.dim)
+          .cursor_pointer().hover((s) => s.text_color(t.blocked)).tooltip("Clean up…")
+          .on_click((_e, cx) => { cx.stop_propagation(); this.askDelete(cx, c); }).child("×")));
+      return v_flex().gap(4).child(row).when(Boolean(box), (el) => el.child(box));
     });
   }
 
@@ -380,9 +457,9 @@ export default class Corral extends View {
         h_flex().gap(6).flex_wrap()
           .when(info.dev_command && !me.listening, (el) => el.child(this.button("dev", "Start dev server", (cx) => this.startServer(cx, info))))
           .when(!info.dev_command, (el) => el.child(this.button("more", "More settings…", () => this.settings(info))))
-          .child(this.button("cleanup", this.confirming ? "Delete worktree and branch" : "Clean up…", (cx) => this.cleanup(cx, info), { danger: this.confirming }))
-          .when(this.confirming, (el) => el.child(this.button("keep", "Cancel", (cx) => { this.confirming = false; cx.notify(); }))),
-        this.confirming ? this.note(`Only if ${info.branch} is merged into ${info.base_branch} (or has nothing of its own) and has no uncommitted changes. Otherwise Corral keeps it and says why.`) : div()));
+          .when(this.deleting?.path !== info.top && Boolean(info.branch), (el) =>
+            el.child(this.button("cleanup", "Clean up…", (cx) => this.askDelete(cx, { path: info.top, branch: info.branch })))),
+        this.deleteBox({ path: info.top, branch: info.branch }, info.base_branch) ?? div()));
     } else {
       parts.push(this.section(`New worktree of ${name}`,
         Input.new(this.input).h(28).px(8).items_center().rounded(5).border(1).border_color(t.input).bg(t.background).text_color(t.foreground).text_size(12.5),
@@ -406,12 +483,18 @@ export default class Corral extends View {
   render() {
     const t = theme();
     const v = this.view();
+    if (this.collapsed()) {
+      // Below macOS's window buttons, which sit over this corner.
+      return v_flex().id("corral").size_full().bg(t.chrome).items_center().pt(this.lightsPadding() ? 40 : 8)
+        .child(this.toggleButton("expand", "Show Corral"));
+    }
     return v_flex().id("corral").size_full().bg(t.chrome).p(10).gap(12).overflow_y_scroll()
       .child(h_flex().gap(6).items_center().pl(this.lightsPadding())
         .child(div().flex_1().font_semibold().text_size(13).text_color(t.foreground).child("Corral"))
         .child(div().text_size(11).text_color(t.dim).child(v ? (v.machine ?? "this computer") : ""))
         .child(div().id("refresh").px(4).cursor_pointer().text_color(t.dim).hover((s) => s.text_color(t.foreground))
-          .on_click((_e, cx) => { this.at = 0; this.tick(cx); }).child("↻")))
+          .on_click((_e, cx) => { this.at = 0; this.tick(cx); }).child("↻"))
+        .child(this.toggleButton("collapse", "Hide Corral")))
       .when(!v, (el) => el.child(this.note("Open a space to use Corral.")))
       .when(Boolean(v), (el) => el.children(this.body(v)))
       .when(Boolean(this.busy), (el) => el.child(h_flex().gap(6).items_center().text_size(12).text_color(t.muted)
