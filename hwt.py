@@ -651,13 +651,17 @@ def serve_snapshot() -> dict[str, Any] | None:
     if not status or status.returncode or not serve or serve.returncode:
         return None
     try:
-        dns = (json.loads(status.stdout).get("Self") or {}).get("DNSName", "").rstrip(".")
+        info = json.loads(status.stdout)
+        dns = (info.get("Self") or {}).get("DNSName", "").rstrip(".")
         config = json.loads(serve.stdout or "{}") or {}
     except (json.JSONDecodeError, AttributeError):
         return None
     if not dns:
         return None
-    return {"dns": dns, "tcp": config.get("TCP") or {}, "web": config.get("Web") or {}}
+    # No cert domains: the tailnet hasn't enabled HTTPS certificates, and
+    # `tailscale serve` would wait for someone to approve that in a browser.
+    certs = bool(info.get("CertDomains"))
+    return {"dns": dns, "certs": certs, "tcp": config.get("TCP") or {}, "web": config.get("Web") or {}}
 
 
 def serve_target(port: int) -> str:
@@ -692,6 +696,10 @@ def ensure_https(cfg: dict[str, Any], port: int) -> str | None:
         return None
     if served_by_corral(snapshot, hp) == port:
         return https_url(snapshot, hp)
+    if not snapshot["certs"]:
+        log("warning: [https] is on, but this tailnet hasn't enabled HTTPS certificates "
+            "(admin console: DNS -> HTTPS Certificates); the dev server is HTTP only")
+        return None
     if str(hp) in snapshot["tcp"]:
         log(f"warning: Tailscale Serve already uses port {hp} for something else; leaving it alone "
             f"(the dev server on {port} is HTTP only)")
@@ -3186,8 +3194,10 @@ def cmd_doctor(args,cfg,state):
     stale_https = []
     if https_settings(cfg):
         snapshot = serve_snapshot()
-        checks.append({"check": "https:tailscale", "ok": snapshot is not None,
-                       "value": snapshot["dns"] if snapshot else "tailscale CLI missing or not running"})
+        checks.append({"check": "https:tailscale", "ok": bool(snapshot and snapshot["certs"]),
+                       "value": (snapshot["dns"] if snapshot["certs"] else
+                                 f"{snapshot['dns']}: HTTPS certificates not enabled for the tailnet")
+                                if snapshot else "tailscale CLI missing or not running"})
         stale_https = orphan_https(cfg, state) if snapshot else []
     orphans = [{k: p[k] for k in ("pid", "command", "cwd", "ports")} for p in orphan_servers(cfg)]
     print(json.dumps({"ok":all(x["ok"] for x in checks),"update":update,"checks":checks,

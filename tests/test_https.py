@@ -20,15 +20,17 @@ def done(stdout: str = "", code: int = 0, stderr: str = "") -> subprocess.Comple
 
 class FakeTailscale:
     """The tailscale CLI over an in-memory Serve config."""
-    def __init__(self, web: dict | None = None, fail_serve: str | None = None):
+    def __init__(self, web: dict | None = None, fail_serve: str | None = None, certs: bool = True):
         self.web = dict(web or {})
+        self.certs = certs
         self.fail_serve = fail_serve
         self.calls: list[tuple[str, ...]] = []
 
     def __call__(self, *args: str, timeout: float = 20.0):
         self.calls.append(args)
         if args[0] == "status":
-            return done(json.dumps({"Self": {"DNSName": DNS + "."}}))
+            return done(json.dumps({"Self": {"DNSName": DNS + "."},
+                                    "CertDomains": [DNS] if self.certs else None}))
         if args[:2] == ("serve", "status"):
             tcp = {key.rpartition(":")[2]: {"HTTPS": True} for key in self.web}
             return done(json.dumps({"TCP": tcp, "Web": self.web} if self.web else {}))
@@ -94,6 +96,13 @@ class EnsureHttpsTests(unittest.TestCase):
         with mock.patch.object(hwt, "tailscale", return_value=None), mock.patch.object(hwt, "log") as log:
             self.assertIsNone(hwt.ensure_https(ON, 4120))
         self.assertIn("HTTP only", log.call_args[0][0])
+
+    def test_without_tailnet_certificates_it_warns_without_waiting_on_serve(self):
+        ts = FakeTailscale(certs=False)
+        with mock.patch.object(hwt, "tailscale", ts), mock.patch.object(hwt, "log") as log:
+            self.assertIsNone(hwt.ensure_https(ON, 4120))
+        self.assertEqual(ts.changes(), [])
+        self.assertIn("HTTPS certificates", log.call_args[0][0])
 
     def test_denied_serve_suggests_the_operator_fix(self):
         ts = FakeTailscale(fail_serve="Access denied: serve config denied")
