@@ -68,5 +68,7 @@ jobs:
           Set-Content -Path "$stub\herdr-app.cmd" -Value "@echo no Herdr window 1>&2`r`n@exit /b 1"
           $env:PATH = "$stub;$env:PATH"
           Get-Content desktop\install.ps1 -Raw | Invoke-Expression *>&1 | Tee-Object -Variable out
-          if (-not ((Get-Content "$env:HERDR_APP_HOME\mods\corral\main.js" -TotalCount 1) -like "// Corral panel*")) { exit 1 }
-          if (-not ($out -match "herdr-app do layout.clone --name main --as main-corral")) { exit 1 }
+          if (-not ((Get-Content "$env:HERDR_APP_HOME\mods\corral\main.js" -TotalCount 1) -like "// Corral panel*")) { throw "main.js wasn't installed" }
+          if (-not ($out -match "herdr-app do layout.clone --name main --as main-corral")) { throw "no layout.clone instruction" }
+          # The stub's exit code is still in $LASTEXITCODE, which the runner would report.
+          exit 0
