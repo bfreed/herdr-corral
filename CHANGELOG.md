@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.4 — 2026-11-05
+
+- **`hwt doctor` crashed right after installing when no repositories were found.** If `--repos-root` (default `~/repos`) has no clones directly inside it, `install.py` writes a config with no `[repositories]` table. `hwt doctor`, the installer's suggested next step, then failed with `KeyError: 'repositories'`, and `hwt info` (the Desktop panel's view) did too. A config without repositories is now valid. `doctor` says to run `hwt init` inside a repository or `hwt add <path>`, and the installer warns when it found no repositories and says how to point it at the right folder.
+
 ## 1.4.3 — 2026-11-05
 
 - **No traceback when a question gets no input.** Windows counts `NUL` as a terminal, so `hwt cleanup <name> < NUL` with an ambiguous name asked which worktree, got end-of-input, and crashed with an `EOFError` traceback (nothing was deleted). The number prompt now treats end-of-input as no terminal ("re-run with one of the listed names or paths"), and any other question that gets none ends hwt with a message and exit code 2.

@@ -671,6 +671,10 @@ def main() -> int:
     print(f"Installed the hwt launcher at {launcher} (running from {source})")
     print(f"Configuration: {config} ({config_result})")
     print(f"Discovered repositories: {', '.join(name for name, _, _ in repos) or '(none)'}")
+    if not repos and config_result != "preserved existing configuration":
+        print(f"warning: no Git repositories directly under {repos_root}; rerun with "
+              "--repos-root <the folder holding your clones> --force-config, or run "
+              "'hwt init' inside a repository", file=sys.stderr)
     if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
         if WINDOWS and add_to_user_path(bin_dir):
             print(f"Added {bin_dir} to your user PATH; open a new terminal to use hwt")

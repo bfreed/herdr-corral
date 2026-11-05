@@ -49,7 +49,7 @@ class SafetyError(WorkflowError):
 
 WINDOWS = os.name == "nt"  # patched in tests; never patch os.name (pathlib reads it)
 
-__version__ = "1.4.3"
+__version__ = "1.4.4"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -243,6 +243,8 @@ def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
             overlay = read_toml(extra)
             for name, repo in overlay.get("repositories", {}).items():
                 cfg.setdefault("repositories", {})[name] = repo
+    # The installer writes no [repositories] table when it found none.
+    cfg.setdefault("repositories", {})
     for key in ("canonical_root", "worktree_root"):
         if key not in cfg:
             raise WorkflowError(f"missing configuration key: {key}")
@@ -3543,6 +3545,8 @@ def cmd_doctor(args,cfg,state):
         log(f"{len(orphans)} process(es) still running from deleted worktrees; run: hwt reap")
     if stale_https:
         log(f"{len(stale_https)} HTTPS mapping(s) left from released ports; run: hwt reap")
+    if not cfg["repositories"]:
+        log("No repositories are configured yet; run 'hwt init' inside one, or 'hwt add <path>'")
     if update["update_available"]:
         log(f"Update available ({__version__} -> {latest}); run: hwt update")
     if not all(x["ok"] for x in checks): raise SystemExit(1)
