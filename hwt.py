@@ -49,7 +49,7 @@ class SafetyError(WorkflowError):
 
 WINDOWS = os.name == "nt"  # patched in tests; never patch os.name (pathlib reads it)
 
-__version__ = "1.4.2"
+__version__ = "1.4.3"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -3056,9 +3056,14 @@ def choose_indexed(lines: list[str], count: int, header: str | None) -> int:
         log(f"{header}:")
     for line in lines:
         log(line)
+    no_terminal = WorkflowError("re-run with one of the listed names or paths as the target")
     if not sys.stdin.isatty():
-        raise WorkflowError("re-run with one of the listed names or paths as the target")
-    answer = input("Number (Enter cancels): ").strip()
+        raise no_terminal
+    try:
+        answer = input("Number (Enter cancels): ").strip()
+    except EOFError:
+        # Windows counts NUL as a terminal: `< NUL` gets here, with no input.
+        raise no_terminal from None
     if not answer:
         raise WorkflowError("cancelled")
     try:
@@ -3689,6 +3694,9 @@ def main(argv: list[str] | None=None) -> int:
         return 0
     except WorkflowError as exc:
         print(f"hwt: {exc}",file=sys.stderr); return 2
+    except EOFError:
+        # A question got no answer: stdin ended (on Windows, `< NUL` counts as a terminal).
+        print("\nhwt: stopped at a question that got no answer (input ended)", file=sys.stderr); return 2
 
 
 if __name__=="__main__": raise SystemExit(main())

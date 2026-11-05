@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.3 — 2026-11-05
+
+- **No traceback when a question gets no input.** Windows counts `NUL` as a terminal, so `hwt cleanup <name> < NUL` with an ambiguous name asked which worktree, got end-of-input, and crashed with an `EOFError` traceback (nothing was deleted). The number prompt now treats end-of-input as no terminal ("re-run with one of the listed names or paths"), and any other question that gets none ends hwt with a message and exit code 2.
+
 ## 1.4.2 — 2026-11-05
 
 Two cleanup fixes from re-testing 1.4.1 on Windows.

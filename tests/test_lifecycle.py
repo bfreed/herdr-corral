@@ -188,6 +188,23 @@ class ResumedCleanupTests(Project):
         self.assertFalse(self.has_branch())
         self.assertTrue(Path(live["path"]).is_dir())
 
+    def test_an_ambiguous_name_with_input_from_nul_says_so_without_a_traceback(self):
+        # Windows counts NUL as a terminal: `hwt cleanup x < NUL` asks, and gets EOF.
+        live = self.other_repo_with_the_same_branch()
+        with mock.patch.object(hwt, "remove_checkout", side_effect=self.fail_like_windows):
+            with self.assertRaises(hwt.WorkflowError):
+                hwt.cleanup_worktree_item(self.cfg, self.state, mock.Mock(), self.item(),
+                                          abandon=False, confirm=None)
+        args = type("Args", (), {"target": self.branch, "abandon": False, "confirm": None})()
+        with mock.patch.object(hwt, "configured_worktree_items", return_value=[live]), \
+                mock.patch.object(hwt.sys.stdin, "isatty", return_value=True), \
+                mock.patch("builtins.input", side_effect=EOFError), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaisesRegex(hwt.WorkflowError, "re-run with one of the listed names or paths"):
+                hwt.cmd_cleanup(args, self.cfg, self.state, mock.Mock())
+        self.assertTrue(self.has_branch())
+        self.assertTrue(Path(live["path"]).is_dir())
+
     def test_a_retry_closes_the_worktrees_own_workspace_first(self):
         with mock.patch.object(hwt, "remove_checkout", side_effect=self.fail_like_windows):
             with self.assertRaises(hwt.WorkflowError):
@@ -391,6 +408,18 @@ class UpdateTests(unittest.TestCase):
         git(self.origin, "commit", "-q", "-am", "1.4.0")
         self.assertEqual(self.update()["version"], "1.4.0")
         self.assertEqual(git(self.clone, "branch", "--show-current"), "main")
+
+
+class NoAnswerTests(unittest.TestCase):
+    def test_a_question_that_gets_no_answer_ends_hwt_with_a_message(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(hwt, "load_config", return_value={"repositories": {}}), \
+                mock.patch.object(hwt, "runtime_state_dir", return_value=Path(tmp)), \
+                mock.patch.object(hwt, "cmd_init", side_effect=EOFError), \
+                contextlib.redirect_stderr(io.StringIO()) as said:
+            self.assertEqual(hwt.main(["--frontend", "tui", "init", "demo"]), 2)
+        self.assertIn("stopped at a question that got no answer", said.getvalue())
+        self.assertNotIn("Traceback", said.getvalue())
 
 
 class ConfigErrorTests(unittest.TestCase):
