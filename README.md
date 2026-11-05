@@ -4,6 +4,7 @@ Herd your Git worktrees in [Herdr](https://herdr.dev). Corral is a Herdr plugin 
 
 - **New worktree, ready to work.** Creating a worktree copies your untracked `.env` / `.env.*` files, sets up dependencies (copy-on-write clone of the main checkout's `node_modules` when lockfiles match — near-instant on btrfs/XFS/APFS — otherwise an install via the lockfile-detected package manager), and opens exactly three tabs: `agent` (your coding agent, started automatically), `shell`, and `server`.
 - **Stable dev ports.** Every worktree leases a port from a configured range (default 4100–4199), so parallel dev servers never collide and URLs stay predictable.
+- **HTTPS dev URLs over Tailscale, optionally started for you.** With `[https] provider = "tailscale"`, each leased port is also served at `https://<machine>.<tailnet>.ts.net:<port + 1000>` with a real certificate, so browser APIs that need a secure context work from any computer on your tailnet. With `start_dev = true`, a new worktree's dev server starts by itself. See [HTTPS dev servers](#https-dev-servers).
 - **Merge-safe cleanup.** `hwt cleanup` deletes the worktree, the local branch, and the remote branch — without questions when the branch is provably merged into your base branch, and only with an explicit `--abandon --confirm BRANCH` when it is not.
 - **Agent-first.** Built for running one coding agent per worktree (Hermes, Claude Code, Codex, …) with isolated checkouts.
 
@@ -101,6 +102,25 @@ TUI and Desktop work side by side; there's nothing to switch. `hwt` drives which
 
 Panel tests: `node --test desktop/tests/panel.test.mjs`. Check it as Herdr loads it: `herdr-app check ~/.config/herdr-app/mods/corral`. The panel ships as the same version as `hwt` (a test checks); `desktop/corral/` is laid out for Herdr's mod gallery (`RECIPE.md`, `preview.png`, `mods/corral/`).
 
+## HTTPS dev servers
+
+Opened from another computer as `http://<machine>:<port>`, a dev server isn't a [secure context](https://developer.mozilla.org/en-US/docs/Web/Security/Secure_Contexts). The browser then withholds Web Locks, service workers, the clipboard API, `crypto.subtle` and more, and apps that depend on them break. Only `http://localhost` is exempt. If Herdr runs on a machine in your [Tailscale](https://tailscale.com) tailnet, Corral can serve every worktree over HTTPS:
+
+```toml
+# ~/.config/herdr-corral/config.toml (top-level keys go before the first [table])
+start_dev = true          # start hwt dev in the server tab of each new worktree
+
+[https]
+provider = "tailscale"    # default "off"
+port_offset = 1000        # HTTPS port = leased port + 1000 (4120 -> 5120)
+```
+
+- **When a port is leased** (`hwt new`, `hwt open`, Herdr's own new-worktree dialog, `hwt dev`), Corral runs `tailscale serve --bg --https=<port+1000> http://127.0.0.1:<port>`. The URL `https://<machine>.<tailnet>.ts.net:<port+1000>` goes in the output of `hwt new` and `hwt status`, in the server tab, in `$HWT_HTTPS_URL` and `$HWT_REMOTE_URL`, and in the Corral panel. It uses the tailnet's own certificate and is reachable from the tailnet only (it is not Funnel). Vite's HMR websocket follows the page's origin, so live reload works through it.
+- **It needs its own port.** Serve listens on the machine's Tailscale address, which a dev server bound to `0.0.0.0` already holds on its own port. That's why the HTTPS port is offset. The dev server must answer on `127.0.0.1`, which servers bound to `0.0.0.0` or `127.0.0.1` do. If your framework checks the Host header (Vite's `server.allowedHosts`), allow the `*.ts.net` name.
+- **Cleanup** (`hwt cleanup`, `hwt remove`, deleting a worktree in Herdr) removes the mapping with the lease. `hwt doctor` reports mappings left by released ports and `hwt reap` removes them. Corral only adds or removes a mapping that is exactly its own (one `/` proxy to `127.0.0.1:<leased port>` at the offset). It leaves anything else you serve alone, and says so if one is in the way.
+- **Setup, once:** HTTPS certificates must be enabled for the tailnet (admin console → DNS → HTTPS Certificates). On Linux your user must be allowed to change Serve without sudo: `sudo tailscale set --operator=$USER`. Without either, Corral warns and keeps serving HTTP, and nothing fails.
+- **Starting the dev server:** with `start_dev` (global, or per repository to override it) and a configured dev command, Corral types `hwt dev` into a server tab it just opened, after dependencies are installed. It skips this when the install failed or the port is already in use, and reopening a worktree never starts a second server.
+
 ## Keybindings
 
 Herdr's sidebar right-click menu is not extensible by plugins (as of 0.8.0 the plugin manifest's `contexts` field is parsed but not used by any UI — verified against the Herdr source), so Corral's interactive surface is the palette popup plus keybindings. Add to `~/.config/herdr/config.toml` and run `herdr server reload-config`:
@@ -127,7 +147,7 @@ Pick any free keys; the install agent offers to set this up. To try it without a
 - `~/.config/herdr-corral/config.toml` — global settings and discovered repositories.
 - `~/.config/herdr-corral/repos.d/<repo>.toml` — per-repository overlays written by `hwt init`.
 
-The first time you create a worktree for a repository, Corral offers to configure it (which env files to copy, whether to auto-install dependencies, the dev-server command). Repositories without explicit settings get safe defaults: copy untracked `.env` / `.env.*`, auto-detect the package manager, no dev server assumed, never a test tab, never an auto-started server.
+The first time you create a worktree for a repository, Corral offers to configure it (which env files to copy, whether to auto-install dependencies, the dev-server command). Repositories without explicit settings get safe defaults: copy untracked `.env` / `.env.*`, auto-detect the package manager, no dev server assumed, never a test tab, and no auto-started server unless you set `start_dev`.
 
 **Worktree placement — unified by default:** Herdr's right-click "new worktree" and `hwt new` should create worktrees in the same place. Out of the box they do: `worktree_placement = "shared-root"` with `worktree_root` defaulting to `~/.herdr/worktrees` — the same directory Herdr's own `[worktrees].directory` uses — so both entry points produce `<root>/<repo>/<slug>` checkouts, and either kind gets the full bootstrap and `hwt cleanup` support. Prefer a visible location? Set Herdr's `[worktrees].directory` (in `~/.config/herdr/config.toml`, then `herdr server reload-config`) and Corral's `worktree_root` to the same folder. The workmux-style `worktree_placement = "sibling"` (`<repo>__worktrees/` next to each repo) remains available for `hwt new`, but note Herdr's own dialog can't follow a per-repo layout; Corral recognizes and bootstraps all of these locations regardless.
 

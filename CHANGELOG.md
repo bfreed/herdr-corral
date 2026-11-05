@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.0 — 2026-11-05
+
+- **HTTPS dev servers over Tailscale.** From another computer, `http://<machine>:<port>` isn't a secure context, so browsers withhold Web Locks, service workers, the clipboard API and `crypto.subtle`, and apps that need them break. With `[https] provider = "tailscale"`, each leased port P is also served at `https://<machine>.<tailnet>.ts.net:<P + 1000>` (`tailscale serve`, tailnet only, real certificate). The mapping is made when the port is leased (`hwt new`, `hwt open`, Herdr's own new-worktree dialog, `hwt dev`) and removed with the lease (`cleanup`, `remove`, Herdr's delete). That HTTPS URL is now the `dev_url` in `hwt new`, `hwt info` and the panel, and `HWT_REMOTE_URL` in the tabs. `HWT_HTTPS_URL` is new, and `hwt status` lists it. Corral only touches mappings that are exactly its own. `hwt doctor` reports mappings left by released ports and `hwt reap` removes them. Without Tailscale, or without permission to change Serve, it warns and stays on HTTP.
+- **`start_dev`.** With `start_dev = true` (global, or per repository to override it) and a dev command, a new worktree's server tab runs `hwt dev` once dependencies are in place. It doesn't run after a failed install, when the port is already serving, or when the worktree is reopened.
+- `hwt dev` prints the URL it serves at. `install.py` takes `--https tailscale` and `--start-dev`, and a new config has both settings with comments.
+
 ## 1.3.0 — 2026-11-05
 
 - **Windows.** Corral runs on Windows 10/11, both as the computer running Herdr Desktop's window and as the machine a space runs on, and with the Herdr TUI. Linux and macOS behave as before.

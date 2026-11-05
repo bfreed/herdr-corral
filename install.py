@@ -80,7 +80,8 @@ def discover_repositories(root: Path, exclude: Path | None = None) -> list[tuple
 
 def render_config(repos_root: Path, worktree_root: Path, repos: list[tuple[str, Path, str]],
                   dev_host: str, remote_host: str, agent_kind: str,
-                  placement: str = "shared-root", frontend: str = "tui") -> str:
+                  placement: str = "shared-root", frontend: str = "tui",
+                  https: str = "off", start_dev: bool = False) -> str:
     lines = [
         f"canonical_root = {quote(str(repos_root.resolve()))}",
         f"worktree_root = {quote(str(worktree_root.resolve()))}",
@@ -95,10 +96,21 @@ def render_config(repos_root: Path, worktree_root: Path, repos: list[tuple[str, 
         f"worktree_placement = {quote(placement)}",
         '# "tui": Herdr TUI (the plugin). "desktop": Herdr Desktop, through herdr-core (hc).',
         f"frontend = {quote(frontend)}",
+        "# Start each new worktree's dev server (hwt dev) in its server tab, once",
+        "# dependencies are in place. Repositories can override it with start_dev.",
+        f"start_dev = {'true' if start_dev else 'false'}",
         "",
         "[ports]",
         "start = 4100",
         "end = 4199",
+        "",
+        "# Browsers allow some APIs (Web Locks, service workers, clipboard,",
+        "# crypto.subtle) only over HTTPS or on localhost. \"tailscale\" also serves each",
+        "# dev port P at https://<machine>.<tailnet>.ts.net:<P + port_offset> with the",
+        "# tailnet's certificate (tailscale serve); \"off\" serves HTTP only.",
+        "[https]",
+        f"provider = {quote(https)}",
+        "port_offset = 1000",
         "",
         "# Repositories without an explicit `files` list get untracked .env / .env.*",
         "# files copied into new worktrees, and dependencies default to policy",
@@ -572,6 +584,10 @@ def main() -> int:
                         default="shared-root")
     parser.add_argument("--dev-host", default="127.0.0.1")
     parser.add_argument("--remote-host", default="")
+    parser.add_argument("--https", choices=("off", "tailscale"), default="off",
+                        help="serve dev ports over HTTPS on the tailnet (tailscale serve)")
+    parser.add_argument("--start-dev", action="store_true",
+                        help="start a new worktree's dev server automatically")
     parser.add_argument("--agent-kind", default="hermes",
                         help="agent started in the 'agent' tab (default: hermes)")
     parser.add_argument("--force-config", action="store_true")
@@ -640,7 +656,8 @@ def main() -> int:
         config.write_text(render_config(repos_root, worktree_root, repos,
                                         args.dev_host, args.remote_host, args.agent_kind,
                                         args.worktree_placement,
-                                        "desktop" if args.desktop else "tui"), encoding="utf-8")
+                                        "desktop" if args.desktop else "tui",
+                                        args.https, args.start_dev), encoding="utf-8")
         config.chmod(0o600)
         config_result = f"configured {len(repos)} repositories"
 

@@ -49,7 +49,7 @@ class SafetyError(WorkflowError):
 
 WINDOWS = os.name == "nt"  # patched in tests; never patch os.name (pathlib reads it)
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -588,10 +588,171 @@ def allocate_port(state_dir: Path, worktree: str, start: int, end: int,
     raise WorkflowError(f"no available development port in {start}-{end}")
 
 
-def release_port(state_dir: Path, worktree: str) -> None:
+def release_port(state_dir: Path, worktree: str, cfg: dict[str, Any] | None = None) -> None:
+    """Return a worktree's port to the pool, and with `cfg`, stop serving it over HTTPS."""
     key = str(Path(worktree).resolve())
     with locked_json(state_dir, "ports") as leases:
-        leases.pop(key, None)
+        port = leases.pop(key, None)
+    if cfg is not None and port is not None:
+        stop_https(cfg, int(port))
+
+
+# HTTPS over Tailscale Serve. Browsers allow some APIs (Web Locks, service
+# workers, clipboard, crypto.subtle...) only in a secure context: https, or
+# http://localhost. A dev server opened at http://<machine>:<port> from another
+# computer gets none of them. With [https] provider = "tailscale", each leased
+# port P is also served at https://<machine>.<tailnet>.ts.net:<P + offset>,
+# with the tailnet's real certificate. Serve listens only on the Tailscale
+# address, so the HTTPS port can't share P with a server bound to 0.0.0.0.
+HTTPS_PORT_OFFSET = 1000
+
+
+def https_settings(cfg: dict[str, Any]) -> dict[str, Any] | None:
+    """[https] when it is on, else None."""
+    https = cfg.get("https") or {}
+    provider = str(https.get("provider", "off")).lower()
+    if provider == "off":
+        return None
+    if provider != "tailscale":
+        raise WorkflowError(f"unknown [https] provider: {provider!r} (use \"tailscale\" or \"off\")")
+    return {"provider": provider, "port_offset": int(https.get("port_offset", HTTPS_PORT_OFFSET))}
+
+
+def https_port(cfg: dict[str, Any], port: int) -> int | None:
+    settings = https_settings(cfg)
+    return port + settings["port_offset"] if settings else None
+
+
+def tailscale_binary() -> str | None:
+    found = shutil.which("tailscale")
+    if found:
+        return found
+    app = Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale")  # macOS app without the CLI linked
+    return str(app) if app.is_file() else None
+
+
+def tailscale(*args: str, timeout: float = 20.0) -> subprocess.CompletedProcess[str] | None:
+    """The tailscale CLI's result; None when it is missing or doesn't answer in
+    time (`serve` waits indefinitely when the tailnet hasn't enabled HTTPS)."""
+    binary = tailscale_binary()
+    if not binary:
+        return None
+    try:
+        return subprocess.run([binary, *args], text=True, encoding="utf-8", errors="replace",
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def serve_snapshot() -> dict[str, Any] | None:
+    """This machine's tailnet name and Serve config, or None without Tailscale."""
+    status = tailscale("status", "--self", "--peers=false", "--json", timeout=10)
+    serve = tailscale("serve", "status", "--json", timeout=10)
+    if not status or status.returncode or not serve or serve.returncode:
+        return None
+    try:
+        info = json.loads(status.stdout)
+        dns = (info.get("Self") or {}).get("DNSName", "").rstrip(".")
+        config = json.loads(serve.stdout or "{}") or {}
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    if not dns:
+        return None
+    # No cert domains: the tailnet hasn't enabled HTTPS certificates, and
+    # `tailscale serve` would wait for someone to approve that in a browser.
+    certs = bool(info.get("CertDomains"))
+    return {"dns": dns, "certs": certs, "tcp": config.get("TCP") or {}, "web": config.get("Web") or {}}
+
+
+def serve_target(port: int) -> str:
+    return f"http://127.0.0.1:{port}"
+
+
+def served_by_corral(snapshot: dict[str, Any], https_port_: int) -> int | None:
+    """The dev port an HTTPS port forwards to, when it is exactly Corral's
+    mapping (a single "/" proxy to 127.0.0.1); None for anything else."""
+    handlers = (snapshot["web"].get(f"{snapshot['dns']}:{https_port_}") or {}).get("Handlers") or {}
+    proxy = (handlers.get("/") or {}).get("Proxy", "") if len(handlers) == 1 else ""
+    prefix = "http://127.0.0.1:"
+    if not (proxy.startswith(prefix) and proxy[len(prefix):].isdigit()):
+        return None
+    return int(proxy[len(prefix):])
+
+
+def https_url(snapshot: dict[str, Any], https_port_: int) -> str:
+    return f"https://{snapshot['dns']}:{https_port_}"
+
+
+def ensure_https(cfg: dict[str, Any], port: int) -> str | None:
+    """Serve a leased port over HTTPS and return its URL. Never fails a caller:
+    without Tailscale, or when the HTTPS port is taken, it warns and returns None."""
+    hp = https_port(cfg, port)
+    if hp is None:
+        return None
+    snapshot = serve_snapshot()
+    if snapshot is None:
+        log("warning: [https] is on, but Tailscale isn't running or its CLI isn't on PATH; "
+            "the dev server is HTTP only")
+        return None
+    if served_by_corral(snapshot, hp) == port:
+        return https_url(snapshot, hp)
+    if not snapshot["certs"]:
+        log("warning: [https] is on, but this tailnet hasn't enabled HTTPS certificates "
+            "(admin console: DNS -> HTTPS Certificates); the dev server is HTTP only")
+        return None
+    if str(hp) in snapshot["tcp"]:
+        log(f"warning: Tailscale Serve already uses port {hp} for something else; leaving it alone "
+            f"(the dev server on {port} is HTTP only)")
+        return None
+    result = tailscale("serve", "--bg", f"--https={hp}", serve_target(port))
+    if result is None or result.returncode:
+        detail = ((result.stderr or result.stdout).strip().splitlines() or [""])[0][:200] if result else \
+            "no answer (is HTTPS enabled for the tailnet? https://login.tailscale.com/admin/dns)"
+        hint = ""
+        if "access denied" in detail.lower() or "permission" in detail.lower():
+            hint = "; allow it once with: sudo tailscale set --operator=$USER"
+        log(f"warning: couldn't serve port {port} over HTTPS on {hp}: {detail}{hint}")
+        return None
+    return https_url(snapshot, hp)
+
+
+def stop_https(cfg: dict[str, Any], port: int) -> None:
+    """Remove a port's HTTPS mapping, only if it is still Corral's own."""
+    hp = https_port(cfg, port)
+    if hp is None:
+        return
+    snapshot = serve_snapshot()
+    if snapshot is not None and served_by_corral(snapshot, hp) == port:
+        tailscale("serve", f"--https={hp}", "off")
+
+
+def https_urls(cfg: dict[str, Any]) -> dict[int, str]:
+    """{dev port: HTTPS URL} for every port Corral serves right now."""
+    settings = https_settings(cfg)
+    snapshot = serve_snapshot() if settings else None
+    if snapshot is None:
+        return {}
+    urls = {}
+    for key in snapshot["web"]:
+        host, _, hp = key.rpartition(":")
+        if host == snapshot["dns"] and hp.isdigit():
+            port = served_by_corral(snapshot, int(hp))
+            if port is not None and port + settings["port_offset"] == int(hp):
+                urls[port] = https_url(snapshot, int(hp))
+    return urls
+
+
+def orphan_https(cfg: dict[str, Any], state_dir: Path) -> list[dict[str, Any]]:
+    """Corral HTTPS mappings for dev ports in the lease range no worktree holds."""
+    served = https_urls(cfg)
+    if not served:
+        return []
+    ports = cfg.get("ports", {})
+    start, end = int(ports.get("start", 4100)), int(ports.get("end", 4199))
+    with locked_json(state_dir, "ports") as leases:
+        leased = {int(v) for v in leases.values()}
+    return [{"port": port, "url": url} for port, url in sorted(served.items())
+            if start <= port <= end and port not in leased]
 
 
 def leased_port(state_dir: Path, worktree: str) -> int | None:
@@ -1010,6 +1171,9 @@ class Herdr:
     def start_agent(self, pane_id: str, name: str, kind: str = "hermes") -> None:
         self.call("agent", "start", name, "--kind", kind, "--pane", pane_id, "--timeout", "120000")
 
+    def run_command(self, pane_id: str, command: str) -> None:
+        run([self.binary, "pane", "run", pane_id, command])
+
     def has_agent(self, pane_id: str) -> bool:
         panes = self.call("agent", "list")["result"].get("agents", [])
         return any(item.get("pane_id") == pane_id for item in panes)
@@ -1072,6 +1236,7 @@ class FakeHerdrForTests:
         self.agent_starts = 0
         self.agent_panes: set[str] = set()
         self.reminders: list[tuple[str, str]] = []
+        self.commands: list[tuple[str, str]] = []
 
     def seed_workspace(self, wid: str, cwd: str, labels: list[str]) -> None:
         self.workspaces[wid] = [{"tab_id": f"{wid}:t{i+1}", "label": x, "pane_id": f"{wid}:p{i+1}"} for i,x in enumerate(labels)]
@@ -1093,6 +1258,7 @@ class FakeHerdrForTests:
     def has_agent(self, pane_id: str) -> bool: return pane_id in self.agent_panes
     def metadata(self, workspace: str, tokens: dict[str,str]): pass
     def show_reminder(self, pane_id: str, message: str): self.reminders.append((pane_id, message))
+    def run_command(self, pane_id: str, command: str): self.commands.append((pane_id, command))
     def labels(self, workspace: str): return [x["label"] for x in self.workspaces[workspace]]
 
 
@@ -1293,6 +1459,9 @@ class HerdrCore:
         # Types the agent's command into the tab's shell, as a person would.
         run([self.binary, "send", pane_id, kind])
 
+    def run_command(self, pane_id: str, command: str) -> None:
+        run([self.binary, "send", pane_id, command])
+
     def has_agent(self, pane_id: str) -> bool:
         term = self._json("get", pane_id)
         if term.get("status"):
@@ -1360,13 +1529,18 @@ def corral_palette_keybinding() -> str | None:
 
 def ensure_layout(herdr: Any, workspace: str, worktree: Path, port: int, host: str,
                   remote_host: str, start_agent: bool, repo: dict[str, Any] | None = None,
-                  agent_kind: str = "hermes") -> None:
+                  agent_kind: str = "hermes", https: str | None = None,
+                  start_dev: bool = False) -> str | None:
+    """Ensure the agent/shell/server tabs; returns the server tab's pane when
+    this call created it (the place to start the dev server)."""
     env = {
         "HWT_WORKTREE": str(worktree), "HWT_DEV_PORT": str(port), "PORT": str(port),
         "HWT_DEV_HOST": host, "HOST": host,
         "HWT_LOCAL_URL": f"http://127.0.0.1:{port}",
-        "HWT_REMOTE_URL": f"http://{remote_host}:{port}" if remote_host else "",
+        "HWT_REMOTE_URL": https or (f"http://{remote_host}:{port}" if remote_host else ""),
+        "HWT_HTTPS_URL": https or "",
     }
+    new_server = None
     repo = repo or {}
     env.update({str(k): str(v) for k, v in repo.get("environment", {}).items()})
     tabs = herdr.tabs(workspace)
@@ -1381,8 +1555,10 @@ def ensure_layout(herdr: Any, workspace: str, worktree: Path, port: int, host: s
         if label not in by_label:
             tid,pid=herdr.create_tab(workspace,worktree,label,env); by_label[label]={"tab_id":tid,"pane_id":pid,"label":label}
             if label == "server":
+                new_server = pid
                 if repo.get("commands", {}).get("dev"):
-                    message = f"Corral: 'hwt dev' starts the dev server on port {port} — {env['HWT_LOCAL_URL']}"
+                    verb = "starting the dev server" if start_dev else "'hwt dev' starts the dev server"
+                    message = f"Corral: {verb} on port {port} — {env['HWT_LOCAL_URL']}"
                     if env.get("HWT_REMOTE_URL"):
                         message += f" / {env['HWT_REMOTE_URL']}"
                 else:
@@ -1405,6 +1581,7 @@ def ensure_layout(herdr: Any, workspace: str, worktree: Path, port: int, host: s
         if pane_id and not herdr.has_agent(pane_id):
             herdr.start_agent(pane_id, f"hwt-{hashlib.sha1(str(worktree).encode()).hexdigest()[:8]}", agent_kind)
     herdr.metadata(workspace, {"dev_port":str(port),"dev_url":env["HWT_REMOTE_URL"],"worktree":str(worktree)})
+    return new_server
 
 
 def ensure_canonical_layout(herdr: Any, workspace: str, repo_path: Path,
@@ -1566,14 +1743,28 @@ def _bootstrap_locked(cfg: dict[str, Any], state: Path, worktree: Path, workspac
         repo_view = dict(repo)
         if repo_is_unconfigured(repo):
             repo_view["_suggest_init"] = True
-        ensure_layout(h,workspace,worktree,port,cfg.get("dev_host","127.0.0.1"),cfg.get("remote_host",""),bool(repo.get("start_agent",False)),repo_view,agent_kind=cfg.get("agent_kind","hermes"))
+        https = ensure_https(cfg, port)
+        start_dev = bool(repo.get("commands", {}).get("dev")) and bool(repo.get("start_dev", cfg.get("start_dev", False)))
+        server_pane = ensure_layout(h,workspace,worktree,port,cfg.get("dev_host","127.0.0.1"),cfg.get("remote_host",""),
+                                    bool(repo.get("start_agent",False)),repo_view,agent_kind=cfg.get("agent_kind","hermes"),
+                                    https=https,start_dev=start_dev)
         # Tabs first, install second: the workspace appears immediately while a
         # potentially slow package-manager run happens afterwards.
         dep_status=prepare_dependencies(canonical,worktree,repo.get("dependencies",{"policy":"clone"}))
     except Exception:
-        release_port(state, str(worktree))
+        release_port(state, str(worktree), cfg)
         raise
-    return {"repository":name,"worktree":str(worktree),"workspace_id":workspace,"port":port,"dependencies":dep_status}
+    # The dev server starts once dependencies are in place, in a server tab
+    # this bootstrap opened (reopening a worktree never starts a second one).
+    dev_started = False
+    if start_dev and server_pane and dep_status != "install-failed" and port_is_free(port):
+        try:
+            h.run_command(server_pane, "hwt dev")
+            dev_started = True
+        except WorkflowError as exc:
+            log(f"warning: couldn't start the dev server in the server tab: {exc}")
+    return {"repository":name,"worktree":str(worktree),"workspace_id":workspace,"port":port,"dependencies":dep_status,
+            "https_url":https,"dev_started":dev_started}
 
 
 def fetch_with_offline_fallback(repo: Path, remote: str) -> str:
@@ -2026,7 +2217,7 @@ def cmd_new(args, cfg, state, herdr: Herdr):
     print(json.dumps({
         **summary,
         "branch": branch,
-        "dev_url": f"http://{cfg.get('remote_host')}:{summary['port']}" if cfg.get("remote_host") else f"http://127.0.0.1:{summary['port']}",
+        "dev_url": summary.get("https_url") or (f"http://{cfg.get('remote_host')}:{summary['port']}" if cfg.get("remote_host") else f"http://127.0.0.1:{summary['port']}"),
         "commands": ["hwt dev", "hwt status"],
     }, indent=2))
 
@@ -2216,7 +2407,13 @@ def cmd_dev(args,cfg,state):
     host = cfg.get("dev_host", "127.0.0.1")
     command=[str(x).format(port=port,host=host,worktree=wt,repository=name) for x in template]
     env=os.environ.copy(); env.update({"PORT":str(port),"HOST":host,"HWT_DEV_PORT":str(port),"HWT_DEV_HOST":host})
+    https = ensure_https(cfg, port)
+    if https:
+        env["HWT_HTTPS_URL"] = https
     env.update({str(k): str(v) for k, v in repo.get("environment", {}).items()})
+    remote = cfg.get("remote_host")
+    log(f"Corral: dev server for {name} on port {port} — "
+        + (https or (f"http://{remote}:{port}" if remote else f"http://127.0.0.1:{port}")))
     os.chdir(wt)
     if WINDOWS:
         raise SystemExit(subprocess.run(program(command), env=env).returncode)
@@ -2228,6 +2425,7 @@ def cmd_status(args,cfg,state):
     p=state/"ports.json"
     if p.exists(): leases=json.loads(p.read_text(encoding="utf-8"))
     rows=[]
+    served=https_urls(cfg)
     for path,port in leases.items():
         exists=Path(path).exists(); mismatch=None
         if exists:
@@ -2235,7 +2433,8 @@ def cmd_status(args,cfg,state):
                 name,repo,canonical=repo_for_worktree(cfg,Path(path)); dep=repo.get("dependencies",{}); lock=dep.get("lockfile")
                 if lock and (Path(path)/lock).exists() and (canonical/lock).exists(): mismatch=hash_file(Path(path)/lock)!=hash_file(canonical/lock)
             except WorkflowError: mismatch="unknown"
-        rows.append({"path":path,"port":port,"exists":exists,"lockfile_mismatch":mismatch,"listening":not port_is_free(int(port))})
+        rows.append({"path":path,"port":port,"exists":exists,"lockfile_mismatch":mismatch,"listening":not port_is_free(int(port)),
+                     "https_url":served.get(int(port))})
     print(json.dumps({"leases":rows},indent=2))
 
 
@@ -2305,11 +2504,12 @@ def cmd_info(args, cfg, state):
                dev_command=bool(repo.get("commands", {}).get("dev")),
                defaults_only=repo_is_unconfigured(repo))
     worktrees = []
+    served = https_urls(cfg)
     for item in checkout_list(main):
         port = leased_port(state, item["path"])
         worktrees.append({**item, "port": port,
                           "listening": bool(port) and not port_is_free(port),
-                          "dev_url": f"http://{host}:{port}" if port else None})
+                          "dev_url": (served.get(port) or f"http://{host}:{port}") if port else None})
     out["worktrees"] = worktrees
     print(json.dumps(out, indent=2))
 
@@ -2515,7 +2715,7 @@ def cmd_remove(args,cfg,state,herdr):
             cmd=["worktree","remove"]
             if args.force: cmd.append("--force")
             git(canonical, *cmd, str(path))
-        release_port(state,str(path))
+        release_port(state,str(path),cfg)
     print(json.dumps({"removed":str(path),"branch_preserved":branch},indent=2))
 
 
@@ -2750,11 +2950,15 @@ def cmd_sweep(args, cfg, state, herdr):
 def cmd_reap(args, cfg, state):
     """Stop dev servers left running from deleted worktree checkouts."""
     orphans = orphan_servers(cfg)
+    stale_https = orphan_https(cfg, state)
     if args.dry_run:
         print(json.dumps({"orphan_servers": [{k: p[k] for k in ("pid", "command", "cwd", "ports")}
-                                             for p in orphans]}, indent=2))
+                                             for p in orphans],
+                          "orphan_https": stale_https}, indent=2))
     else:
-        print(json.dumps({"stopped": stop_processes(orphans)}, indent=2))
+        for item in stale_https:
+            stop_https(cfg, item["port"])
+        print(json.dumps({"stopped": stop_processes(orphans), "stopped_https": stale_https}, indent=2))
 
 
 def cmd_cleanup_workspace(args, cfg, state, herdr):
@@ -2859,7 +3063,7 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
                 remove.append("--force")
             git(canonical, *remove, str(path))
         git(canonical, "update-ref", "-d", branch_ref)
-        release_port(state, str(path))
+        release_port(state, str(path), cfg)
     return {
         "removed": str(path),
         "local_branch_deleted": branch,
@@ -2987,11 +3191,21 @@ def cmd_doctor(args,cfg,state):
     latest = latest_remote_version()
     update = {"installed": __version__, "latest": latest,
               "update_available": bool(latest and version_tuple(latest) > version_tuple(__version__))}
+    stale_https = []
+    if https_settings(cfg):
+        snapshot = serve_snapshot()
+        checks.append({"check": "https:tailscale", "ok": bool(snapshot and snapshot["certs"]),
+                       "value": (snapshot["dns"] if snapshot["certs"] else
+                                 f"{snapshot['dns']}: HTTPS certificates not enabled for the tailnet")
+                                if snapshot else "tailscale CLI missing or not running"})
+        stale_https = orphan_https(cfg, state) if snapshot else []
     orphans = [{k: p[k] for k in ("pid", "command", "cwd", "ports")} for p in orphan_servers(cfg)]
     print(json.dumps({"ok":all(x["ok"] for x in checks),"update":update,"checks":checks,
-                      "orphan_servers":orphans},indent=2))
+                      "orphan_servers":orphans, "orphan_https":stale_https},indent=2))
     if orphans:
         log(f"{len(orphans)} process(es) still running from deleted worktrees; run: hwt reap")
+    if stale_https:
+        log(f"{len(stale_https)} HTTPS mapping(s) left from released ports; run: hwt reap")
     if update["update_available"]:
         log(f"Update available ({__version__} -> {latest}); run: hwt update")
     if not all(x["ok"] for x in checks): raise SystemExit(1)
@@ -3032,7 +3246,7 @@ def cmd_event(args,cfg,state,herdr):
         # No approved-root guard: releasing is a no-op for paths that never
         # held a lease, and ad-hoc worktree locations must get theirs back too.
         for p in values(payload, {"path", "cwd", "worktree_path"}):
-            release_port(state, p)
+            release_port(state, p, cfg)
         maybe_open_teardown(cfg, state, payload)
 
 
