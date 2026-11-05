@@ -449,7 +449,8 @@ class ConfigErrorTests(unittest.TestCase):
             git(repo, "init", "-q")
             config = root / "config.toml"
             config.write_text(install.render_config(root / "repos", root / "wts", [],
-                                                    "127.0.0.1", "", "claude"))
+                                                    "127.0.0.1", "", "claude"),
+                              encoding="utf-8")  # as install.py writes it; it has an em dash
             self.assertEqual(hwt.load_config(config)["repositories"], {})
             with mock.patch.object(hwt, "latest_remote_version", return_value=None), \
                  mock.patch.object(hwt, "orphan_servers", return_value=[]), \
