@@ -47,7 +47,9 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "1.2.1"
+WINDOWS = os.name == "nt"  # patched in tests; never patch os.name (pathlib reads it)
+
+__version__ = "1.3.0"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -109,14 +111,14 @@ def contained_destination(root: Path, relative: str) -> Path:
     cursor = root_real
     for part in rel.parts[:-1]:
         cursor = cursor / part
-        if cursor.exists() or cursor.is_symlink():
+        if cursor.exists() or is_link(cursor):
             resolved = cursor.resolve(strict=True)
             if not is_within(resolved, root_real):
                 raise SafetyError(f"symlink escape in destination: {relative}")
         else:
             cursor.mkdir(mode=0o700)
     destination = cursor / rel.parts[-1]
-    if destination.is_symlink():
+    if is_link(destination):
         resolved = destination.resolve(strict=False)
         if not is_within(resolved, root_real):
             raise SafetyError(f"symlink escape in destination: {relative}")
@@ -129,6 +131,74 @@ def safe_source(root: Path, relative: str) -> Path:
     if not is_within(resolved, resolve_existing(root)):
         raise SafetyError(f"source escapes canonical checkout: {relative}")
     return source
+
+
+def is_link(path: Path) -> bool:
+    """A symlink, or a Windows directory junction (which Path.is_symlink misses)."""
+    if path.is_symlink():
+        return True
+    if not WINDOWS:
+        return False
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return (bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+            and getattr(st, "st_reparse_tag", None) == stat.IO_REPARSE_TAG_MOUNT_POINT)
+
+
+def remove_link(path: Path) -> None:
+    """Remove a symlink or junction itself, never what it points to."""
+    if WINDOWS:
+        with contextlib.suppress(OSError):
+            if os.lstat(path).st_file_attributes & stat.FILE_ATTRIBUTE_DIRECTORY:
+                os.rmdir(path)  # a directory link: rmdir removes only the link
+                return
+    path.unlink()
+
+
+def create_junction(source: Path, destination: Path) -> None:
+    """A directory junction at destination pointing to source (CPython on Windows)."""
+    import _winapi
+    _winapi.CreateJunction(str(source), str(destination))
+
+
+def make_link(destination: Path, source: Path, *, directory: bool) -> str:
+    """Link destination to source: a symlink where the system allows one. Windows
+    allows those only with Developer Mode, so there a folder gets a junction
+    instead and a file a copy. Returns "symlink", "junction" or "copy"."""
+    try:
+        destination.symlink_to(source, target_is_directory=directory)
+        return "symlink"
+    except OSError:
+        if not WINDOWS:
+            raise
+    if directory:
+        create_junction(source.resolve(), destination)
+        return "junction"
+    shutil.copy2(source, destination)
+    return "copy"
+
+
+def detach_links(worktree: Path, repo: dict[str, Any]) -> None:
+    """Windows: remove the junctions Corral made in a worktree before deleting it,
+    so deleting the worktree can never reach through one into the main checkout."""
+    if not WINDOWS:
+        return
+    relatives = [repo.get("dependencies", {}).get("directory", "node_modules")]
+    relatives += [op.get("path", "") for op in repo.get("files") or [] if op.get("action") == "symlink"]
+    paths = []
+    for relative in relatives:
+        with contextlib.suppress(SafetyError):
+            paths.append(worktree / safe_relative(relative))
+    # Also any top-level link out of the worktree (made under an older config).
+    with contextlib.suppress(OSError):
+        root = worktree.resolve()
+        paths += [p for p in worktree.iterdir() if is_link(p) and not is_within(p.resolve(), root)]
+    for path in paths:
+        with contextlib.suppress(OSError):
+            if is_link(path):
+                remove_link(path)
 
 
 def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
@@ -165,9 +235,22 @@ def resolve_configured_repo(cfg: dict[str, Any], path: Path) -> tuple[str, dict[
     raise SafetyError(f"repository is not explicitly configured: {target}")
 
 
+def program(argv: list[str]) -> list[str]:
+    """argv with its program found the way a shell finds it. Windows' CreateProcess
+    looks only for .exe files on PATH, and npm, pnpm, yarn (and Corral's own hwt)
+    are .cmd shims there."""
+    if WINDOWS and argv and not os.path.dirname(argv[0]):
+        found = shutil.which(argv[0])
+        if found and found.lower().endswith((".cmd", ".bat")):
+            return [found, *argv[1:]]
+    return list(argv)
+
+
 def run(argv: list[str], *, cwd: Path | None = None, check: bool = True,
         env: dict[str, str] | None = None, input: str | None = None) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(argv, cwd=cwd, env=env, text=True, input=input,
+    # Windows decodes in the ANSI code page by default; git and hc write UTF-8.
+    encoding = {"encoding": "utf-8", "errors": "replace"} if WINDOWS else {}
+    result = subprocess.run(program(argv), cwd=cwd, env=env, text=True, input=input, **encoding,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if check and result.returncode:
         detail = (result.stderr or result.stdout or "").strip()
@@ -220,8 +303,8 @@ def apply_file_operations(canonical: Path, worktree: Path, operations: list[dict
         if action == "copy":
             if not source.is_file() and not source.is_dir():
                 raise WorkflowError(f"copy source is not a regular file or directory: {rel}")
-            if destination.exists() or destination.is_symlink():
-                if source.is_file() and destination.is_file() and not destination.is_symlink() and hash_file(destination) == hash_file(source):
+            if destination.exists() or is_link(destination):
+                if source.is_file() and destination.is_file() and not is_link(destination) and hash_file(destination) == hash_file(source):
                     logger(f"copy already current: {rel}")
                     continue
                 if overwrite == "skip":
@@ -229,10 +312,10 @@ def apply_file_operations(canonical: Path, worktree: Path, operations: list[dict
                     continue
                 if overwrite != "always":
                     raise WorkflowError(f"refusing to overwrite modified destination: {rel}")
-                if destination.is_dir() and not destination.is_symlink():
+                if destination.is_dir() and not is_link(destination):
                     shutil.rmtree(destination)
                 else:
-                    destination.unlink()
+                    remove_link(destination)
             if source.is_dir():
                 shutil.copytree(source, destination, copy_function=shutil.copy2)
             else:
@@ -240,17 +323,27 @@ def apply_file_operations(canonical: Path, worktree: Path, operations: list[dict
                 os.chmod(destination, stat.S_IMODE(source.stat().st_mode))
             logger(f"copied local path: {rel}")
         elif action == "symlink":
-            if destination.is_symlink() and destination.resolve() == source.resolve():
+            if is_link(destination) and destination.resolve() == source.resolve():
                 logger(f"symlink already current: {rel}")
                 continue
-            if destination.exists() or destination.is_symlink():
+            # Windows without Developer Mode copies a file instead of linking it.
+            if WINDOWS and source.is_file() and destination.is_file() and not is_link(destination):
+                # This Windows copied it last time (no symlinks without Developer
+                # Mode). A copy that differs now may hold the worktree's own edits.
+                if hash_file(destination) == hash_file(source):
+                    logger(f"copy already current: {rel}")
+                else:
+                    logger(f"copy differs from {rel} in the main checkout; left as is")
+                continue
+            if destination.exists() or is_link(destination):
                 raise WorkflowError(f"refusing to replace destination with symlink: {rel}")
-            destination.symlink_to(source, target_is_directory=source.is_dir())
-            logger(f"linked local path: {rel}")
+            how = make_link(destination, source, directory=source.is_dir())
+            logger(f"linked local path: {rel}" if how != "copy"
+                   else f"copied local path (this Windows can't make symlinks): {rel}")
         elif action == "create":
             kind = op.get("kind", "directory")
-            if destination.exists() or destination.is_symlink():
-                valid = (kind == "directory" and destination.is_dir() and not destination.is_symlink()) or (kind == "file" and destination.is_file() and not destination.is_symlink())
+            if destination.exists() or is_link(destination):
+                valid = (kind == "directory" and destination.is_dir() and not is_link(destination)) or (kind == "file" and destination.is_file() and not is_link(destination))
                 if valid:
                     continue
                 raise WorkflowError(f"existing destination has wrong type for {kind}: {rel}")
@@ -282,7 +375,7 @@ def default_env_operations(canonical: Path) -> list[dict[str, Any]]:
     seen: set[str] = set()
     for pattern in DEFAULT_ENV_GLOBS:
         for source in sorted(canonical.glob(pattern)):
-            if not source.is_file() or source.is_symlink() or source.name in seen:
+            if not source.is_file() or is_link(source) or source.name in seen:
                 continue
             seen.add(source.name)
             tracked = git(canonical, "ls-files", "--error-unmatch", source.name,
@@ -303,8 +396,32 @@ def detect_install_command(worktree: Path) -> list[str] | None:
     return ["npm", "install"]
 
 
+class _TreeHasLinks(Exception):
+    pass
+
+
+def _refuse_links(directory: str, names: list[str]) -> list[str]:
+    for name in names:
+        if is_link(Path(directory) / name):
+            raise _TreeHasLinks(os.path.join(directory, name))
+    return []
+
+
 def clone_tree(source: Path, destination: Path) -> bool:
-    """Copy a directory tree, copy-on-write where the platform allows. True on success."""
+    """Copy a directory tree, copy-on-write where the platform allows. True on success.
+
+    Windows has no copy-on-write copy, so this is a plain copy there. A tree
+    holding symlinks or junctions (pnpm's node_modules) isn't copied on
+    Windows: copying would follow them, so the install runs instead."""
+    if WINDOWS:
+        try:
+            shutil.copytree(source, destination, symlinks=True, ignore=_refuse_links)
+            return True
+        except (OSError, _TreeHasLinks) as exc:
+            if isinstance(exc, _TreeHasLinks):
+                log(f"not copying {source}: it holds links ({exc})")
+            shutil.rmtree(destination, ignore_errors=True)
+            return False
     if sys.platform == "darwin":
         candidates = [["cp", "-c", "-R", str(source), str(destination)]]  # APFS clonefile
     elif os.name == "posix":
@@ -335,10 +452,10 @@ def prepare_dependencies(canonical: Path, worktree: Path, dep: dict[str, Any]) -
         # (copy-on-write where the filesystem supports it) when lockfiles are
         # identical, else fall through to the lockfile-detected install, same
         # as "auto". Failures warn instead of aborting the bootstrap.
-        if destination.is_dir() and not destination.is_symlink():
+        if destination.is_dir() and not is_link(destination):
             return "present"
-        if destination.is_symlink():
-            destination.unlink()
+        if is_link(destination):
+            remove_link(destination)
         if policy == "clone":
             clone_lock = dep.get("lockfile") or next(
                 (name for name, _ in LOCKFILE_COMMANDS if (canonical / name).is_file()), None)
@@ -376,16 +493,16 @@ def prepare_dependencies(canonical: Path, worktree: Path, dep: dict[str, Any]) -
     if share:
         canonical_dir = safe_source(canonical, directory.as_posix())
         if not canonical_dir.is_dir(): raise WorkflowError(f"canonical dependency directory missing: {canonical_dir}")
-        if destination.is_symlink() and destination.resolve() == canonical_dir.resolve():
+        if is_link(destination) and destination.resolve() == canonical_dir.resolve():
             return "shared"
-        if destination.is_symlink():
-            destination.unlink()
-        if destination.exists() or destination.is_symlink():
+        if is_link(destination):
+            remove_link(destination)
+        if destination.exists() or is_link(destination):
             raise WorkflowError(f"dependency destination already exists and is not the expected link: {destination}")
-        destination.symlink_to(canonical_dir.resolve(), target_is_directory=True)
+        make_link(destination, canonical_dir.resolve(), directory=True)
         return "shared"
-    if destination.is_symlink():
-        destination.unlink()
+    if is_link(destination):
+        remove_link(destination)
     command = dep.get("install_command", [])
     if command:
         run([str(x) for x in command], cwd=worktree)
@@ -395,7 +512,7 @@ def prepare_dependencies(canonical: Path, worktree: Path, dep: dict[str, Any]) -
 def prepare_local_cache_paths(worktree: Path, paths: list[str]) -> None:
     for relative in paths:
         destination = contained_destination(worktree, relative)
-        if destination.is_symlink():
+        if is_link(destination):
             raise SafetyError(f"worktree-local cache may not be a symlink: {relative}")
         destination.mkdir(parents=True, exist_ok=True, mode=0o700)
 
@@ -408,13 +525,13 @@ def locked_json(state_dir: Path, name: str):
         lock_file(lock)
         data_path = state_dir / f"{name}.json"
         try:
-            data = json.loads(data_path.read_text()) if data_path.exists() else {}
+            data = json.loads(data_path.read_text(encoding="utf-8")) if data_path.exists() else {}
         except json.JSONDecodeError as exc:
             raise WorkflowError(f"invalid state file: {data_path}") from exc
         yield data
         fd, temp = tempfile.mkstemp(prefix=f".{name}.", dir=state_dir)
         try:
-            with os.fdopen(fd, "w") as fh:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(data, fh, indent=2, sort_keys=True)
                 fh.write("\n")
                 fh.flush(); os.fsync(fh.fileno())
@@ -435,7 +552,12 @@ def worktree_lock(state_dir: Path, worktree: Path):
 
 def port_is_free(port: int, host: str = "0.0.0.0") -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # On Windows SO_REUSEADDR lets a bind share a port another program
+        # listens on, so every port would look free; exclusive use can't.
+        if WINDOWS:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        else:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             sock.bind((host, port))
             return True
@@ -541,11 +663,162 @@ def _lsof_processes() -> list[dict[str, Any]]:
     return [p for p in procs.values() if p["cwd"]]
 
 
+class _Win32:
+    """The few Windows calls process discovery needs (ctypes, standard library)."""
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    SYNCHRONIZE = 0x100000
+    TOKEN_QUERY = 0x8
+    WAIT_TIMEOUT = 0x102
+    ERROR_ACCESS_DENIED = 5
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes
+        self.ctypes, self.wintypes = ctypes, wintypes
+        self.k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.advapi = ctypes.WinDLL("advapi32", use_last_error=True)
+        k, a = self.k32, self.advapi
+        k.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k.OpenProcess.restype = wintypes.HANDLE
+        k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k.CloseHandle.argtypes = [wintypes.HANDLE]
+        k.GetCurrentProcess.restype = wintypes.HANDLE
+        k.WaitForSingleObject.restype = wintypes.DWORD
+        k.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        a.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+        a.GetTokenInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p,
+                                          wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        a.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        k.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.c_void_p] * 4
+
+        class Entry(ctypes.Structure):  # PROCESSENTRY32W
+            _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                        ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                        ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                        ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                        ("dwFlags", wintypes.DWORD), ("szExeFile", ctypes.c_wchar * 260)]
+        self.Entry = Entry
+        k.Process32FirstW.argtypes = k.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(Entry)]
+
+    def processes(self) -> list[tuple[int, int, str]]:
+        """(pid, parent pid, program name) for every process."""
+        snapshot = self.k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+        if not snapshot or snapshot == self.ctypes.c_void_p(-1).value:
+            raise OSError("CreateToolhelp32Snapshot failed")
+        found = []
+        try:
+            entry = self.Entry()
+            entry.dwSize = self.ctypes.sizeof(self.Entry)
+            ok = self.k32.Process32FirstW(snapshot, self.ctypes.byref(entry))
+            while ok:
+                found.append((entry.th32ProcessID, entry.th32ParentProcessID, entry.szExeFile))
+                ok = self.k32.Process32NextW(snapshot, self.ctypes.byref(entry))
+        finally:
+            self.k32.CloseHandle(snapshot)
+        return found
+
+    def _user(self, process) -> Any:
+        """The token user (TOKEN_USER buffer) of an open process handle, or None."""
+        token = self.wintypes.HANDLE()
+        if not self.advapi.OpenProcessToken(process, self.TOKEN_QUERY, self.ctypes.byref(token)):
+            return None
+        try:
+            size = self.wintypes.DWORD()
+            self.advapi.GetTokenInformation(token, 1, None, 0, self.ctypes.byref(size))  # TokenUser
+            if not size.value:
+                return None
+            buffer = self.ctypes.create_string_buffer(size.value)
+            if not self.advapi.GetTokenInformation(token, 1, buffer, size, self.ctypes.byref(size)):
+                return None
+            return buffer
+        finally:
+            self.k32.CloseHandle(token)
+
+    def mine(self, pid: int, me: Any) -> int | None:
+        """The process's creation time (FILETIME ticks) when it is this user's, else None."""
+        process = self.k32.OpenProcess(self.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not process:
+            return None  # not ours to inspect
+        try:
+            user = self._user(process)
+            if user is None:
+                return None
+            sid = self.ctypes.c_void_p.from_buffer(user).value  # TOKEN_USER.User.Sid
+            mine = self.ctypes.c_void_p.from_buffer(me).value
+            if not self.advapi.EqualSid(sid, mine):
+                return None
+            times = [self.ctypes.c_ulonglong() for _ in range(4)]  # created, exited, kernel, user
+            if not self.k32.GetProcessTimes(process, *[self.ctypes.byref(t) for t in times]):
+                return 0
+            return times[0].value
+        finally:
+            self.k32.CloseHandle(process)
+
+    def my_user(self) -> Any:
+        return self._user(self.k32.GetCurrentProcess())
+
+    def alive(self, pid: int) -> bool:
+        process = self.k32.OpenProcess(self.SYNCHRONIZE | self.PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not process:
+            return self.ctypes.get_last_error() == self.ERROR_ACCESS_DENIED
+        try:
+            return self.k32.WaitForSingleObject(process, 0) == self.WAIT_TIMEOUT
+        finally:
+            self.k32.CloseHandle(process)
+
+
+_WIN32: _Win32 | None = None
+
+
+def win32() -> _Win32:
+    global _WIN32
+    if _WIN32 is None:
+        _WIN32 = _Win32()
+    return _WIN32
+
+
+def windows_listeners() -> dict[int, set[int]]:
+    """pid -> the TCP ports it listens on, from `netstat -ano`. A listening row's
+    remote port is 0; the state word is localized, so it isn't read."""
+    output = subprocess.run(["netstat", "-ano"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            text=True, errors="replace").stdout
+    ports: dict[int, set[int]] = {}
+    for line in output.splitlines():
+        fields = line.split()
+        if (len(fields) == 5 and fields[0].upper() == "TCP" and fields[2].rsplit(":", 1)[-1] == "0"
+                and fields[4].isdigit() and fields[1].rsplit(":", 1)[-1].isdigit()):
+            ports.setdefault(int(fields[4]), set()).add(int(fields[1].rsplit(":", 1)[-1]))
+    return ports
+
+
+def _windows_processes() -> list[dict[str, Any]]:
+    """Windows: the user's processes and their listening ports. A process's
+    working folder can't be read there, so cwd is None: servers are matched by
+    their leased port only, and never found as orphans."""
+    win = win32()
+    me = win.my_user()
+    if me is None:
+        return []
+    listening = windows_listeners()
+    found = []
+    for pid, ppid, name in win.processes():
+        created = win.mine(pid, me) if pid else None
+        if created is not None:
+            found.append({"pid": pid, "ppid": ppid, "command": name, "cwd": None, "cwd_deleted": False,
+                          "ports": sorted(listening.get(pid, ())), "created": created})
+    return found
+
+
 def user_processes() -> list[dict[str, Any]]:
     """The current user's processes: pid, ppid, command, cwd (cwd_deleted when
-    its directory is gone) and TCP listening ports. Other users' processes are
-    never returned, so never stopped. Empty where they cannot be inspected."""
+    its directory is gone; None on Windows) and TCP listening ports. Other users'
+    processes are never returned, so never stopped. Empty where they cannot be
+    inspected."""
     try:
+        if WINDOWS:
+            return _windows_processes()
         if Path("/proc/net/tcp").exists():
             return _linux_processes()
         if os.name == "posix" and shutil.which("lsof"):
@@ -569,6 +842,11 @@ def server_trees(procs: list[dict[str, Any]], is_target: Callable[[dict[str, Any
     protected.add(os.getpid())
     children: dict[int, list[int]] = {}
     for proc in procs:
+        parent = by_pid.get(proc["ppid"])
+        # Windows keeps a dead parent's id and reuses ids: a "parent" started
+        # after its child is someone else (only Windows reports "created").
+        if parent and proc.get("created") and parent.get("created") and proc["created"] < parent["created"]:
+            continue
         children.setdefault(proc["ppid"], []).append(proc["pid"])
     chosen: dict[int, dict[str, Any]] = {}
     pending = [p["pid"] for p in procs if p["ports"] and is_target(p)]
@@ -582,6 +860,9 @@ def server_trees(procs: list[dict[str, Any]], is_target: Callable[[dict[str, Any
 
 
 def _alive(pid: int) -> bool:
+    if WINDOWS:
+        # Never os.kill(pid, 0) here: on Windows that terminates the process.
+        return win32().alive(pid)
     with contextlib.suppress(OSError, IndexError):
         # A zombie has exited; only its parent's wait() is pending.
         if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
@@ -595,22 +876,47 @@ def _alive(pid: int) -> bool:
     return True
 
 
+def taskkill(pid: int, force: bool) -> bool:
+    """Windows: end a process tree (`taskkill /T`); force adds /F. True when it went."""
+    argv = ["taskkill", "/PID", str(pid), "/T", *(["/F"] if force else [])]
+    with contextlib.suppress(OSError):
+        return subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    return False
+
+
 def stop_processes(procs: list[dict[str, Any]], grace: float = 5.0) -> list[dict[str, Any]]:
-    """SIGTERM, wait up to `grace` seconds, then SIGKILL whatever remains."""
-    for proc in procs:
-        with contextlib.suppress(OSError):
-            os.kill(proc["pid"], signal.SIGTERM)
+    """SIGTERM, wait up to `grace` seconds, then SIGKILL whatever remains. On
+    Windows: taskkill /T, then taskkill /T /F; a console program can only be
+    ended forcefully, so when no polite request went through there is no wait."""
+    if WINDOWS:
+        asked = [taskkill(proc["pid"], force=False) for proc in procs]
+        if not any(asked):
+            grace = 0.0
+    else:
+        for proc in procs:
+            with contextlib.suppress(OSError):
+                os.kill(proc["pid"], signal.SIGTERM)
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline and any(_alive(p["pid"]) for p in procs):
         time.sleep(0.1)
     report = []
+    forced = []
     for proc in procs:
         killed = _alive(proc["pid"])
         if killed:
-            with contextlib.suppress(OSError):
-                os.kill(proc["pid"], signal.SIGKILL)
+            if WINDOWS:
+                taskkill(proc["pid"], force=True)
+                forced.append(proc["pid"])
+            else:
+                with contextlib.suppress(OSError):
+                    os.kill(proc["pid"], signal.SIGKILL)
         report.append({"pid": proc["pid"], "command": proc["command"][:200], "cwd": proc["cwd"],
                        "ports": proc["ports"], "signal": "KILL" if killed else "TERM"})
+    # Windows: a process's open files stay locked until it has gone, and the
+    # worktree is deleted next.
+    deadline = time.monotonic() + 5.0
+    while forced and time.monotonic() < deadline and any(_alive(pid) for pid in forced):
+        time.sleep(0.1)
     return report
 
 
@@ -621,7 +927,8 @@ def stop_worktree_servers(state_dir: Path, worktree: Path) -> list[dict[str, Any
     root = Path(os.path.realpath(worktree))
     port = leased_port(state_dir, str(worktree))
     def belongs(proc: dict[str, Any]) -> bool:
-        return is_within(Path(proc["cwd"]), root) or (port is not None and port in proc["ports"])
+        inside = proc["cwd"] is not None and is_within(Path(proc["cwd"]), root)
+        return inside or (port is not None and port in proc["ports"])
     return stop_processes(server_trees(user_processes(), belongs))
 
 
@@ -642,8 +949,10 @@ def orphan_servers(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     stopped them (a plain `git worktree remove`, a pre-1.1 cleanup)."""
     roots = approved_worktree_roots(cfg)
     def orphaned(proc: dict[str, Any]) -> bool:
+        if not proc["cwd_deleted"]:
+            return False
         cwd = Path(proc["cwd"])
-        return proc["cwd_deleted"] and any(is_within(cwd, r) and checkout_gone(cwd, r) for r in roots)
+        return any(is_within(cwd, r) and checkout_gone(cwd, r) for r in roots)
     return server_trees(user_processes(), orphaned)
 
 
@@ -721,14 +1030,22 @@ class Herdr:
             ])
         if self._write_reminder_to_tty(pane_id, message):
             return
-        command = f"printf '\\n%s\\n\\n' {shlex.quote(message)}"
+        if WINDOWS:
+            # Herdr's Windows panes run PowerShell (pwsh, else powershell).
+            quoted = "'" + message.replace("'", "''") + "'"
+            command = f"Write-Host ''; Write-Host {quoted}; Write-Host ''"
+        else:
+            command = f"printf '\\n%s\\n\\n' {shlex.quote(message)}"
         with contextlib.suppress(WorkflowError):
             run([self.binary, "pane", "run", pane_id, command])
 
     def _write_reminder_to_tty(self, pane_id: str, message: str) -> bool:
         # Writing straight to the pane's tty displays the message without a
         # command being typed and echoed at the prompt. Resolving the tty needs
-        # /proc, so non-Linux hosts return False and use the printf fallback.
+        # /proc, so non-Linux hosts return False and use the printf fallback
+        # (Windows has no ttys to write to at all).
+        if WINDOWS:
+            return False
         try:
             info = self.call("pane", "process-info", "--pane", pane_id)
             shell_pid = int(info["result"]["process_info"]["shell_pid"])
@@ -785,13 +1102,35 @@ def is_desktop(herdr: Any) -> bool:
 
 
 SHELL_NAMES = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh", "nu", "pwsh", "xonsh"}
+WINDOWS_SHELL_NAMES = SHELL_NAMES | {"powershell", "cmd"}
+
+
+def program_name(program: str) -> str:
+    """A program's name as SHELL_NAMES has it (Windows: no .exe, any case)."""
+    if WINDOWS:
+        return re.split(r"[\\/]", program)[-1].lower().removesuffix(".exe")
+    return Path(program).name
 
 
 def login_shell() -> str:
+    if WINDOWS:
+        return (shutil.which("pwsh") or shutil.which("powershell")
+                or os.environ.get("COMSPEC") or "cmd.exe")
     with contextlib.suppress(ImportError, KeyError):
         import pwd
         return os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell
     return os.environ.get("SHELL") or "/bin/sh"
+
+
+def shell_with_env(env: dict[str, str]) -> list[str]:
+    """The login shell, started with env set (hc run has no --env)."""
+    shell = login_shell()
+    if not WINDOWS:
+        return ["env", *[f"{k}={v}" for k, v in env.items()], shell]
+    if program_name(shell) in ("pwsh", "powershell"):
+        sets = "; ".join("${env:%s} = '%s'" % (k, v.replace("'", "''")) for k, v in env.items())
+        return [shell, "-NoLogo", "-NoExit", "-Command", sets]
+    return [shell, "/d", "/k", "&& ".join(f"set {k}={v}" for k, v in env.items())]
 
 
 def hc_binary() -> str:
@@ -799,6 +1138,11 @@ def hc_binary() -> str:
     if found:
         return found
     local = Path.home() / ".local/bin/hc"
+    if WINDOWS:
+        # hc's Windows installer puts it in %LOCALAPPDATA%\Programs\herdr-core.
+        folder = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local") / "Programs/herdr-core"
+        found = next((p for p in (folder / "hc.exe", folder / "herdr-core.exe") if p.exists()), None)
+        return str(found) if found else "hc"
     return str(local) if local.exists() else "hc"
 
 
@@ -862,7 +1206,7 @@ class HerdrCore:
             args += ["--label", f"corral.tab={label}"]
         if env:
             # hc run has no --env; the tab's shell inherits these instead.
-            args += ["--", "env", *[f"{k}={v}" for k, v in env.items()], login_shell()]
+            args += ["--", *shell_with_env(env)]
         try:
             address = json.loads(run(args).stdout)["address"]
         except (json.JSONDecodeError, KeyError, TypeError) as exc:
@@ -954,14 +1298,18 @@ class HerdrCore:
         if term.get("status"):
             return True
         program = (term.get("foreground") or {}).get("name") or ""
-        return bool(program) and Path(program).name not in SHELL_NAMES
+        shells = WINDOWS_SHELL_NAMES if WINDOWS else SHELL_NAMES
+        return bool(program) and program_name(program) not in shells
 
     def metadata(self, workspace: str, tokens: dict[str, str]) -> None:
         pass  # Desktop has no workspace metadata; the lease in Corral's state is the record.
 
     def show_reminder(self, pane_id: str, message: str) -> None:
         # Straight to the shell's tty (Linux /proc), so nothing is typed at the
-        # prompt; a missed reminder must never break the bootstrap.
+        # prompt; a missed reminder must never break the bootstrap. Windows has
+        # no ttys, so no reminder there: the Corral panel shows the same.
+        if WINDOWS:
+            return
         with contextlib.suppress(WorkflowError, OSError, KeyError, TypeError, ValueError):
             tty = os.readlink(f"/proc/{int(self._json('get', pane_id)['pid'])}/fd/0")
             if not tty.startswith("/dev/"):
@@ -980,16 +1328,25 @@ def tab_pane(tab: dict[str, Any]) -> str:
     raise WorkflowError("pane id unavailable for tab")
 
 
+def herdr_config_file() -> Path:
+    """Where the Herdr TUI reads config.toml (its src/config/io.rs): HERDR_CONFIG_PATH,
+    else XDG_CONFIG_HOME/herdr, else ~/.config/herdr; on Windows %APPDATA%\\herdr."""
+    if os.environ.get("HERDR_CONFIG_PATH"):
+        return Path(os.environ["HERDR_CONFIG_PATH"])
+    base = os.environ.get("XDG_CONFIG_HOME")
+    if not base and WINDOWS:
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData/Roaming")
+    return Path(base or Path.home() / ".config") / "herdr" / "config.toml"
+
+
 def corral_palette_keybinding() -> str | None:
     """The user's palette binding from Herdr's own config, or None when unbound.
 
-    Reads the same file Herdr does (XDG_CONFIG_HOME, else ~/.config/herdr) and
-    renders 'prefix+X' as the real keystrokes by expanding the configured
-    prefix (Herdr's default is ctrl+b, per validated_keybinds in its source)."""
-    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
-    config = Path(base) / "herdr" / "config.toml"
+    Reads the same file Herdr does (see herdr_config_file) and renders
+    'prefix+X' as the real keystrokes by expanding the configured prefix
+    (Herdr's default is ctrl+b, per validated_keybinds in its source)."""
     try:
-        keys = tomllib.loads(config.read_text()).get("keys", {})
+        keys = tomllib.loads(herdr_config_file().read_text(encoding="utf-8")).get("keys", {})
     except (OSError, tomllib.TOMLDecodeError):
         return None
     for entry in keys.get("command", []):
@@ -1284,7 +1641,7 @@ def suggest_dev_command(canonical: Path) -> list[str] | None:
     if not package.is_file():
         return None
     try:
-        scripts = json.loads(package.read_text()).get("scripts", {})
+        scripts = json.loads(package.read_text(encoding="utf-8")).get("scripts", {})
     except (json.JSONDecodeError, OSError):
         return None
     script = next((s for s in ("dev", "serve", "start") if s in scripts), None)
@@ -1434,7 +1791,7 @@ def run_init_interview(cfg: dict[str, Any], name: str, config_path: Path) -> Pat
     overlay_dir = config_path.parent / "repos.d"
     overlay_dir.mkdir(parents=True, exist_ok=True)
     overlay = overlay_dir / f"{name}.toml"
-    overlay.write_text(render_repo_overlay(name, repo, files, dep_policy, dev))
+    overlay.write_text(render_repo_overlay(name, repo, files, dep_policy, dev), encoding="utf-8")
     print(f"Wrote {overlay}")
     return overlay
 
@@ -1480,14 +1837,19 @@ def cmd_update(args) -> None:
     result = run(["git", "-C", str(root), "pull", "--ff-only"], check=False)
     if result.returncode:
         raise WorkflowError(f"git pull failed: {result.stderr.strip() or result.stdout.strip()}")
-    manifest = tomllib.loads((root / "herdr-plugin.toml").read_text())
+    manifest = tomllib.loads((root / "herdr-plugin.toml").read_text(encoding="utf-8"))
     current = str(manifest.get("version", previous))
     if shutil.which("herdr"):
+        plugin = root
+        if WINDOWS:
+            # Windows links a generated manifest (see install.py's
+            # write_windows_plugin); the updated installer rewrites it.
+            plugin = Path(run([sys.executable, str(root / "install.py"), "--windows-plugin"]).stdout.strip())
         subprocess.run(["herdr", "plugin", "unlink", PLUGIN_ID],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        relink = subprocess.run(["herdr", "plugin", "link", str(root), "--enabled"])
+        relink = subprocess.run(["herdr", "plugin", "link", str(plugin), "--enabled"])
         if relink.returncode:
-            raise WorkflowError(f"herdr plugin relink failed; run: herdr plugin link {root} --enabled")
+            raise WorkflowError(f"herdr plugin relink failed; run: herdr plugin link {plugin} --enabled")
     else:
         log("herdr is not on PATH; skipped plugin relink")
     print(json.dumps({"installed_from": str(root), "previous_version": previous,
@@ -1856,15 +2218,15 @@ def cmd_dev(args,cfg,state):
     env=os.environ.copy(); env.update({"PORT":str(port),"HOST":host,"HWT_DEV_PORT":str(port),"HWT_DEV_HOST":host})
     env.update({str(k): str(v) for k, v in repo.get("environment", {}).items()})
     os.chdir(wt)
-    if os.name == "nt":
-        raise SystemExit(subprocess.run(command, env=env).returncode)
+    if WINDOWS:
+        raise SystemExit(subprocess.run(program(command), env=env).returncode)
     os.execvpe(command[0],command,env)
 
 
 def cmd_status(args,cfg,state):
     leases={}
     p=state/"ports.json"
-    if p.exists(): leases=json.loads(p.read_text())
+    if p.exists(): leases=json.loads(p.read_text(encoding="utf-8"))
     rows=[]
     for path,port in leases.items():
         exists=Path(path).exists(); mismatch=None
@@ -1894,6 +2256,8 @@ def checkout_list(canonical: Path) -> list[dict[str, Any]]:
             continue
         branch = next((l.removeprefix("branch refs/heads/") for l in lines
                        if l.startswith("branch refs/heads/")), None)
+        if WINDOWS:
+            path = str(Path(path))  # git's C:/x/y, as Corral's other paths: C:\x\y
         items.append({"path": path, "branch": branch, "main": not items})
     return items
 
@@ -1984,7 +2348,7 @@ def cmd_add(args, cfg, state):
         f"remote = {toml_quote(remote)}",
         "fetch = true",
         "start_agent = true",
-    ]) + "\n")
+    ]) + "\n", encoding="utf-8")
     print(json.dumps({"repository": name, "path": str(path), "base_branch": base,
                       "overlay": str(overlay)}, indent=2))
 
@@ -2131,13 +2495,14 @@ def cmd_remove(args,cfg,state,herdr):
     if len(candidates)!=1: raise WorkflowError("removal target must identify exactly one Herdr worktree")
     item=candidates[0]; workspace,path=worktree_item_ids(item)
     with worktree_lock(state, path):
-        _, _, canonical = validate_worktree_identity(cfg, path)
+        _, repo, canonical = validate_worktree_identity(cfg, path)
         branch=git(path,"branch","--show-current").stdout.strip(); dirty=bool(git(path,"status","--porcelain").stdout.strip())
         check_remove_allowed(dirty,args.force,args.confirm,branch)
         # Re-read immediately before the destructive call while holding our workflow lock.
         branch2=git(path,"branch","--show-current").stdout.strip(); dirty2=bool(git(path,"status","--porcelain").stdout.strip())
         if branch2 != branch or dirty2 != dirty: raise WorkflowError("worktree changed while removal was being validated")
         suppress_teardown(state, str(path))
+        detach_links(path, repo)
         if is_desktop(herdr):
             herdr.remove_worktree(canonical, workspace, path, args.force)
         elif workspace:
@@ -2477,6 +2842,7 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
         # Before removal: a server outlives its checkout (and Herdr's tab
         # closing never reaches one an agent started in the background).
         stopped = stop_worktree_servers(state, path)
+        detach_links(path, repo)
         if is_desktop(herdr):
             herdr.remove_worktree(canonical, workspace, path, dirty)
         elif workspace:
@@ -2612,6 +2978,12 @@ def cmd_doctor(args,cfg,state):
         checks.append({"check":f"command:{tool}","ok":shutil.which(tool) is not None})
     for name,repo in cfg["repositories"].items():
         p=Path(repo["path"]); checks.append({"check":f"repo:{name}","ok":p.is_dir() and (p/".git").exists(),"value":str(p)})
+    if WINDOWS:
+        launcher = Path.home() / ".local/bin/hwt.cmd"
+        found = shutil.which("hwt")
+        checks.append({"check": "launcher", "value": str(launcher),
+                       "ok": launcher.is_file() and found is not None
+                             and Path(found).resolve() == launcher.resolve()})
     latest = latest_remote_version()
     update = {"installed": __version__, "latest": latest,
               "update_available": bool(latest and version_tuple(latest) > version_tuple(__version__))}
@@ -2740,7 +3112,19 @@ def parser() -> argparse.ArgumentParser:
     return p
 
 
+def utf8_output() -> None:
+    """Windows writes piped output in the ANSI code page; the Corral panel and
+    Herdr read UTF-8. A console already gets Unicode."""
+    if not WINDOWS:
+        return
+    for stream in (sys.stdout, sys.stderr):
+        with contextlib.suppress(AttributeError, OSError, ValueError):
+            if not stream.isatty():
+                stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main(argv: list[str] | None=None) -> int:
+    utf8_output()
     args=parser().parse_args(argv)
     try:
         if args.command == "update":

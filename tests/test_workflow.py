@@ -449,6 +449,7 @@ class LayoutTests(unittest.TestCase):
             "herdr", "workspace", "report-metadata", "w2", "--source",
             hwt.PLUGIN_ID, "--token", "dev_port=4180"])
 
+    @unittest.skipIf(os.name == "nt", "Windows has no ttys (see test_windows)")
     def test_server_reminder_writes_to_pane_tty_without_echoing_a_command(self):
         api = hwt.Herdr("herdr")
         process_info = mock.Mock(stdout=json.dumps(
@@ -477,7 +478,7 @@ class LayoutTests(unittest.TestCase):
         api = hwt.Herdr("herdr")
         process_info = mock.Mock(stdout=json.dumps(
             {"result": {"process_info": {"shell_pid": 4242}}}))
-        with mock.patch.object(hwt, "run") as command, \
+        with mock.patch.object(hwt, "run") as command, mock.patch.object(hwt, "WINDOWS", False), \
                 mock.patch.object(hwt.os, "readlink", side_effect=OSError):
             command.side_effect = [mock.Mock(), process_info, mock.Mock()]
             api.show_reminder("w2:p3", "To start the development server, run: hwt dev")

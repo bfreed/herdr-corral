@@ -28,6 +28,7 @@ A column docked at the window's left edge, 260 px wide, in the theme's `chrome` 
 - **Clicking a worktree row** selects the space that shows it, or runs `hwt open <path>`.
 - **Cleaning up:** × (or **Clean up…**) asks first. **Delete worktree and branch** runs `hwt cleanup <path>`, which is merge-checked. **Delete anyway** runs `hwt cleanup <path> --abandon --confirm <branch>`.
 - **Install** runs on the space's machine: it clones this repository's release tag into `~/.local/share/herdr-corral`, then runs `install.py --desktop --repos-root <the repo's parent folder> --agent-kind claude`.
+- **Windows machines:** a space's machine can run Windows whatever this window runs on, so the panel decides per machine. It tries `sh`; when there is none ("cannot start sh: program not found") or it's Git's (`uname` says MINGW/MSYS/CYGWIN), it runs programs directly: the probe and Install as Python scripts (`py -3`, else `python`, else `python3`), `hwt` as `<python> <clone>\hwt.py`, which it reads from the `hwt.cmd` install.py writes (Herdr's exec starts only `.exe` files by name), and `hc` by the path the probe found. It remembers the machine and its Python. Windows paths from Herdr, git and hwt (`C:\…`, either separator, any case) are compared without regard to case or separator.
 - **Update panel** copies the machine's `desktop/corral/mods/corral/*` over this panel's own files, with `main.js` last.
 - **Tab names:** any terminal labelled `corral.tab=<name>` gets its tab named that, once. A tab the person named is never renamed.
 
@@ -35,14 +36,14 @@ A column docked at the window's left edge, 260 px wide, in the theme's `chrome` 
 
 One mod, `corral`, placed `"left"` at 260 px. It uses these `herdr` functions:
 
-- `exec` (always as `sh -lc`, with `on: space.machine`)
+- `exec` (with `on: space.machine`): as `sh -lc` on POSIX machines, so the login PATH applies; on Windows machines, programs directly
 - `spaces`, `panes`, `focused`, `terminals`
 - `run`: `tab.rename`, `tab.move`, `space.select`, `tab.new`, `layout.resize`
 - `layout`, `window`, `settings`, `theme`, `notify`
 - `shared` / `setShared` (`corral.width`)
 - `readTextFile` / `writeTextFile` / `appHome` (the self-update)
 
-It runs `hwt` (Corral ≥ 1.2.0), `hc ls`/`hc send` (Start dev server), `git`, `python3` and `open`/`xdg-open`. It reaches the network only through Install (`git clone`).
+It runs `hwt` (Corral ≥ 1.2.0; on Windows ≥ 1.3.0), `hc ls`/`hc send` (Start dev server), `git`, `python3` (on Windows `py`/`python`) and `open`/`xdg-open`/`start`. It reaches the network only through Install (`git clone`).
 
 ## Watch out
 
@@ -51,12 +52,14 @@ It runs `hwt` (Corral ≥ 1.2.0), `hc ls`/`hc send` (Start dev server), `git`, `
 - **Remote tab ids carry a `machine/` prefix**, which terminal labels don't. Compare the last path segment.
 - **Older `hwt` releases don't know `--frontend`:** run `hwt update` without it.
 - **Docked left, it's the window's first column**, under macOS's window buttons.
+- **Herdr won't dock it into a shipped layout.** `main` (the default), `terminals` and `win98` are read-only; while one shows, a new mod waits, with no error. The installers (`desktop/install.sh`, `desktop/install.ps1`) ask the open window for a copy first: `herdr-app do layout.clone --name main --as main-corral`, which switches to it, and Herdr docks the panel there. By hand: add `{"id":"corral","type":"block","size":{"px":260},"content":{"mod":"corral"}}` as the first child of your own layout's root row.
 - **Collapse goes by width:** the panel finds its own layout block by `content.mod === "corral"` and resizes it.
 
 ## Done when
 
 - **Main checkout:** on a repository's main checkout, New worktree makes a space with agent, shell and server tabs in that order, and selects it.
 - **Clean up:** × then **Delete worktree and branch** removes a merged worktree and its branch. An unmerged one shows Corral's reason and **Delete <branch> anyway**.
-- **Install:** a space on a machine without Corral shows Install. After it, the same space shows **Set up** or the repository.
+- **Install:** a space on a machine without Corral shows Install. After it, the same space shows **Set up** or the repository. The same on a Windows machine.
+- **Docked:** after `install.sh`/`install.ps1` on a fresh Herdr (showing `main`), the panel shows on the left of `main-corral`.
 - **Collapse:** the toggle folds the panel to a 40 px rail and back to its width.
 - **Checker:** `herdr-app check` passes.
