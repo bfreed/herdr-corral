@@ -61,6 +61,28 @@ No typing required, two ways:
 - **`hwt sweep`** — cleans *every* worktree that qualifies without questions in one shot, and reports the kept ones with the exact `--abandon` command for each.
 - **The Corral palette** — a popup (bind it to a key, below) listing every worktree with a safety annotation (`merged — cleans instantly`, `squash-merged — cleans instantly`, `nothing unique — cleans instantly`, `has unpublished commits`, `dirty`). Pick a number to clean it, `n` to create a worktree, `s` to sweep, `q` to close.
 
+## Herdr Desktop
+
+Corral also works with [Herdr Desktop](https://herdr.dev/), through each machine's herdr-core. Desktop's window can run on another computer: a space's worktree, ports and dev server live on the machine the space runs on.
+
+1. Add the panel on the computer where Desktop's window runs, once. Either ask an agent in a Desktop space on that computer:
+
+   > Add the Herdr mod at github.com/bfreed/herdr-corral/tree/main/desktop/corral
+
+   or run:
+
+   ```sh
+   curl -fsSL https://raw.githubusercontent.com/bfreed/herdr-corral/main/desktop/install.sh | sh
+   ```
+
+   Herdr docks it on the left the first time it sees it. After that the panel updates itself: when a machine's Corral ships a newer panel (after `hwt update` there), it offers **Update panel**.
+2. Focus a space. If Corral isn't installed on that space's machine, the panel offers **Install Corral**. That needs git and Python 3.11+ there, clones this repository's release into `~/.local/share/herdr-corral`, and runs `install.py --desktop` with the repository's parent folder as the repositories folder. If the repository isn't set up, the panel offers **Set up** with a base-branch choice, plus **More settings…**, which opens `hwt init` in a new tab.
+3. On a repository's main checkout, type a branch name and click **New worktree**. On a worktree, the panel shows its port and dev URL, starts the dev server, and offers **Clean up…** (merge-checked, as `hwt cleanup`). Every worktree in the list has a **×** for the same Clean up. When Corral keeps a branch because of unmerged commits or uncommitted changes, the panel says why and offers **Delete *branch* anyway** (`hwt cleanup --abandon`). The panel's sidebar button folds it to a narrow rail.
+
+TUI and Desktop work side by side; there's nothing to switch. `hwt` drives whichever Herdr it runs in: the TUI from a TUI pane (and for the TUI plugin's own hooks), Desktop from a Desktop terminal. Only in a shell outside both (ssh, cron) does `frontend` in `~/.config/herdr-corral/config.toml` decide (default `tui`). `--frontend` overrides it all; the panel always passes `--frontend desktop`.
+
+Panel tests: `node --test desktop/tests/panel.test.mjs`. Check it as Herdr loads it: `herdr-app check ~/.config/herdr-app/mods/corral`. The panel ships as the same version as `hwt` (a test checks); `desktop/corral/` is laid out for Herdr's mod gallery (`RECIPE.md`, `preview.png`, `mods/corral/`).
+
 ## Keybindings
 
 Herdr's sidebar right-click menu is not extensible by plugins (as of 0.8.0 the plugin manifest's `contexts` field is parsed but not used by any UI — verified against the Herdr source), so Corral's interactive surface is the palette popup plus keybindings. Add to `~/.config/herdr/config.toml` and run `herdr server reload-config`:
