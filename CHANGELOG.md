@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.5 — 2026-11-05
+
+- **A Desktop cleanup run from inside its own worktree finishes.** Run from one of the worktree's own tabs (as an agent in its agent tab does), `hwt cleanup` ended that tab right after deleting the checkout, which ended hwt before it deleted the branch, its remote copy and the lease, leaving the cleanup half done. hwt now ends its own terminal only after the whole command has finished and printed its result. A command that fails keeps it, so the error stays readable.
+
 ## 1.4.4 — 2026-11-05
 
 - **`hwt doctor` crashed right after installing when no repositories were found.** If `--repos-root` (default `~/repos`) has no clones directly inside it, `install.py` writes a config with no `[repositories]` table. `hwt doctor`, the installer's suggested next step, then failed with `KeyError: 'repositories'`, and `hwt info` (the Desktop panel's view) did too. A config without repositories is now valid. `doctor` says to run `hwt init` inside a repository or `hwt add <path>`, and the installer warns when it found no repositories and says how to point it at the right folder.
