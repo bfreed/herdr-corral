@@ -8,24 +8,20 @@ Herdr Desktop (`herdr-app`, built on herdr-core) has its own "New worktree" in t
 
 Corral does not run there:
 
-- Desktop has no TUI plugins. Its extensions are JavaScript "mods" in `~/.config/herdr-app/mods/`.
+- Desktop has no TUI plugins. Its extensions are JavaScript "mods" in `~/.config/herdr-app/mods/` on the computer where the window runs.
 - Desktop sends no "worktree created" event that anything could listen to.
 - `hwt` drives the TUI's `herdr` binary, so its workspaces and tabs land in the TUI, not in Desktop.
 
-The setup this is for: the Desktop window runs on a laptop, and the dev PC is added under Settings → Machines. Spaces for the dev PC run on that PC's herdr-core, reached over SSH. Corral runs on the dev PC, where `herdr-app` isn't installed, so Corral can't use `herdr-app do`.
-
 What we lose: `.env` copies, `node_modules` setup, the agent/shell/server tabs, the agent start, the port lease, branching from the configured base (`origin/develop` for katapult-lidar) and merge-checked cleanup.
+
+The setup this is for: the Desktop window runs on a laptop, and each dev PC or VPS is added under Settings → Machines. Spaces for a machine run on that machine's herdr-core, reached over SSH. `herdr-app` isn't installed on those machines.
 
 ## The shape
 
-**`hwt` keeps doing all the work; the mod is only a dialog.** Agents create worktrees by running `hwt new … --background` from a shell, so the command line has to work in Desktop anyway. If the logic lived in the mod, agents and the dialog would behave differently.
+- **`hwt` does all the work, on the machine where the code is.** Agents create worktrees by running `hwt new … --background` from a shell, so the command line has to work without the window. If the logic lived in the mod, agents and the panel would behave differently.
+- **A Corral panel in the Desktop window is the GUI.** It follows the focused space, shows its Corral state, and has buttons for everything. It runs `hwt` on that space's machine, and installs and sets up Corral there the first time.
 
-Two pieces:
-
-1. **Corral learns to drive Desktop.** A second adapter beside the existing `Herdr` class, picked by a config setting.
-2. **A `corral` mod** that asks for a branch name, runs `hwt new`, and shows the result as a toast. It's opened with a key, like `prefix+u` today.
-
-## Piece 1: Corral's Desktop adapter
+## Piece 1: `hwt` drives herdr-core (`frontend = "desktop"`)
 
 Config, in `~/.config/herdr-corral/config.toml`:
 
@@ -35,7 +31,7 @@ frontend = "desktop"   # "tui" (today's behavior, the default) or "desktop"
 
 There's also a `--frontend` flag for testing. Make it explicit, not auto-detected: both programs can be installed and running at once.
 
-A `HerdrCore` class with the methods `cmd_new`, `cmd_open`, `bootstrap`/`ensure_layout` and cleanup already call on `Herdr`. It works only through `hc`, the dev PC's own herdr-core, so it works with the window closed or on another computer.
+A `HerdrCore` class with the methods `cmd_new`, `cmd_open`, `bootstrap`/`ensure_layout` and cleanup already call on `Herdr`. It works only through `hc`, the machine's own herdr-core, so it works with the window closed or on another computer.
 
 The route: Desktop shows any core terminal labelled `herdr.space=<id>` and `herdr.tab=<id>`, and makes a new space or tab for an id it doesn't know. Seen on a live Desktop terminal (`hc get <t> --json`): `"herdr.space": "sp<32 hex>"`, `"herdr.tab": "tb<32 hex>"`. `hc ls --json` doesn't print labels; use `hc get` or `hc ls --label k=v`.
 
@@ -46,116 +42,83 @@ The route: Desktop shows any core terminal labelled `herdr.space=<id>` and `herd
 | shell and server tabs | `herdr tab create --label shell` | the same `hc run`, same space id, a new tab id each, running a shell |
 | start the agent | `herdr agent start` | the command on the first tab |
 | find an existing space for a path | `herdr workspace list` / `get` | `hc ls --json`, then `hc get` on each terminal; match `cwd` or `foreground.cwd` and read its `herdr.space` |
-| focus | `herdr workspace focus` | none: focus belongs to each screen. Fine for `--background`; interactive `hwt new` just leaves it unfocused |
+| focus | `herdr workspace focus` | none from `hc`: focus belongs to each screen. The panel selects the new space itself (`space.select`) when you created it there |
 | close on cleanup | TUI workspace close | `hc kill` every terminal labelled with that space; the last one closing closes the space |
 | per-tab env (`PORT`, `HWT_DEV_PORT`, `HWT_REMOTE_URL`, the repo's `environment`) | `--env` on `tab create` | **Not supported**: `hc run` has no `--env`, and Desktop terminals get the core's environment. Wrap the agent's command as `env PORT=… HWT_DEV_PORT=… claude`. The shell and server tabs go without; `hwt dev` and `hwt status` read the port lease from Corral's state, so they still work |
-| reminder lines in the shell/server panes | `show_reminder` | none from the command line; `hwt new` prints them in its JSON and the mod shows them as a toast |
+| reminder lines in the shell/server panes | `show_reminder` | none; the panel shows the port, dev URL and commands instead |
 | workspace metadata (`dev_port`, `dev_url`) | `herdr workspace metadata` | none; the lease in Corral's state is the record |
 
 Worktree path: no change. `worktree_root/<repo>/<slug>-<hash>` already sits under `~/.herdr/worktrees`, and Desktop's "Open worktree" lists every `git worktree list` entry, so Corral's worktrees appear there too.
 
-## Piece 2: the `corral` mod
+Other `hwt` changes the panel needs:
 
-`~/.config/herdr-app/mods/corral/` **on the laptop**, where the window runs, under our own name so Herdr updates never replace it. (Updates replace shipped mods whole and move any edits aside to `<name>-edited`.) Every `exec` passes `on: space.machine`, so `git` and `hwt` run on the dev PC. Use `hwt`'s full path (`~/.local/bin/hwt`) unless a remote `exec` turns out to load the login shell's PATH.
+- **`install.py --desktop`**: skips the TUI plugin link, doesn't require the TUI's `herdr` binary, and writes `frontend = "desktop"`. Today's installer checks for the TUI and links the plugin.
+- **`hwt add <path> [--base <ref>]`**: adds a repo with the existing safe defaults, without questions. Today `hwt init` refuses to run outside a terminal, and `hwt new` refuses repos that aren't set up.
+- **`--json` on `hwt doctor`, `hwt list` and `hwt status`**, so the panel reads state instead of parsing text.
+- **A version the panel can check** (`hwt --version`), so it can offer `hwt update` instead of failing.
+
+## Piece 2: the Corral panel
+
+`~/.config/herdr-app/mods/corral/` on the laptop, under our own name so Herdr updates never replace it. (Updates replace shipped mods whole and move any edits aside to `<name>-edited`.)
 
 `mod.json`:
 
 ```json
-{ "place": "none", "title": "Corral",
-  "overlay": { "kind": "dialog", "width": 460, "height": 300 } }
+{ "place": "left", "size": 220, "title": "Corral" }
 ```
 
-`keys.json` entry (any free key):
+The first time Herdr finds the folder, it docks one copy into the current layout; after that it stays wherever the person drags or resizes it. `"left"` puts it in the sidebar area with Spaces and Agents; `"right"` or `"bottom"` work too.
 
-```json
-"ctrl-shift-u": "mod.open:corral"
-```
+The panel shows the **focused space** (`focused().space`, its machine, its first terminal's folder). Every `exec` passes `on: space.machine`, so `git` and `hwt` run on that machine. It runs commands through a login shell (`sh -lc`) so `~/.local/bin` is on the PATH, and calls `hwt` by its full path after an install.
 
-What the dialog does:
+What it shows, by state:
 
-- Works out the repo from the focused space's first terminal folder, the way the shipped `worktree` mod does.
-- **New**: branch name input; Enter runs `hwt new <branch> --repo <repo top> --background`. Shows the base it will use, from a new `hwt list --json`.
-- **Clean up** (only on a worktree space): runs `hwt cleanup <path>`. That's merge-checked, same as the TUI action.
-- **Open**: runs `hwt open` on a picked worktree. Corral's open re-runs bootstrap (tabs, lease) for a worktree that has no space yet.
-- On success: `notify({ title: "Corral", body: "<repo>/<branch>: port 4112 — http://hermes…:4112" })` and close.
-- On failure: the error stays in the dialog, red.
+1. **Not a git folder.** "Corral works in git repositories." Nothing else.
+2. **Corral isn't installed on this machine.** "Corral isn't installed on hermes" and an **Install Corral** button. Before running, it shows what will happen: clone Corral from its repo, pinned to a release tag, into `~/.local/share/herdr-corral`; put `hwt` in `~/.local/bin`; set the repos folder to the parent of this space's repo (e.g. `~/Documents/GitRepos`); run `install.py --desktop`. It checks for `python3` 3.11+ and `git` first; if either is missing, it says so and stops. It never installs system packages.
+3. **Installed, but this repo isn't set up.** "Set up katapult-lidar" with one question: the base branch, suggested from the remote's default (`origin/HEAD`), changeable (for example to `origin/develop`). **Set up** runs `hwt add`. **More settings…** opens a new tab in this space running the existing `hwt init` questions.
+4. **Corral is out of date.** An **Update Corral** button runs `hwt update`.
+5. **Ready, on the repo's main checkout.** A branch-name box with **New worktree** (`hwt new <branch> --repo <top> --background`, then select the new space), a list of this repo's worktrees (click to open or focus), and the base branch shown.
+6. **Ready, on a worktree.** Branch, port, dev URL (click to open), dev server running or not, and buttons: **Start dev server** (runs `hwt dev` in the server tab), **Clean up** (merge-checked `hwt cleanup`, with a `Dialog`-style confirm; refusals show why and delete nothing).
 
-Untested draft of the core of `main.js`:
+Messages use Desktop's `notify` toasts; failures stay in the panel in the error color until dismissed.
 
-```js
-import { View, div } from "gpui-kit";
-import { v_flex, InputState, Input } from "gpui-base";
-import { exec, focused, panes, spaces, notify, closeOverlay, props, theme } from "herdr";
+Long jobs: `exec` waits at most 10 minutes. Corral opens the tabs before installing dependencies, so `hwt new` returns well inside that.
 
-export default class Corral extends View {
-  init(_props, cx) {
-    this.error = ""; this.busy = false; this.repo = null;
-    this.input = InputState.new({ placeholder: "branch name" });
-    this.input.on("submit", (_e, cx) => this.create(cx));
-    this.input.focus();
-    cx.spawn(async (cx) => {
-      const folder = this.folder();
-      const r = folder && await exec("git", ["rev-parse", "--show-toplevel"], { cwd: folder });
-      this.repo = r?.code === 0 ? r.stdout.trim() : null;
-      cx.notify();
-    });
-  }
+A key also opens the same view as a dialog for people who hide the panel: `keys.json` `"ctrl-shift-u": "mod.open:corral"` with an `overlay` entry in `mod.json`.
 
-  // Where the focused space is now: its first terminal's live folder.
-  folder() {
-    const s = spaces().find((x) => x.id === focused()?.space);
-    const tabs = new Set((s?.tabs ?? []).map((t) => t.id));
-    return panes().find((p) => tabs.has(p.tab) && p.cwd)?.cwd ?? s?.folder ?? null;
-  }
+## Piece 3: the right-click menus
 
-  create(cx) {
-    const branch = this.input.value().trim();
-    if (!branch || !this.repo || this.busy) return;
-    this.busy = true; this.error = ""; cx.notify();
-    cx.spawn(async (cx) => {
-      // 10 minutes is exec's cap; Corral sets up tabs before installing dependencies.
-      const r = await exec("hwt", ["new", branch, "--repo", this.repo, "--background"], { timeout: 600_000 })
-        .catch((e) => ({ code: 1, stderr: String(e) }));
-      this.busy = false;
-      if (r.code !== 0) { this.error = (r.stderr || r.stdout || "hwt new failed").trim(); cx.notify(); return; }
-      const out = JSON.parse(r.stdout);
-      notify({ title: "Corral", body: `${out.repository}/${out.branch}: port ${out.port} — ${out.dev_url}` });
-      closeOverlay(props().overlay);
-    });
-  }
+The built-in space menu, **+** menu, tab-bar panel buttons (Files, Changes) and command palette can't take extra items:
 
-  render() {
-    const t = theme();
-    return v_flex().size_full().p(16).gap(10).bg(t.popover).text_color(t.foreground)
-      .child(div().font_semibold().child(this.repo ? `New worktree of ${this.repo.split("/").pop()}` : "Not in a Corral repository"))
-      .child(Input.new(this.input))
-      .when(this.busy, (el) => el.child(div().text_color(t.dim).frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90)))
-      .when(Boolean(this.error), (el) => el.child(div().text_color(t.blocked).child(this.error)));
-  }
-}
-```
+- The `menu` mod is opened by name from `spaces`, `tabs` and `terminals-bar`, and its items are written in its code.
+- The tab-bar panel buttons are written in the `tabs` mod (`files` and `changes` only).
+- The palette lists a fixed set plus app commands; it hides `mod.open` and doesn't list mod commands.
 
-Check with `herdr-app check ~/.config/herdr-app/mods/corral` before using it.
+Two things are open without copying Herdr's mods:
 
-## Piece 3: the right-click menu
+- **The terminal right-click menu.** A layout's root can name its own mod (`"terminal_menu": "corral-menu"`). This replaces the whole terminal menu, so it repeats Herdr's few items (split, zoom, close…) and adds Corral's. It needs a personal copy of the layout (`layout.clone main`). That copy keeps using Herdr's mods, which keep updating; only the layout tree stops getting Herdr's changes.
+- **A floating drawer** (`floating` with `peek` on a layout node), as an alternative to the docked panel. It also needs a personal layout copy.
 
-The space menu and the **+** menu open the shipped `worktree` dialog by name. That menu (`menu`) is opened by name from `spaces`, `tabs` and `terminals-bar`. There's no hook for adding items. The choices:
+Recommendation: the docked panel first; it needs no copies of anything. Ask Herdr upstream for a way to add items to the space menu, e.g. menu items contributed by mods. Treat the terminal-menu copy as optional.
 
-- **a. Key only (recommended to start).** `ctrl-shift-u` opens Corral; the built-in "New worktree" stays as plain git. No upkeep.
-- **b. Clone the menus.** Clone `menu` and `new-menu` so "New worktree" opens `corral`, then clone `spaces`, `tabs`, `terminals-bar` and the layout so they open the clones. That's five or six forked mods to re-merge on every Herdr release.
-- **c. Ask Herdr for a hook.** For example, a setting that sends "New worktree" to a named mod, or the `worktree` mod running a command after `git worktree add`. That would make **b** unnecessary.
+## Coworker setup
 
-Recommendation: start with **a**, and file **c** upstream.
+1. Install Herdr Desktop.
+2. Add their machines under Settings → Machines.
+3. Add the Corral mod on the laptop, once. Desktop can add a mod from a URL (its agent reads the files first, then installs the mod and its keys); if that flow can't take a repo subfolder, copy `desktop-mod/` to `~/.config/herdr-app/mods/corral`.
+
+Then, in a space on any machine, the Corral panel offers to install Corral there and set up the repo. If they also write code on the laptop itself, the same panel installs Corral there.
 
 ## To check before building
 
-1. Tab names. `hc` can't rename tabs, so Corral's tabs show as 1, 2, 3, not agent/shell/server. Find out whether a label sets the name, or whether the mod renames them with `tab.rename` after `hwt new` returns the tab ids.
-2. Whether a space id Corral makes up (`sp` + 32 random hex) is accepted as-is, and whether all its tabs land in one space when started a moment apart.
-3. Whether a remote `exec` from the mod finds `hwt` on the PATH.
-4. Whether `mod.open` opens the mod as the dialog its `mod.json` `overlay` describes; the shipped `picker` does it this way.
+1. **Docking persists.** That Herdr's first-sight docking into the shipped `main` layout survives restarts and updates (the guide says the layouts decide after the first time; shipped layouts are replaced on every start, and clicks are kept separately).
+2. **Tab names.** `hc` can't rename tabs, so Corral's tabs show as 1, 2, 3, not agent/shell/server. Find out whether a label sets the name, or the panel renames them with `tab.rename` after `hwt new` returns the tab ids.
+3. **Made-up space ids.** Whether `sp` + 32 random hex is accepted as-is, and whether all its tabs land in one space when started a moment apart.
+4. **Remote PATH.** Whether `exec(…, { on })` runs a login shell; if not, keep the `sh -lc` wrapping.
+5. **Add mod from URL.** Whether it can take a subfolder of the herdr-corral repo.
 
 ## Not changing
 
 - Worktree folders and the naming slug.
 - `hwt cleanup`, `hwt sweep`, `hwt reap`, port ranges, repo overlays in `repos.d/`.
-- The TUI path: `frontend = "tui"` stays the default until Desktop is the daily driver.
+- The TUI path: `frontend = "tui"` stays the default for TUI users.
