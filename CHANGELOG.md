@@ -3,6 +3,7 @@
 ## 1.2.1 — 2026-11-05
 
 - **`hwt init` checks the dev command before saving it.** A command that could never run in the repository used to be saved silently and only failed later in `hwt dev`, often as an unhelpful package-manager error (for example `npx quasar dev` in a repository with no `package.json` gives "npm error could not determine executable to run"). The interview now warns when a package runner (`npm`, `npx`, `pnpm`, `yarn`, `bun`, …) is used without a `package.json`, when the executable is not on `PATH`, or when a relative script path does not exist, then asks whether to save it anyway (default no, which re-prompts). The prompt also names the repository being configured.
+- Clearer `hwt init` wording: the dev server step now says what the command is for, when to use `{port}` (with `npm run dev` and Quasar examples), how to answer `none`, and that Enter accepts the bracketed value. The env-file message says plainly that there is nothing to copy.
 
 ## 1.2.0 — 2026-11-05
 

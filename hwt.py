@@ -1411,7 +1411,7 @@ def run_init_interview(cfg: dict[str, Any], name: str, config_path: Path) -> Pat
         if ask_yes_no(f"Copy untracked env files into new worktrees ({listing})?", True):
             files = env_ops
     else:
-        print("No untracked .env files found in the repository root.")
+        print("No .env files to copy into new worktrees.")
     dep_policy = "clone"
     install = detect_install_command(canonical)
     if install:
@@ -1422,9 +1422,14 @@ def run_init_interview(cfg: dict[str, Any], name: str, config_path: Path) -> Pat
             description = f"run '{' '.join(install)}'"
         if not ask_yes_no(f"Set up dependencies automatically in new worktrees ({description})?", True):
             dep_policy = "independent"
-    print("The dev command is a template run by 'hwt dev' in each worktree, on a leased")
-    print("per-worktree port: {port}/{host} placeholders are substituted, and the")
-    print("PORT/HOST environment variables are always set for servers that read them.")
+    print()
+    print("Dev server: the command 'hwt dev' runs to start this project in a worktree.")
+    print("Each worktree gets its own port. If the server ignores $PORT, put {port}")
+    print("where the command takes a port, for example:")
+    print("  npm run dev -- --port {port}     (Vite and most npm projects)")
+    print("  npx quasar dev --port {port}")
+    print("Type 'none' if this repository has no dev server, or press Enter to accept")
+    print("the value in brackets.")
     dev = ask_dev_command(canonical, suggest_dev_command(canonical))
     overlay_dir = config_path.parent / "repos.d"
     overlay_dir.mkdir(parents=True, exist_ok=True)
