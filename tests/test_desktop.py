@@ -229,6 +229,20 @@ class InfoTests(DesktopTestCase):
         info = self.info(self.root, self.cfg())
         self.assertFalse(info["git"])
 
+    def test_it_points_the_panel_at_the_panel_files_this_install_ships(self):
+        panel = self.info(self.root, self.cfg())["panel"]
+        self.assertEqual(panel["version"], hwt.__version__)
+        self.assertIn("main.js", panel["files"])
+        self.assertIn("mod.json", panel["files"])
+        self.assertTrue((Path(panel["dir"]) / "main.js").read_text().startswith("// Corral panel"))
+
+
+class PanelVersionTests(unittest.TestCase):
+    def test_the_panel_ships_as_the_same_version_as_hwt(self):
+        # The panel updates itself when a machine's Corral is newer than it is.
+        source = (Path(hwt.__file__).parent / hwt.PANEL_DIR / "main.js").read_text()
+        self.assertIn(f'const VERSION = "{hwt.__version__}";', source)
+
 
 class AddTests(DesktopTestCase):
     def add(self, path, base=None, repositories=None):

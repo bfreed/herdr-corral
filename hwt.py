@@ -1862,11 +1862,23 @@ def checkout_list(canonical: Path) -> list[dict[str, Any]]:
     return items
 
 
+PANEL_DIR = Path("desktop/corral/mods/corral")
+
+
+def panel_files() -> dict[str, Any] | None:
+    """The Corral panel this install ships, for the panel to update itself from."""
+    folder = install_root() / PANEL_DIR
+    if not folder.is_dir():
+        return None
+    return {"version": __version__, "dir": str(folder),
+            "files": sorted(p.name for p in folder.iterdir() if p.is_file())}
+
+
 def cmd_info(args, cfg, state):
     """Everything the Corral panel shows for one folder, as JSON."""
     folder = resolve_existing(Path(args.folder or Path.cwd()))
     out: dict[str, Any] = {"version": __version__, "frontend": args.frontend,
-                           "folder": str(folder), "git": False}
+                           "panel": panel_files(), "folder": str(folder), "git": False}
     top = git(folder, "rev-parse", "--show-toplevel", check=False)
     common = git(folder, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)
     if top.returncode or common.returncode:

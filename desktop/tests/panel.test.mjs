@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
-const source = (await readFile(new URL("../corral/main.js", import.meta.url), "utf8"))
+const source = (await readFile(new URL("../corral/mods/corral/main.js", import.meta.url), "utf8"))
   .replace(/^import [^;]+;\n/gm, "")
   .replace("export default class Corral", "class Corral");
 
@@ -30,8 +30,8 @@ function element() {
 const textOf = (n) => (typeof n === "string" ? n : (n?.children ?? []).map(textOf).join(" "));
 const find = (n, id) => (n?.id === id ? n : (n?.children ?? []).map((c) => find(c, id)).find(Boolean));
 
-function harness({ probe = {}, info = null, hwt = {}, space = {}, terms = [], tabs = null, width = 260 } = {}) {
-  const calls = { exec: [], run: [], notify: [] };
+function harness({ probe = {}, info = null, hwt = {}, space = {}, terms = [], tabs = null, width = 260, files = {} } = {}) {
+  const calls = { exec: [], run: [], notify: [], writes: [] };
   const store = {};
   const block = { id: "b7", type: "block", content: { mod: "corral" }, size: { px: width } };
   const theSpace = { id: "hermes/sp1", machine: "hermes", folder: "/r/demo", named: false,
@@ -43,6 +43,14 @@ function harness({ probe = {}, info = null, hwt = {}, space = {}, terms = [], ta
   const globals = {
     View: class {}, div: element, v_flex: element, h_flex: element, svg: element,
     shared: (k) => store[k], setShared: (k, v) => { store[k] = v; return null; },
+    appHome: () => "/mac/.config/herdr-app",
+    readTextFile: async (path, opts) => files[`${opts?.on ?? "local"}:${path}`] ?? null,
+    writeTextFile: async (path, text, expected) => {
+      assert.equal(files[`local:${path}`] ?? null, expected, "writes only over what it read");
+      files[`local:${path}`] = text;
+      calls.writes.push(path);
+      return null;
+    },
     Input: { new: element },
     InputState: { new: () => { let v = ""; return { on() {}, value: () => v, set_value: (x) => { v = x; }, type: (x) => { v = x; } }; } },
     theme: () => new Proxy({}, { get: (_, k) => String(k) }),
@@ -239,4 +247,37 @@ test("clicking a worktree that has no space opens it with hwt open", async () =>
 test("on macOS the header clears the window buttons", () => {
   const h = harness();
   assert.equal(h.panel.lightsPadding(), 70); // (16 + 64) - the panel's own 10 px padding
+});
+
+test("a machine whose Corral ships a newer panel: Update panel copies its files over this one, main.js last", async () => {
+  const dir = "/h/.local/share/herdr-corral/desktop/corral/mods/corral";
+  const files = {
+    "local:/mac/.config/herdr-app/mods/corral/main.js": "// Corral panel old",
+    "local:/mac/.config/herdr-app/mods/corral/mod.json": "{}",
+    [`hermes:${dir}/main.js`]: "// Corral panel new",
+    [`hermes:${dir}/mod.json`]: "{}",
+    [`hermes:${dir}/icon.svg`]: "<svg/>",
+  };
+  const h = harness({ files, info: configured({ panel: { version: "1.3.0", dir, files: ["icon.svg", "main.js", "mod.json"] } }) });
+  await h.settle();
+  assert.match(textOf(h.draw()), /Corral on hermes has panel 1\.3\.0; this one is 1\.2\.0/);
+  await h.click("update-panel");
+  assert.deepEqual(h.calls.writes, ["/mac/.config/herdr-app/mods/corral/icon.svg", "/mac/.config/herdr-app/mods/corral/main.js"],
+                   "unchanged mod.json isn't rewritten; main.js (which reloads the panel) goes last");
+  assert.equal(files["local:/mac/.config/herdr-app/mods/corral/main.js"], "// Corral panel new");
+});
+
+test("no update offered for the same or an older panel, and none over a folder that isn't this panel", async () => {
+  const same = harness({ info: configured({ panel: { version: "1.2.0", dir: "/d", files: ["main.js"] } }) });
+  await same.settle();
+  assert.equal(find(same.draw(), "update-panel"), undefined);
+  const older = harness({ info: configured({ panel: { version: "1.1.9", dir: "/d", files: ["main.js"] } }) });
+  await older.settle();
+  assert.equal(find(older.draw(), "update-panel"), undefined);
+  const stranger = harness({ files: { "local:/mac/.config/herdr-app/mods/corral/main.js": "// someone else's corral" },
+                             info: configured({ panel: { version: "9.0.0", dir: "/d", files: ["main.js"] } }) });
+  await stranger.settle();
+  await stranger.click("update-panel");
+  assert.deepEqual(stranger.calls.writes, []);
+  assert.match(textOf(stranger.draw()), /isn't in \/mac\/\.config\/herdr-app\/mods\/corral/);
 });

@@ -4,12 +4,16 @@
 // Corral there, and to set the repository up, when either is missing.
 // It also names the tabs Corral starts (agent, shell, server): herdr-core
 // can't name tabs, so Corral labels their terminals corral.tab=<name>.
+// Every Corral install carries this panel's files; when a machine's are
+// newer, the panel offers to update itself from them.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { exec, spaces, panes, focused, terminals, run, theme, notify, window, layout, settings, shared, setShared } from "herdr";
+import { exec, spaces, panes, focused, terminals, run, theme, notify, window, layout, settings, shared, setShared,
+  readTextFile, writeTextFile, appHome } from "herdr";
 
-const RELEASE = "v1.2.0"; // the Corral release Install checks out
+const VERSION = "1.2.0"; // this panel; ships with the same Corral version
+const RELEASE = `v${VERSION}`; // the Corral release Install checks out
 const REPO = "https://github.com/bfreed/herdr-corral";
 const NEEDS = [1, 2, 0]; // the oldest hwt this panel works with
 const TAB_ORDER = ["agent", "shell", "server"];
@@ -243,6 +247,25 @@ export default class Corral extends View {
     });
   }
 
+  // Copies the panel files a machine's Corral ships over this panel's own;
+  // Herdr reloads the panel as main.js lands, so it goes last.
+  updatePanel(cx, panel) {
+    const on = this.view()?.machine;
+    const here = `${appHome()}/mods/corral`;
+    this.act(cx, "Updating the panel…", async () => {
+      const mine = await readTextFile(`${here}/main.js`);
+      if (!mine?.startsWith("// Corral panel")) throw new Error(`This panel isn't in ${here}; update it by hand.`);
+      const files = [...panel.files.filter((f) => f !== "main.js"), "main.js"];
+      for (const name of files) {
+        const text = await readTextFile(`${panel.dir}/${name}`, { on });
+        if (text === null) throw new Error(`Couldn't read ${name} from Corral on ${on ?? "this computer"}.`);
+        const old = await readTextFile(`${here}/${name}`);
+        if (name === "main.js") notify({ title: "Corral", body: `Panel updated to ${panel.version}`, level: "success" });
+        if (old !== text) await writeTextFile(`${here}/${name}`, text, old);
+      }
+    });
+  }
+
   askDelete(cx, c) {
     if (this.busy || !c.branch) return;
     this.deleting = { path: c.path, branch: c.branch };
@@ -420,6 +443,15 @@ export default class Corral extends View {
         h_flex().child(this.button("update", "Update Corral", (cx) => this.update(cx), { primary: true })))];
     }
     const info = st.info;
+    const newer = info?.panel && !atLeast(versionOf(VERSION), versionOf(info.panel.version)) ? info.panel : null;
+    const update = newer && this.section("Panel update",
+      this.note(`Corral on ${where} has panel ${newer.version}; this one is ${VERSION}.`),
+      h_flex().child(this.button("update-panel", "Update panel", (cx) => this.updatePanel(cx, newer), { primary: true })));
+    return update ? [update, ...this.repoParts(v, info)] : this.repoParts(v, info);
+  }
+
+  repoParts(v, info) {
+    const t = theme();
     if (!info?.git) return [this.note(`${v.folder} isn't in a git repository.`)];
     const name = basename(info.main);
     if (!info.repository) {
