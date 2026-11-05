@@ -234,13 +234,13 @@ class InfoTests(DesktopTestCase):
         self.assertEqual(panel["version"], hwt.__version__)
         self.assertIn("main.js", panel["files"])
         self.assertIn("mod.json", panel["files"])
-        self.assertTrue((Path(panel["dir"]) / "main.js").read_text().startswith("// Corral panel"))
+        self.assertTrue((Path(panel["dir"]) / "main.js").read_text(encoding="utf-8").startswith("// Corral panel"))
 
 
 class PanelVersionTests(unittest.TestCase):
     def test_the_panel_ships_as_the_same_version_as_hwt(self):
         # The panel updates itself when a machine's Corral is newer than it is.
-        source = (Path(hwt.__file__).parent / hwt.PANEL_DIR / "main.js").read_text()
+        source = (Path(hwt.__file__).parent / hwt.PANEL_DIR / "main.js").read_text(encoding="utf-8")
         self.assertIn(f'const VERSION = "{hwt.__version__}";', source)
 
 
@@ -248,7 +248,9 @@ class AddTests(DesktopTestCase):
     def add(self, path, base=None, repositories=None):
         config = self.root / "config" / "config.toml"
         config.parent.mkdir(exist_ok=True)
-        config.write_text(f'canonical_root = "{self.root / "repos"}"\nworktree_root = "{self.worktrees}"\n')
+        # as_posix: a Windows path's backslashes are escapes in a TOML string.
+        config.write_text(f'canonical_root = "{(self.root / "repos").as_posix()}"\n'
+                          f'worktree_root = "{self.worktrees.as_posix()}"\n')
         cfg = hwt.load_config(config)
         cfg["repositories"] = repositories or {}
         args = type("Args", (), {"path": str(path), "base": base, "config": config})()
@@ -292,6 +294,7 @@ class FrontendSelectionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "config.toml"
             (Path(tmp) / "r").mkdir()
+            tmp = Path(tmp).as_posix()  # TOML strings: no backslashes
             config.write_text(f'canonical_root = "{tmp}/r"\nworktree_root = "{tmp}"\nrepositories = {{}}\n'
                               + config_text)
             with mock.patch.object(hwt, "cmd_list") as cmd_list, \
