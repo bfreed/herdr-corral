@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.0 — 2026-11-05
+
+- **Herdr Desktop.** `frontend = "desktop"` in config.toml (or `--frontend desktop`) makes Corral work through the machine's herdr-core (`hc`) instead of the TUI. A new worktree's space appears in Desktop with its agent, shell and server tabs, the agent started, and `PORT`/`HWT_*` set in the shell and server tabs. `cleanup`, `remove`, `open` and `list` work the same; Desktop has no workspace metadata or focus to set, so those are skipped. `frontend` defaults to `tui`, so nothing changes until it's set.
+- **The Corral panel** (`desktop/corral`), a Herdr Desktop mod. It shows the focused space's repository and worktrees with their ports and dev servers. Its buttons create, open and clean up worktrees and start the dev server, running `hwt` on that space's machine. When Corral or the repository isn't set up there, it offers **Install Corral** or **Set up** instead. It also names and orders Corral's tabs, which herdr-core can't do.
+- **`hwt add <path> [--base]`** configures a repository with Corral's defaults, no questions. **`hwt info [folder]`** prints a folder's repository, worktrees and port leases as JSON. **`hwt --version`.**
+- **`install.py --desktop`** skips the TUI plugin, doesn't need the TUI's `herdr`, and writes `frontend = "desktop"`.
 ## 1.1.0 — 2026-09-30
 
 - **Squash-merged branches clean up without `--abandon --confirm`.** A squash or rebase merge leaves the branch's own commits nowhere else, so the ancestry check reported them as unmerged work. `cleanup`, `sweep`, the palette, and the teardown popup now also accept a branch whose changes provably landed on base: merging it would change nothing (`git merge-tree --write-tree`), or one base commit's patch equals the branch's whole diff (`git patch-id --stable`, which still holds after base later edits the same lines). Either proof is enough. A commit made after the merge, a partly landed branch, or commits that cancel out still require confirmation, and a failed probe still blocks deletion. The palette shows `squash-merged — cleans instantly`, and the cleanup result reports `reason: "squash-merged"`. Requires Git 2.38+ for the merge-tree check; on older Git the patch-id check alone applies.

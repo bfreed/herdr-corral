@@ -74,7 +74,7 @@ def discover_repositories(root: Path, exclude: Path | None = None) -> list[tuple
 
 def render_config(repos_root: Path, worktree_root: Path, repos: list[tuple[str, Path, str]],
                   dev_host: str, remote_host: str, agent_kind: str,
-                  placement: str = "shared-root") -> str:
+                  placement: str = "shared-root", frontend: str = "tui") -> str:
     lines = [
         f"canonical_root = {quote(str(repos_root.resolve()))}",
         f"worktree_root = {quote(str(worktree_root.resolve()))}",
@@ -87,6 +87,8 @@ def render_config(repos_root: Path, worktree_root: Path, repos: list[tuple[str, 
         '# and hwt create worktrees in the same place. "sibling": <repo>__worktrees/',
         "# (workmux layout; Herdr's own dialog cannot follow a per-repo layout).",
         f"worktree_placement = {quote(placement)}",
+        '# "tui": Herdr TUI (the plugin). "desktop": Herdr Desktop, through herdr-core (hc).',
+        f"frontend = {quote(frontend)}",
         "",
         "[ports]",
         "start = 4100",
@@ -470,6 +472,8 @@ def main() -> int:
     parser.add_argument("--purge", action="store_true",
                         help="with --uninstall: also delete configuration and runtime state")
     parser.add_argument("--skip-plugin", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--desktop", action="store_true",
+                        help="for Herdr Desktop: no TUI plugin, frontend = \"desktop\"")
     args = parser.parse_args()
 
     source = Path(__file__).resolve().parent
@@ -519,11 +523,12 @@ def main() -> int:
             shutil.copy2(config, backup)
         config.write_text(render_config(repos_root, worktree_root, repos,
                                         args.dev_host, args.remote_host, args.agent_kind,
-                                        args.worktree_placement))
+                                        args.worktree_placement,
+                                        "desktop" if args.desktop else "tui"))
         config.chmod(0o600)
         config_result = f"configured {len(repos)} repositories"
 
-    if not args.skip_plugin:
+    if not (args.skip_plugin or args.desktop):
         if shutil.which("herdr") is None:
             raise SystemExit("Herdr is not on PATH; install Herdr, then rerun this installer")
         subprocess.run(["herdr", "plugin", "unlink", PLUGIN_ID], stdout=subprocess.DEVNULL,

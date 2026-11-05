@@ -61,6 +61,25 @@ No typing required, two ways:
 - **`hwt sweep`** — cleans *every* worktree that qualifies without questions in one shot, and reports the kept ones with the exact `--abandon` command for each.
 - **The Corral palette** — a popup (bind it to a key, below) listing every worktree with a safety annotation (`merged — cleans instantly`, `squash-merged — cleans instantly`, `nothing unique — cleans instantly`, `has unpublished commits`, `dirty`). Pick a number to clean it, `n` to create a worktree, `s` to sweep, `q` to close.
 
+## Herdr Desktop
+
+Corral also works with [Herdr Desktop](https://herdr.dev/), through each machine's herdr-core. Desktop's window can run on another computer: a space's worktree, ports and dev server live on the machine the space runs on.
+
+1. Copy the panel to the computer where Desktop's window runs:
+
+   ```sh
+   # from a clone of this repository:
+   mkdir -p ~/.config/herdr-app/mods && cp -R desktop/corral ~/.config/herdr-app/mods/corral
+   ```
+
+   Herdr docks it on the left the first time it sees it; drag it anywhere.
+2. Focus a space. If Corral isn't installed on that space's machine, the panel offers **Install Corral**. That needs git and Python 3.11+ there, clones this repository's release into `~/.local/share/herdr-corral`, and runs `install.py --desktop` with the repository's parent folder as the repositories folder. If the repository isn't set up, the panel offers **Set up** with a base-branch choice, plus **More settings…**, which opens `hwt init` in a new tab.
+3. On a repository's main checkout, type a branch name and click **New worktree**. On a worktree, the panel shows its port and dev URL, starts the dev server, and offers **Clean up…** (merge-checked, as `hwt cleanup`).
+
+On a machine that already has Corral, set `frontend = "desktop"` in `~/.config/herdr-corral/config.toml` so `hwt` run from a shell (by you or an agent) also makes Desktop spaces. The panel always passes `--frontend desktop` itself.
+
+Panel tests: `node --test desktop/tests/panel.test.mjs`. Check it as Herdr loads it: `herdr-app check ~/.config/herdr-app/mods/corral`.
+
 ## Keybindings
 
 Herdr's sidebar right-click menu is not extensible by plugins (as of 0.8.0 the plugin manifest's `contexts` field is parsed but not used by any UI — verified against the Herdr source), so Corral's interactive surface is the palette popup plus keybindings. Add to `~/.config/herdr/config.toml` and run `herdr server reload-config`:

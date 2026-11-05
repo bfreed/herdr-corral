@@ -47,7 +47,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -779,6 +779,201 @@ class FakeHerdrForTests:
     def labels(self, workspace: str): return [x["label"] for x in self.workspaces[workspace]]
 
 
+def is_desktop(herdr: Any) -> bool:
+    # `is True`: tests pass mock.Mock(), whose every attribute is truthy.
+    return getattr(herdr, "desktop", False) is True
+
+
+SHELL_NAMES = {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "csh", "nu", "pwsh", "xonsh"}
+
+
+def login_shell() -> str:
+    with contextlib.suppress(ImportError, KeyError):
+        import pwd
+        return os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell
+    return os.environ.get("SHELL") or "/bin/sh"
+
+
+def hc_binary() -> str:
+    found = os.environ.get("HC_BIN_PATH") or shutil.which("hc") or shutil.which("herdr-core")
+    if found:
+        return found
+    local = Path.home() / ".local/bin/hc"
+    return str(local) if local.exists() else "hc"
+
+
+class HerdrCore:
+    """Herdr Desktop, through this machine's herdr-core (`hc`).
+
+    Desktop shows every core terminal labelled herdr.space=<id> and
+    herdr.tab=<id>, and makes a space or tab for an id it doesn't know, so a
+    workspace here is just the terminals sharing a space id. Tab names can't
+    be set from hc: each terminal carries corral.tab=<name> and the Corral
+    panel names the tab from it. Focus belongs to each screen, so focusing is
+    a no-op. Speaks the subset of the TUI's `herdr` CLI that Corral calls, so
+    only creating and removing a checkout need Desktop branches in the commands."""
+
+    desktop = True
+
+    def __init__(self, binary: str | None = None):
+        self.binary = binary or hc_binary()
+
+    def _json(self, *args: str) -> Any:
+        result = run([self.binary, *args, "--json"])
+        try:
+            return json.loads(result.stdout)
+        except json.JSONDecodeError as exc:
+            raise WorkflowError(f"hc returned invalid JSON for {' '.join(args)}") from exc
+
+    def _terminals(self, *filters: str) -> list[dict[str, Any]]:
+        # `hc ls` omits labels; `hc get` has them.
+        listing = self._json("ls", *[x for f in filters for x in ("--label", f)])
+        found = []
+        for item in listing.get("terminals", []):
+            with contextlib.suppress(WorkflowError):
+                found.append(self._json("get", item["address"]))
+        return sorted(found, key=lambda t: t.get("created_ms") or 0)
+
+    def _spaces(self) -> dict[str, list[dict[str, Any]]]:
+        spaces: dict[str, list[dict[str, Any]]] = {}
+        for term in self._terminals():
+            space = (term.get("labels") or {}).get("herdr.space")
+            if space:
+                spaces.setdefault(space, []).append(term)
+        return spaces
+
+    @staticmethod
+    def _folders(terms: list[dict[str, Any]]) -> list[str]:
+        # Where its terminals started and where their programs are now: a
+        # Desktop-made space's shell often starts at home and cd's in.
+        folders = []
+        for term in terms:
+            for folder in (term.get("cwd"), (term.get("foreground") or {}).get("cwd")):
+                if isinstance(folder, str) and folder and folder not in folders:
+                    folders.append(folder)
+        return folders
+
+    def _start(self, cwd: Path, space: str, label: str | None,
+               env: dict[str, str] | None = None) -> tuple[str, str]:
+        tab = "tb" + os.urandom(16).hex()
+        args = [self.binary, "run", "--bg", "--json", "--keep", "--no-parent", "--no-notify",
+                "--cwd", str(cwd), "--label", f"herdr.space={space}", "--label", f"herdr.tab={tab}"]
+        if label:
+            args += ["--label", f"corral.tab={label}"]
+        if env:
+            # hc run has no --env; the tab's shell inherits these instead.
+            args += ["--", "env", *[f"{k}={v}" for k, v in env.items()], login_shell()]
+        try:
+            address = json.loads(run(args).stdout)["address"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise WorkflowError("hc run did not report the new terminal") from exc
+        return tab, address
+
+    def new_space(self, cwd: Path) -> str:
+        space = "sp" + os.urandom(16).hex()
+        self._start(cwd, space, None)
+        return space
+
+    def call(self, *args: str) -> dict[str, Any]:
+        verb = args[:2]
+        if verb == ("workspace", "list"):
+            return {"result": {"workspaces": [
+                {"workspace_id": space, "cwd": self._folders(terms), "focused": False}
+                for space, terms in self._spaces().items()]}}
+        if verb == ("workspace", "get"):
+            terms = self._spaces().get(args[2], [])
+            return {"result": {"workspace_id": args[2], "cwd": self._folders(terms)}}
+        if verb == ("workspace", "create"):
+            cwd = Path(args[args.index("--cwd") + 1])
+            return {"result": {"workspace": {"workspace_id": self.new_space(cwd)}}}
+        if verb == ("workspace", "focus"):
+            return {"result": {}}
+        if verb == ("worktree", "open"):
+            path = Path(args[args.index("--path") + 1])
+            return {"result": {"workspace": {"workspace_id": self.new_space(path)}}}
+        if verb == ("worktree", "list"):
+            return {"result": {"worktrees": self.worktrees(Path(args[args.index("--cwd") + 1]))}}
+        raise WorkflowError(f"not available in Herdr Desktop: herdr {' '.join(args[:2])}")
+
+    def worktrees(self, repo: Path) -> list[dict[str, Any]]:
+        items = [{"path": c["path"], "branch": c["branch"], "is_detached": c["branch"] is None,
+                  "is_linked_worktree": not c["main"]} for c in checkout_list(repo)]
+        spaces = self._spaces()
+        for item in items:
+            # The space showing a checkout: one of its folders is in it, and not
+            # in a deeper checkout (worktree roots may nest under a repo).
+            here = Path(item["path"]).resolve()
+            deeper = [Path(i["path"]).resolve() for i in items
+                      if i is not item and is_within(Path(i["path"]).resolve(), here)]
+            for space, terms in spaces.items():
+                folders = [Path(f).resolve() for f in self._folders(terms)]
+                if any(is_within(f, here) and not any(is_within(f, d) for d in deeper) for f in folders):
+                    item["workspace_id"] = space
+                    break
+        return items
+
+    def create_worktree(self, canonical: Path, branch: str, base: str, path: Path) -> str:
+        exists = git(canonical, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}",
+                     check=False).returncode == 0
+        add = ["worktree", "add", str(path), branch] if exists else \
+              ["worktree", "add", "-b", branch, str(path), base]
+        git(canonical, *add)
+        return self.new_space(path)
+
+    def remove_worktree(self, canonical: Path, workspace: str | None, path: Path, force: bool) -> None:
+        git(canonical, "worktree", "remove", *(["--force"] if force else []), str(path))
+        # The checkout is gone; its space goes with its last terminal.
+        if workspace:
+            for term in self._terminals(f"herdr.space={workspace}"):
+                with contextlib.suppress(WorkflowError):
+                    run([self.binary, "kill", term["address"]])
+
+    def tabs(self, workspace: str) -> list[dict[str, Any]]:
+        tabs: dict[str, dict[str, Any]] = {}
+        for term in self._terminals(f"herdr.space={workspace}"):
+            labels = term.get("labels") or {}
+            tab = labels.get("herdr.tab")
+            if tab and tab not in tabs:
+                tabs[tab] = {"tab_id": tab, "label": labels.get("corral.tab", ""),
+                             "pane_id": term["address"]}
+        return list(tabs.values())
+
+    def rename_tab(self, tab_id: str, label: str) -> None:
+        for term in self._terminals(f"herdr.tab={tab_id}"):
+            run([self.binary, "label", term["address"], f"corral.tab={label}"])
+
+    def create_tab(self, workspace: str, cwd: Path, label: str, env: dict[str, str]) -> tuple[str, str]:
+        return self._start(cwd, workspace, label, env)
+
+    def start_agent(self, pane_id: str, name: str, kind: str = "hermes") -> None:
+        # Types the agent's command into the tab's shell, as a person would.
+        run([self.binary, "send", pane_id, kind])
+
+    def has_agent(self, pane_id: str) -> bool:
+        term = self._json("get", pane_id)
+        if term.get("status"):
+            return True
+        program = (term.get("foreground") or {}).get("name") or ""
+        return bool(program) and Path(program).name not in SHELL_NAMES
+
+    def metadata(self, workspace: str, tokens: dict[str, str]) -> None:
+        pass  # Desktop has no workspace metadata; the lease in Corral's state is the record.
+
+    def show_reminder(self, pane_id: str, message: str) -> None:
+        # Straight to the shell's tty (Linux /proc), so nothing is typed at the
+        # prompt; a missed reminder must never break the bootstrap.
+        with contextlib.suppress(WorkflowError, OSError, KeyError, TypeError, ValueError):
+            tty = os.readlink(f"/proc/{int(self._json('get', pane_id)['pid'])}/fd/0")
+            if not tty.startswith("/dev/"):
+                return
+            fd = os.open(tty, os.O_WRONLY | os.O_NOCTTY)
+            try:
+                os.write(fd, f"\r\n\x1b[2m{message}\x1b[0m\r\n".encode())
+            finally:
+                os.close(fd)
+            run([self.binary, "keys", pane_id, "enter"])
+
+
 def tab_pane(tab: dict[str, Any]) -> str:
     if "pane_id" in tab: return tab["pane_id"]
     # Live tab list omits root pane; caller resolves panes separately when needed.
@@ -837,9 +1032,12 @@ def ensure_layout(herdr: Any, workspace: str, worktree: Path, port: int, host: s
                     message = "Corral: no dev command configured for this repository — set one with 'hwt init'"
                 herdr.show_reminder(pid, message)
             if label == "shell":
-                binding = corral_palette_keybinding()
-                palette = (f"palette: {binding}" if binding
-                           else "palette via 'herdr plugin action invoke corral.palette'")
+                if is_desktop(herdr):
+                    palette = "the Corral panel has buttons for them"
+                else:
+                    binding = corral_palette_keybinding()
+                    palette = (f"palette: {binding}" if binding
+                               else "palette via 'herdr plugin action invoke corral.palette'")
                 message = f"Corral: 'hwt -h' lists commands; {palette}"
                 if repo.get("_suggest_init"):
                     message += " — run 'hwt init' to configure this repository"
@@ -1392,7 +1590,10 @@ def cmd_new(args, cfg, state, herdr: Herdr):
     # somewhere mid-creation, possibly after the workspace exists.
     if not ref_exists(canonical, base):
         raise WorkflowError(f"base ref does not exist (even after fetch): {base!r}")
-    canonical_workspace = ensure_canonical_workspace(herdr, canonical, name, False)
+    desktop = is_desktop(herdr)
+    # Desktop nests a worktree's space under its repo's by itself; the TUI
+    # anchors the worktree to the repo's workspace.
+    canonical_workspace = None if desktop else ensure_canonical_workspace(herdr, canonical, name, False)
     placement = cfg.get("worktree_placement", "shared-root")
     if placement == "sibling":
         parent = sibling_worktree_dir(canonical)
@@ -1410,16 +1611,20 @@ def cmd_new(args, cfg, state, herdr: Herdr):
     # Herdr's branch-derived sidebar display (strip_prefix("worktree/")).
     command=["worktree","create","--workspace",canonical_workspace,"--branch",branch,"--base",base,"--path",str(path),"--no-focus" if args.background else "--focus"]
     try:
-        obj=herdr.call(*command)
+        if desktop:
+            workspace = herdr.create_worktree(canonical, branch, base, path)
+        else:
+            obj=herdr.call(*command)
+            workspace=json_result(obj,"result","workspace","workspace_id")
     except WorkflowError:
         # A failed create must not leave an empty namespace directory behind.
         if created_namespace:
             with contextlib.suppress(OSError):
                 path.parent.rmdir()
         raise
-    workspace=json_result(obj,"result","workspace","workspace_id")
     summary=bootstrap(cfg,state,path,workspace,herdr)
     if not args.background: herdr.call("workspace","focus",workspace)
+    summary.update(desktop_tabs(herdr, workspace))
     print(json.dumps({
         **summary,
         "branch": branch,
@@ -1564,6 +1769,13 @@ def resolve_open_target(args, cfg: dict[str, Any], herdr: Any) -> Path:
     return resolve_existing(Path(entries[index]["path"]))
 
 
+def desktop_tabs(herdr: Any, workspace: str) -> dict[str, Any]:
+    """Herdr Desktop: the tab ids by Corral name, for the Corral panel to name and order."""
+    if not is_desktop(herdr):
+        return {}
+    return {"tabs": {t["label"]: t["tab_id"] for t in herdr.tabs(workspace) if t["label"]}}
+
+
 def cmd_open(args,cfg,state,herdr:Herdr):
     path = resolve_open_target(args, cfg, herdr)
     try:
@@ -1589,7 +1801,7 @@ def cmd_open(args,cfg,state,herdr:Herdr):
     else:
         obj=herdr.call("worktree","open","--cwd",str(Path(repo["path"])),"--path",str(path),"--focus")
         workspace=obj["result"]["workspace"]["workspace_id"]
-        print(json.dumps(bootstrap(cfg,state,path,workspace,herdr),indent=2))
+        print(json.dumps({**bootstrap(cfg,state,path,workspace,herdr),**desktop_tabs(herdr,workspace)},indent=2))
 
 
 def current_worktree(cfg:dict[str,Any], cwd:Path)->tuple[str,dict[str,Any],Path]:
@@ -1627,6 +1839,106 @@ def cmd_status(args,cfg,state):
             except WorkflowError: mismatch="unknown"
         rows.append({"path":path,"port":port,"exists":exists,"lockfile_mismatch":mismatch,"listening":not port_is_free(int(port))})
     print(json.dumps({"leases":rows},indent=2))
+
+
+def remote_head(canonical: Path, remote: str = "origin") -> str | None:
+    """The remote's default branch as a remote-tracking ref (origin/develop), if git knows it."""
+    found = git(canonical, "symbolic-ref", "--quiet", f"refs/remotes/{remote}/HEAD", check=False)
+    return found.stdout.strip().removeprefix("refs/remotes/") or None if found.returncode == 0 else None
+
+
+def checkout_list(canonical: Path) -> list[dict[str, Any]]:
+    """`git worktree list`: the main checkout first, then linked ones."""
+    listing = git(canonical, "worktree", "list", "--porcelain", check=False)
+    items: list[dict[str, Any]] = []
+    for block in listing.stdout.strip().split("\n\n") if listing.returncode == 0 else []:
+        lines = block.splitlines()
+        path = next((l.removeprefix("worktree ") for l in lines if l.startswith("worktree ")), None)
+        if not path or any(l == "bare" or l.startswith("prunable") for l in lines):
+            continue
+        branch = next((l.removeprefix("branch refs/heads/") for l in lines
+                       if l.startswith("branch refs/heads/")), None)
+        items.append({"path": path, "branch": branch, "main": not items})
+    return items
+
+
+def cmd_info(args, cfg, state):
+    """Everything the Corral panel shows for one folder, as JSON."""
+    folder = resolve_existing(Path(args.folder or Path.cwd()))
+    out: dict[str, Any] = {"version": __version__, "frontend": args.frontend,
+                           "folder": str(folder), "git": False}
+    top = git(folder, "rev-parse", "--show-toplevel", check=False)
+    common = git(folder, "rev-parse", "--path-format=absolute", "--git-common-dir", check=False)
+    if top.returncode or common.returncode:
+        print(json.dumps(out, indent=2))
+        return
+    top_path = Path(top.stdout.strip()).resolve()
+    common_dir = Path(common.stdout.strip()).resolve()
+    main = common_dir.parent if common_dir.name == ".git" else common_dir
+    root = Path(cfg["canonical_root"])
+    out.update(git=True, top=str(top_path), main=str(main), linked=top_path != main,
+               branch=git(top_path, "branch", "--show-current", check=False).stdout.strip() or None,
+               canonical_root=str(root), under_root=is_within(main, root))
+    name = next((n for n, r in cfg["repositories"].items()
+                 if "path" in r and Path(r["path"]).expanduser().resolve() == main), None)
+    out["repository"] = name
+    if name is None:
+        out["suggested_base"] = remote_head(main)
+        out["base_candidates"] = remote_base_candidates(main, "origin")[:6]
+        print(json.dumps(out, indent=2))
+        return
+    repo = cfg["repositories"][name]
+    host = cfg.get("remote_host") or "127.0.0.1"
+    out.update(mode=repo.get("mode"), base_branch=repo.get("base_branch", "origin/main"),
+               dev_command=bool(repo.get("commands", {}).get("dev")),
+               defaults_only=repo_is_unconfigured(repo))
+    worktrees = []
+    for item in checkout_list(main):
+        port = leased_port(state, item["path"])
+        worktrees.append({**item, "port": port,
+                          "listening": bool(port) and not port_is_free(port),
+                          "dev_url": f"http://{host}:{port}" if port else None})
+    out["worktrees"] = worktrees
+    print(json.dumps(out, indent=2))
+
+
+def cmd_add(args, cfg, state):
+    """Configure a repository with safe defaults, no questions (the panel's Set up)."""
+    path = resolve_existing(Path(args.path))
+    top = git(path, "rev-parse", "--show-toplevel", check=False)
+    if top.returncode or Path(top.stdout.strip()).resolve() != path:
+        raise WorkflowError(f"not the top folder of a git repository: {path}")
+    if not repo_is_canonical_checkout(path):
+        raise WorkflowError("that is a linked worktree; add its repository's main checkout")
+    root = Path(cfg["canonical_root"])
+    if not is_within(path, root):
+        raise SafetyError(f"repository outside approved canonical root {root}: {path}")
+    name = path.name
+    for other, repo in cfg["repositories"].items():
+        if other == name or ("path" in repo and Path(repo["path"]).expanduser().resolve() == path):
+            raise WorkflowError(f"already configured as {other!r}")
+    remote = "origin"
+    base = args.base or remote_head(path, remote) or f"{remote}/main"
+    if base.split("/", 1)[0] != remote or "/" not in base:
+        raise WorkflowError(f"base must be a remote-tracking branch like {remote}/develop")
+    if not ref_exists(path, base):
+        raise WorkflowError(f"no such ref here: {base!r}")
+    overlay = args.config.parent / "repos.d" / f"{name}.toml"
+    if overlay.exists():
+        raise WorkflowError(f"{overlay} already exists")
+    overlay.parent.mkdir(parents=True, exist_ok=True)
+    overlay.write_text("\n".join([
+        "# Written by 'hwt add': Corral's defaults. Refine with 'hwt init'.",
+        f"[repositories.{toml_quote(name)}]",
+        f"path = {toml_quote(str(path))}",
+        'mode = "worktree"',
+        f"base_branch = {toml_quote(base)}",
+        f"remote = {toml_quote(remote)}",
+        "fetch = true",
+        "start_agent = true",
+    ]) + "\n")
+    print(json.dumps({"repository": name, "path": str(path), "base_branch": base,
+                      "overlay": str(overlay)}, indent=2))
 
 
 def normalize_worktree_item(raw: dict[str, Any], repository: str) -> dict[str, Any]:
@@ -1778,7 +2090,9 @@ def cmd_remove(args,cfg,state,herdr):
         branch2=git(path,"branch","--show-current").stdout.strip(); dirty2=bool(git(path,"status","--porcelain").stdout.strip())
         if branch2 != branch or dirty2 != dirty: raise WorkflowError("worktree changed while removal was being validated")
         suppress_teardown(state, str(path))
-        if workspace:
+        if is_desktop(herdr):
+            herdr.remove_worktree(canonical, workspace, path, args.force)
+        elif workspace:
             focused = focused_workspace_id(herdr)
             cmd=["worktree","remove","--workspace",workspace]
             if args.force: cmd.append("--force")
@@ -2115,7 +2429,9 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
         # Before removal: a server outlives its checkout (and Herdr's tab
         # closing never reaches one an agent started in the background).
         stopped = stop_worktree_servers(state, path)
-        if workspace:
+        if is_desktop(herdr):
+            herdr.remove_worktree(canonical, workspace, path, dirty)
+        elif workspace:
             focused = focused_workspace_id(herdr)
             remove = ["worktree", "remove", "--workspace", workspace]
             if dirty:
@@ -2238,8 +2554,10 @@ def cmd_doctor(args,cfg,state):
     checks=[]
     for key in ("canonical_root","worktree_root"):
         p=Path(cfg[key]); checks.append({"check":key,"ok":p.is_dir(),"value":str(p)})
-    checks.append({"check":"HERDR_ENV","ok":os.environ.get("HERDR_ENV")=="1"})
-    for tool in ("git", "herdr", cfg.get("agent_kind", "hermes")):
+    desktop = getattr(args, "frontend", None) == "desktop"
+    if not desktop:
+        checks.append({"check":"HERDR_ENV","ok":os.environ.get("HERDR_ENV")=="1"})
+    for tool in ("git", "hc" if desktop else "herdr", cfg.get("agent_kind", "hermes")):
         checks.append({"check":f"command:{tool}","ok":shutil.which(tool) is not None})
     configured_tools = sorted({str(cmd[0]) for repo in cfg["repositories"].values() for cmd in repo.get("commands", {}).values() if cmd})
     for tool in configured_tools:
@@ -2329,14 +2647,19 @@ def maybe_open_teardown(cfg: dict[str, Any], state: Path, payload: dict[str, Any
 def parser() -> argparse.ArgumentParser:
     p=argparse.ArgumentParser(prog="hwt",description="Corral: safe Git-worktree workflow for Herdr")
     p.add_argument("--config",type=Path,default=DEFAULT_CONFIG,help=argparse.SUPPRESS)
+    p.add_argument("--version",action="version",version=f"hwt {__version__}")
+    p.add_argument("--frontend",choices=("tui","desktop"),
+                   help="Herdr TUI or Herdr Desktop (default: config 'frontend', else tui)")
     # metavar hides the internal entry points (event, cleanup-workspace,
     # palette-open, teardown, invoked by Herdr) from usage; omitting their
     # help keeps them out of the table below it.
     sub=p.add_subparsers(dest="command",required=True,
-                         metavar="{new,open,init,list,status,dev,remove,cleanup,sweep,reap,palette,doctor,update}")
+                         metavar="{new,open,init,add,info,list,status,dev,remove,cleanup,sweep,reap,palette,doctor,update}")
     n=sub.add_parser("new",help="create a worktree for a new branch"); n.add_argument("branch",nargs="?",help="omit to choose repository, base, and name interactively"); n.add_argument("--base"); n.add_argument("--repo"); n.add_argument("--background",action="store_true")
     o=sub.add_parser("open",help="open a repository or existing worktree"); o.add_argument("target",nargs="?",help="repository, branch, or worktree name; omit to pick from a list")
     i=sub.add_parser("init",help="interactively configure a repository"); i.add_argument("repository",nargs="?")
+    a=sub.add_parser("add",help="configure a repository with defaults, no questions"); a.add_argument("path"); a.add_argument("--base",help="remote-tracking base branch (default: the remote's default branch)")
+    f=sub.add_parser("info",help="a folder's repository, worktrees and ports, as JSON"); f.add_argument("folder",nargs="?")
     sub.add_parser("list",help="configured repositories and live worktrees")
     sub.add_parser("status",help="port leases and dev-server status")
     d=sub.add_parser("dev",help="start the configured dev server on a leased port"); d.add_argument("--port",type=int)
@@ -2363,8 +2686,10 @@ def main(argv: list[str] | None=None) -> int:
         if args.command == "palette-open":
             cmd_palette_open(args)
             return 0
-        cfg=load_config(args.config); state=runtime_state_dir(); herdr=Herdr()
-        commands={"new":cmd_new,"open":cmd_open,"init":cmd_init,"list":cmd_list,"status":cmd_status,"dev":cmd_dev,"remove":cmd_remove,"cleanup":cmd_cleanup,"cleanup-workspace":cmd_cleanup_workspace,"sweep":cmd_sweep,"reap":cmd_reap,"palette":cmd_palette,"doctor":cmd_doctor,"event":cmd_event,"teardown":cmd_teardown}
+        cfg=load_config(args.config); state=runtime_state_dir()
+        args.frontend = args.frontend or cfg.get("frontend", "tui")
+        herdr = HerdrCore() if args.frontend == "desktop" else Herdr()
+        commands={"add":cmd_add,"info":cmd_info,"new":cmd_new,"open":cmd_open,"init":cmd_init,"list":cmd_list,"status":cmd_status,"dev":cmd_dev,"remove":cmd_remove,"cleanup":cmd_cleanup,"cleanup-workspace":cmd_cleanup_workspace,"sweep":cmd_sweep,"reap":cmd_reap,"palette":cmd_palette,"doctor":cmd_doctor,"event":cmd_event,"teardown":cmd_teardown}
         fn=commands[args.command]
         if args.command in ("new","open","list","remove","cleanup","cleanup-workspace","sweep","palette","event"): fn(args,cfg,state,herdr)
         else: fn(args,cfg,state)
