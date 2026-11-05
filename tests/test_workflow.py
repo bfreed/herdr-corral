@@ -1739,6 +1739,60 @@ class DevCommandSuggestionTests(unittest.TestCase):
         self.assertIsNone(self.suggest({}))
 
 
+class DevCommandCheckTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def ask(self, answers):
+        replies = iter(answers)
+        with mock.patch("builtins.input", side_effect=lambda *_: next(replies)), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            result = hwt.ask_dev_command(self.repo, None)
+        return result, out.getvalue()
+
+    def test_package_runner_without_package_json_is_a_problem(self):
+        problem = hwt.dev_command_problem(self.repo, ["npx", "quasar", "dev"])
+        self.assertIn("no package.json", problem)
+
+    def test_package_runner_with_package_json_is_fine(self):
+        (self.repo / "package.json").write_text("{}")
+        with mock.patch.object(hwt.shutil, "which", return_value="/usr/bin/npx"):
+            self.assertIsNone(hwt.dev_command_problem(self.repo, ["npx", "quasar", "dev"]))
+
+    def test_missing_executable_is_a_problem(self):
+        with mock.patch.object(hwt.shutil, "which", return_value=None):
+            problem = hwt.dev_command_problem(self.repo, ["quasar", "dev"])
+        self.assertIn("not on PATH", problem)
+
+    def test_relative_script_resolves_against_repository(self):
+        self.assertIn("does not exist", hwt.dev_command_problem(self.repo, ["./serve.sh"]))
+        (self.repo / "serve.sh").write_text("#!/bin/sh\n")
+        self.assertIsNone(hwt.dev_command_problem(self.repo, ["./serve.sh"]))
+
+    def test_placeholder_executable_is_not_checked(self):
+        self.assertIsNone(hwt.dev_command_problem(self.repo, ["{worktree}/bin/serve"]))
+
+    def test_interview_warns_and_reprompts_when_declined(self):
+        result, out = self.ask(["npx quasar dev", "", "none"])
+        self.assertIsNone(result)
+        self.assertIn("no package.json", out)
+
+    def test_interview_saves_flagged_command_when_confirmed(self):
+        result, out = self.ask(["npx quasar dev", "y"])
+        self.assertEqual(result, ["npx", "quasar", "dev"])
+        self.assertIn("Warning:", out)
+
+    def test_interview_accepts_runnable_command_without_warning(self):
+        with mock.patch.object(hwt.shutil, "which", return_value="/usr/bin/python3"):
+            result, out = self.ask(["python3 -m http.server {port}"])
+        self.assertEqual(result, ["python3", "-m", "http.server", "{port}"])
+        self.assertNotIn("Warning:", out)
+
+
 class BaseRefTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)

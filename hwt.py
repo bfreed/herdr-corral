@@ -47,7 +47,7 @@ class SafetyError(WorkflowError):
     pass
 
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -1299,6 +1299,45 @@ def suggest_dev_command(canonical: Path) -> list[str] | None:
     return base
 
 
+PACKAGE_RUNNERS = {"npm", "npx", "pnpm", "pnpx", "yarn", "bun", "bunx"}
+
+
+def dev_command_problem(canonical: Path, dev: list[str]) -> str | None:
+    """Why `hwt dev` could not run this command in the repository, or None.
+    Placeholder-bearing executables are left alone: they only resolve per worktree."""
+    executable = dev[0]
+    if "{" in executable:
+        return None
+    if Path(executable).name in PACKAGE_RUNNERS and not (canonical / "package.json").is_file():
+        return f"{canonical} has no package.json, so '{executable}' has nothing to run"
+    if "/" in executable or os.sep in executable:
+        target = Path(executable) if Path(executable).is_absolute() else canonical / executable
+        if not target.is_file():
+            return f"'{executable}' does not exist in {canonical}"
+        return None
+    if shutil.which(executable) is None:
+        return f"'{executable}' is not on PATH"
+    return None
+
+
+def ask_dev_command(canonical: Path, suggestion: list[str] | None) -> list[str] | None:
+    rendered = " ".join(suggestion) if suggestion else "none"
+    while True:
+        raw = input(f"Dev server command for {canonical.name} [{rendered}]: ").strip()
+        if not raw:
+            dev = suggestion
+        elif raw.lower() == "none":
+            dev = None
+        else:
+            dev = shlex.split(raw)
+        problem = dev_command_problem(canonical, dev) if dev else None
+        if not problem:
+            return dev
+        print(f"Warning: {problem}.")
+        if ask_yes_no("Save it anyway?", False):
+            return dev
+
+
 def render_repo_overlay(name: str, repo: dict[str, Any], files: list[dict[str, Any]],
                         dep_policy: str, dev: list[str] | None) -> str:
     lines = [
@@ -1383,18 +1422,10 @@ def run_init_interview(cfg: dict[str, Any], name: str, config_path: Path) -> Pat
             description = f"run '{' '.join(install)}'"
         if not ask_yes_no(f"Set up dependencies automatically in new worktrees ({description})?", True):
             dep_policy = "independent"
-    suggestion = suggest_dev_command(canonical)
-    rendered = " ".join(suggestion) if suggestion else "none"
     print("The dev command is a template run by 'hwt dev' in each worktree, on a leased")
     print("per-worktree port: {port}/{host} placeholders are substituted, and the")
     print("PORT/HOST environment variables are always set for servers that read them.")
-    raw = input(f"Dev server command [{rendered}]: ").strip()
-    if not raw:
-        dev = suggestion
-    elif raw.lower() == "none":
-        dev = None
-    else:
-        dev = shlex.split(raw)
+    dev = ask_dev_command(canonical, suggest_dev_command(canonical))
     overlay_dir = config_path.parent / "repos.d"
     overlay_dir.mkdir(parents=True, exist_ok=True)
     overlay = overlay_dir / f"{name}.toml"

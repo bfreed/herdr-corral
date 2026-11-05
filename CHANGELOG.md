@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.2.1 — 2026-11-05
+
+- **`hwt init` checks the dev command before saving it.** A command that could never run in the repository used to be saved silently and only failed later in `hwt dev`, often as an unhelpful package-manager error (for example `npx quasar dev` in a repository with no `package.json` gives "npm error could not determine executable to run"). The interview now warns when a package runner (`npm`, `npx`, `pnpm`, `yarn`, `bun`, …) is used without a `package.json`, when the executable is not on `PATH`, or when a relative script path does not exist, then asks whether to save it anyway (default no, which re-prompts). The prompt also names the repository being configured.
+
 ## 1.2.0 — 2026-11-05
 
 - **Herdr Desktop.** Corral now also works in Herdr Desktop, through the machine's herdr-core (`hc`). `hwt` drives whichever Herdr it runs in: the TUI from a TUI pane or plugin hook, Desktop from a Desktop terminal, otherwise `frontend` in config.toml (default `tui`); `--frontend` overrides. A new worktree's space appears in Desktop with its agent, shell and server tabs, the agent started, and `PORT`/`HWT_*` set in the shell and server tabs. `cleanup`, `remove`, `open` and `list` work the same; Desktop has no workspace metadata or focus to set, so those are skipped.
