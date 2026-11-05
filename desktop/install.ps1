@@ -82,4 +82,6 @@
     } elseif (-not $copy) {
         if ($seen) { Write-Host "It shows wherever your layout has it." } else { Write-Host "Herdr docks it on the left." }
     }
+    # Installed either way: not herdr-app's exit code from asking a closed window.
+    $global:LASTEXITCODE = 0
 }

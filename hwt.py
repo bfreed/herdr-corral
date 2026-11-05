@@ -49,7 +49,7 @@ class SafetyError(WorkflowError):
 
 WINDOWS = os.name == "nt"  # patched in tests; never patch os.name (pathlib reads it)
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -105,7 +105,10 @@ def require_within(path: Path, root: Path, *, existing: bool = True) -> Path:
     raise SafetyError(f"refusing path outside approved root {root_real}: {target}")
 
 
-def contained_destination(root: Path, relative: str) -> Path:
+def contained_destination(root: Path, relative: str, *, link_to: Path | None = None) -> Path:
+    """Where relative lands in root, refusing any link out of root on the way.
+    link_to: the source of a symlink Corral makes there, so that link, already
+    made, is accepted (it points out of root by design)."""
     rel = safe_relative(relative)
     root_real = resolve_existing(root)
     cursor = root_real
@@ -120,7 +123,8 @@ def contained_destination(root: Path, relative: str) -> Path:
     destination = cursor / rel.parts[-1]
     if is_link(destination):
         resolved = destination.resolve(strict=False)
-        if not is_within(resolved, root_real):
+        if not is_within(resolved, root_real) and not (
+                link_to is not None and resolved == link_to.resolve()):
             raise SafetyError(f"symlink escape in destination: {relative}")
     return destination
 
@@ -147,6 +151,14 @@ def is_link(path: Path) -> bool:
             and getattr(st, "st_reparse_tag", None) == stat.IO_REPARSE_TAG_MOUNT_POINT)
 
 
+def is_junction(path: Path) -> bool:
+    """A Windows directory junction. Corral 1.3.0 made these where Windows can't
+    make symlinks; Git for Windows before 2.54 deletes through them when it
+    removes a worktree (git worktree remove, and Herdr's Delete), emptying
+    whatever they point to. Corral no longer makes them, and replaces any it finds."""
+    return is_link(path) and not path.is_symlink()
+
+
 def remove_link(path: Path) -> None:
     """Remove a symlink or junction itself, never what it points to."""
     if WINDOWS:
@@ -157,16 +169,10 @@ def remove_link(path: Path) -> None:
     path.unlink()
 
 
-def create_junction(source: Path, destination: Path) -> None:
-    """A directory junction at destination pointing to source (CPython on Windows)."""
-    import _winapi
-    _winapi.CreateJunction(str(source), str(destination))
-
-
 def make_link(destination: Path, source: Path, *, directory: bool) -> str:
-    """Link destination to source: a symlink where the system allows one. Windows
-    allows those only with Developer Mode, so there a folder gets a junction
-    instead and a file a copy. Returns "symlink", "junction" or "copy"."""
+    """Link destination to source with a symlink. Windows allows those only with
+    Developer Mode (or as administrator); without, destination gets a copy:
+    never a junction, which older Git deletes through. Returns "symlink" or "copy"."""
     try:
         destination.symlink_to(source, target_is_directory=directory)
         return "symlink"
@@ -174,43 +180,67 @@ def make_link(destination: Path, source: Path, *, directory: bool) -> str:
         if not WINDOWS:
             raise
     if directory:
-        create_junction(source.resolve(), destination)
-        return "junction"
-    shutil.copy2(source, destination)
+        if not clone_tree(source, destination):
+            raise WorkflowError(f"couldn't copy {source} (this Windows can't make symlinks)")
+    else:
+        shutil.copy2(source, destination)
     return "copy"
 
 
-def detach_links(worktree: Path, repo: dict[str, Any]) -> None:
-    """Windows: remove the junctions Corral made in a worktree before deleting it,
-    so deleting the worktree can never reach through one into the main checkout."""
-    if not WINDOWS:
-        return
-    relatives = [repo.get("dependencies", {}).get("directory", "node_modules")]
-    relatives += [op.get("path", "") for op in repo.get("files") or [] if op.get("action") == "symlink"]
-    paths = []
+def corral_link_paths(repo: dict[str, Any]) -> list[str]:
+    """Where Corral may put links in a worktree: the dependency folder and
+    each files entry with action "symlink" (relative, POSIX form)."""
+    relatives = [str(repo.get("dependencies", {}).get("directory", "node_modules"))]
+    relatives += [str(op.get("path", "")) for op in repo.get("files") or [] if op.get("action") == "symlink"]
+    found = []
     for relative in relatives:
         with contextlib.suppress(SafetyError):
-            paths.append(worktree / safe_relative(relative))
-    # Also any top-level link out of the worktree (made under an older config).
-    with contextlib.suppress(OSError):
-        root = worktree.resolve()
-        paths += [p for p in worktree.iterdir() if is_link(p) and not is_within(p.resolve(), root)]
+            found.append(safe_relative(relative).as_posix())
+    return found
+
+
+def detach_links(worktree: Path, repo: dict[str, Any]) -> None:
+    """Remove the links Corral made in a worktree before deleting it. git counts
+    them as untracked files (a node_modules/ ignore line matches only a real
+    folder), and on Windows nothing may delete through one. Also any junction
+    an older Corral left at the worktree's top level."""
+    paths = [worktree / Path(relative) for relative in corral_link_paths(repo)]
+    if WINDOWS:
+        with contextlib.suppress(OSError):
+            paths += [p for p in worktree.iterdir() if is_junction(p)]
     for path in paths:
         with contextlib.suppress(OSError):
             if is_link(path):
                 remove_link(path)
 
 
+def worktree_dirty(worktree: Path, repo: dict[str, Any]) -> bool:
+    """Whether git sees uncommitted changes, apart from Corral's own links."""
+    own = {r for r in corral_link_paths(repo) if is_link(worktree / Path(r))}
+    for line in git(worktree, "status", "--porcelain").stdout.splitlines():
+        if line.startswith("?? ") and line[3:].rstrip("/") in own:
+            continue
+        if line.strip():
+            return True
+    return False
+
+
+def read_toml(path: Path) -> dict[str, Any]:
+    try:
+        with path.open("rb") as fh:
+            return tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise WorkflowError(f"{path} isn't valid TOML ({exc}); fix it, or move it away") from None
+
+
 def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
-    with path.open("rb") as fh:
-        cfg = tomllib.load(fh)
+    cfg = read_toml(path)
     # Per-repository overlays written by `hwt init`; each replaces the whole
     # matching repository entry so it must be self-contained.
     repos_d = path.parent / "repos.d"
     if repos_d.is_dir():
         for extra in sorted(repos_d.glob("*.toml")):
-            with extra.open("rb") as fh:
-                overlay = tomllib.load(fh)
+            overlay = read_toml(extra)
             for name, repo in overlay.get("repositories", {}).items():
                 cfg.setdefault("repositories", {})[name] = repo
     for key in ("canonical_root", "worktree_root"):
@@ -281,6 +311,12 @@ def hash_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def lockfile_digest(path: Path) -> str:
+    """A lockfile's content, ignoring line endings: with core.autocrlf (Git for
+    Windows' default) a checkout's copy has CRLF where another's may have LF."""
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+
+
 def apply_file_operations(canonical: Path, worktree: Path, operations: list[dict[str, Any]],
                           logger: Callable[[str], None] = log) -> None:
     canonical = resolve_existing(canonical)
@@ -299,7 +335,7 @@ def apply_file_operations(canonical: Path, worktree: Path, operations: list[dict
                 logger(f"optional local source absent: {rel}")
                 continue
             source = canonical / safe_relative(rel)
-        destination = contained_destination(worktree, rel)
+        destination = contained_destination(worktree, rel, link_to=source if action == "symlink" else None)
         if action == "copy":
             if not source.is_file() and not source.is_dir():
                 raise WorkflowError(f"copy source is not a regular file or directory: {rel}")
@@ -323,14 +359,19 @@ def apply_file_operations(canonical: Path, worktree: Path, operations: list[dict
                 os.chmod(destination, stat.S_IMODE(source.stat().st_mode))
             logger(f"copied local path: {rel}")
         elif action == "symlink":
-            if is_link(destination) and destination.resolve() == source.resolve():
+            if is_junction(destination):
+                remove_link(destination)  # an older Corral's; see is_junction
+            elif is_link(destination) and destination.resolve() == source.resolve():
                 logger(f"symlink already current: {rel}")
                 continue
-            # Windows without Developer Mode copies a file instead of linking it.
-            if WINDOWS and source.is_file() and destination.is_file() and not is_link(destination):
-                # This Windows copied it last time (no symlinks without Developer
-                # Mode). A copy that differs now may hold the worktree's own edits.
-                if hash_file(destination) == hash_file(source):
+            # Windows without Developer Mode copies instead of linking.
+            if WINDOWS and not is_link(destination) and (
+                    (source.is_file() and destination.is_file()) or (source.is_dir() and destination.is_dir())):
+                # This Windows copied it last time. A copy that differs now may
+                # hold the worktree's own edits, so it stays.
+                if source.is_dir():
+                    logger(f"keeping the copy of {rel}")
+                elif hash_file(destination) == hash_file(source):
                     logger(f"copy already current: {rel}")
                 else:
                     logger(f"copy differs from {rel} in the main checkout; left as is")
@@ -466,7 +507,7 @@ def prepare_dependencies(canonical: Path, worktree: Path, dep: dict[str, Any]) -
                     source_dir = None
                 worktree_lockfile = worktree / clone_lock
                 if (source_dir is not None and source_dir.is_dir() and worktree_lockfile.is_file()
-                        and hash_file(canonical / clone_lock) == hash_file(worktree_lockfile)):
+                        and lockfile_digest(canonical / clone_lock) == lockfile_digest(worktree_lockfile)):
                     if clone_tree(source_dir, destination):
                         log(f"cloned {directory} from the canonical checkout")
                         return "cloned"
@@ -488,19 +529,32 @@ def prepare_dependencies(canonical: Path, worktree: Path, dep: dict[str, Any]) -
     if lock_name:
         c_lock = safe_source(canonical, lock_name)
         w_lock = safe_source(worktree, lock_name)
-        matching = hash_file(c_lock) == hash_file(w_lock)
+        matching = lockfile_digest(c_lock) == lockfile_digest(w_lock)
     share = policy == "shared" or (policy == "shared-if-lockfile-matches" and matching)
     if share:
         canonical_dir = safe_source(canonical, directory.as_posix())
         if not canonical_dir.is_dir(): raise WorkflowError(f"canonical dependency directory missing: {canonical_dir}")
+        if is_junction(destination):
+            remove_link(destination)  # an older Corral's; see is_junction
         if is_link(destination) and destination.resolve() == canonical_dir.resolve():
             return "shared"
         if is_link(destination):
             remove_link(destination)
+        if WINDOWS and destination.is_dir():
+            return "present"  # its own copy, made because this Windows couldn't share
         if destination.exists() or is_link(destination):
             raise WorkflowError(f"dependency destination already exists and is not the expected link: {destination}")
-        make_link(destination, canonical_dir.resolve(), directory=True)
-        return "shared"
+        try:
+            destination.symlink_to(canonical_dir.resolve(), target_is_directory=True)
+            return "shared"
+        except OSError:
+            if not WINDOWS:
+                raise
+        # A junction would share it too, but Herdr's Delete (git worktree
+        # remove) empties a junction's target with Git for Windows before 2.54.
+        log(f"warning: sharing {directory} needs a symlink, which this Windows can't make "
+            "(turn on Developer Mode); the worktree gets its own instead")
+        return prepare_dependencies(canonical, worktree, {**dep, "policy": "clone"})
     if is_link(destination):
         remove_link(destination)
     command = dep.get("install_command", [])
@@ -574,6 +628,10 @@ def allocate_port(state_dir: Path, worktree: str, start: int, end: int,
             if requested is None or requested == current:
                 return current
             del leases[key]
+        # A lease whose worktree is gone (deleted outside Corral, or a cleanup
+        # that failed partway) holds its port for nothing.
+        for stale in [k for k in leases if k != key and not Path(k).exists()]:
+            del leases[stale]
         used = {int(v) for k, v in leases.items() if k != key}
         candidates = [requested] if requested is not None else list(range(start, end + 1))
         for port in candidates:
@@ -996,11 +1054,17 @@ def server_trees(procs: list[dict[str, Any]], is_target: Callable[[dict[str, Any
     so a shell or agent that launched the server is never touched — nor is
     this process or anything it runs under."""
     by_pid = {p["pid"]: p for p in procs}
+    roots = [p["pid"] for p in procs if p["ports"] and is_target(p)]
+    return [by_pid[pid] for pid in process_tree(procs, roots)]
+
+
+def process_tree(procs: list[dict[str, Any]], roots: list[int]) -> list[int]:
+    """roots and their descendants, never this process or what it runs under."""
+    by_pid = {p["pid"]: p for p in procs}
     protected, pid = set(), os.getpid()
     while pid in by_pid and pid not in protected:
         protected.add(pid)
         pid = by_pid[pid]["ppid"]
-    protected.add(os.getpid())
     children: dict[int, list[int]] = {}
     for proc in procs:
         parent = by_pid.get(proc["ppid"])
@@ -1009,15 +1073,15 @@ def server_trees(procs: list[dict[str, Any]], is_target: Callable[[dict[str, Any
         if parent and proc.get("created") and parent.get("created") and proc["created"] < parent["created"]:
             continue
         children.setdefault(proc["ppid"], []).append(proc["pid"])
-    chosen: dict[int, dict[str, Any]] = {}
-    pending = [p["pid"] for p in procs if p["ports"] and is_target(p)]
+    chosen: list[int] = []
+    pending = [pid for pid in roots if pid in by_pid]
     while pending:
         pid = pending.pop()
-        if pid in chosen or pid in protected:
+        if pid in chosen or pid in protected or pid == os.getpid():
             continue
-        chosen[pid] = by_pid[pid]
+        chosen.append(pid)
         pending.extend(children.get(pid, []))
-    return list(chosen.values())
+    return chosen
 
 
 def _alive(pid: int) -> bool:
@@ -1169,7 +1233,17 @@ class Herdr:
         return obj["tab"]["tab_id"], obj["root_pane"]["pane_id"]
 
     def start_agent(self, pane_id: str, name: str, kind: str = "hermes") -> None:
-        self.call("agent", "start", name, "--kind", kind, "--pane", pane_id, "--timeout", "120000")
+        result = run([self.binary, "agent", "start", name, "--kind", kind, "--pane", pane_id,
+                      "--timeout", "120000"], check=False)
+        if not result.returncode:
+            return
+        detail = (result.stderr or result.stdout or "").strip()
+        if "agent_not_ready" in detail:
+            # It started and is waiting for an answer, as Claude does in every new
+            # folder ("Do you trust the files in this folder?"). Not a failure.
+            log("the agent started and is waiting for an answer in its tab")
+            return
+        raise WorkflowError(f"herdr agent start failed: {detail.splitlines()[0][:200] if detail else result.returncode}")
 
     def run_command(self, pane_id: str, command: str) -> None:
         run([self.binary, "pane", "run", pane_id, command])
@@ -1183,10 +1257,11 @@ class Herdr:
         for key, value in tokens.items(): args += ["--token", f"{key}={value}"]
         run([self.binary, *args])
 
-    def show_reminder(self, pane_id: str, message: str) -> None:
+    def show_reminder(self, pane_id: str, message: str, *, fresh: bool = False) -> None:
         # Wait for a shell prompt (covering $, #, %, ❯ and > prompts); a missed
         # or slow reminder must never break the bootstrap, so failures are
-        # swallowed and delivery is attempted regardless.
+        # swallowed and delivery is attempted regardless. fresh: the tab was
+        # just made, so nothing on its screen matters yet.
         with contextlib.suppress(WorkflowError):
             run([
                 self.binary, "pane", "wait-output", pane_id, "--regex", "[$#%❯>] ?$",
@@ -1195,9 +1270,12 @@ class Herdr:
         if self._write_reminder_to_tty(pane_id, message):
             return
         if WINDOWS:
-            # Herdr's Windows panes run PowerShell (pwsh, else powershell).
+            # Herdr's Windows panes run PowerShell (pwsh, else powershell). It
+            # has no tty to write to, so the command is typed; in a new tab it
+            # clears the screen first, so the typed command doesn't stay there.
             quoted = "'" + message.replace("'", "''") + "'"
-            command = f"Write-Host ''; Write-Host {quoted}; Write-Host ''"
+            command = ("Clear-Host; " if fresh else "Write-Host ''; ") + \
+                f"Write-Host {quoted} -ForegroundColor DarkGray; Write-Host ''"
         else:
             command = f"printf '\\n%s\\n\\n' {shlex.quote(message)}"
         with contextlib.suppress(WorkflowError):
@@ -1257,7 +1335,7 @@ class FakeHerdrForTests:
         self.agent_panes.add(pane_id)
     def has_agent(self, pane_id: str) -> bool: return pane_id in self.agent_panes
     def metadata(self, workspace: str, tokens: dict[str,str]): pass
-    def show_reminder(self, pane_id: str, message: str): self.reminders.append((pane_id, message))
+    def show_reminder(self, pane_id: str, message: str, *, fresh: bool = False): self.reminders.append((pane_id, message))
     def run_command(self, pane_id: str, command: str): self.commands.append((pane_id, command))
     def labels(self, workspace: str): return [x["label"] for x in self.workspaces[workspace]]
 
@@ -1431,12 +1509,29 @@ class HerdrCore:
         return self.new_space(path)
 
     def remove_worktree(self, canonical: Path, workspace: str | None, path: Path, force: bool) -> None:
-        git(canonical, "worktree", "remove", *(["--force"] if force else []), str(path))
-        # The checkout is gone; its space goes with its last terminal.
-        if workspace:
-            for term in self._terminals(f"herdr.space={workspace}"):
-                with contextlib.suppress(WorkflowError):
-                    run([self.binary, "kill", term["address"]])
+        # The space's terminals first: their shells have the folder open, and
+        # Windows won't delete a folder in use. The space goes with them.
+        # What git would refuse, refused before the space is ended.
+        if not force and git(path, "status", "--porcelain", "--ignore-submodules=none",
+                             check=False).stdout.strip():
+            raise WorkflowError(f"{path} has modified or untracked files; removing it needs --force")
+        terms = self._terminals(f"herdr.space={workspace}") if workspace else []
+        # hwt itself may run in one of them (the space's shell tab): that one last.
+        me = os.environ.get("HC_TERMINAL_ID")
+        own = [t for t in terms if me and me in (t.get("id"), t.get("address"))]
+        others = [t for t in terms if t not in own]
+        shells = [t["pid"] for t in others if isinstance(t.get("pid"), int)]
+        # Their shells and whatever runs in them (the agent): until those exit,
+        # Windows keeps the folder in use.
+        held = process_tree(user_processes(), shells) if WINDOWS and shells else []
+        for term in others:
+            with contextlib.suppress(WorkflowError):
+                run([self.binary, "kill", term["address"]])
+        wait_for_exit(held)
+        remove_checkout(canonical, path, force)
+        for term in own:
+            with contextlib.suppress(WorkflowError):
+                run([self.binary, "kill", term["address"]])
 
     def tabs(self, workspace: str) -> list[dict[str, Any]]:
         tabs: dict[str, dict[str, Any]] = {}
@@ -1473,7 +1568,7 @@ class HerdrCore:
     def metadata(self, workspace: str, tokens: dict[str, str]) -> None:
         pass  # Desktop has no workspace metadata; the lease in Corral's state is the record.
 
-    def show_reminder(self, pane_id: str, message: str) -> None:
+    def show_reminder(self, pane_id: str, message: str, *, fresh: bool = False) -> None:
         # Straight to the shell's tty (Linux /proc), so nothing is typed at the
         # prompt; a missed reminder must never break the bootstrap. Windows has
         # no ttys, so no reminder there: the Corral panel shows the same.
@@ -1530,9 +1625,11 @@ def corral_palette_keybinding() -> str | None:
 def ensure_layout(herdr: Any, workspace: str, worktree: Path, port: int, host: str,
                   remote_host: str, start_agent: bool, repo: dict[str, Any] | None = None,
                   agent_kind: str = "hermes", https: str | None = None,
-                  start_dev: bool = False) -> str | None:
-    """Ensure the agent/shell/server tabs; returns the server tab's pane when
-    this call created it (the place to start the dev server)."""
+                  start_dev: bool = False, before_agent: Callable[[], Any] | None = None) -> str | None:
+    """The worktree's agent, shell and server tabs, then before_agent() (its
+    dependencies: the tabs show at once, while the agent waits for a worktree
+    that's ready), then metadata and the agent. Returns the server tab's pane
+    when this call created it (the place to start the dev server)."""
     env = {
         "HWT_WORKTREE": str(worktree), "HWT_DEV_PORT": str(port), "PORT": str(port),
         "HWT_DEV_HOST": host, "HOST": host,
@@ -1563,7 +1660,7 @@ def ensure_layout(herdr: Any, workspace: str, worktree: Path, port: int, host: s
                         message += f" / {env['HWT_REMOTE_URL']}"
                 else:
                     message = "Corral: no dev command configured for this repository — set one with 'hwt init'"
-                herdr.show_reminder(pid, message)
+                herdr.show_reminder(pid, message, fresh=True)
             if label == "shell":
                 if is_desktop(herdr):
                     palette = "the Corral panel has buttons for them"
@@ -1574,13 +1671,15 @@ def ensure_layout(herdr: Any, workspace: str, worktree: Path, port: int, host: s
                 message = f"Corral: 'hwt -h' lists commands; {palette}"
                 if repo.get("_suggest_init"):
                     message += " — run 'hwt init' to configure this repository"
-                herdr.show_reminder(pid, message)
+                herdr.show_reminder(pid, message, fresh=True)
+    if before_agent:
+        before_agent()
+    herdr.metadata(workspace, {"dev_port":str(port),"dev_url":env["HWT_REMOTE_URL"],"worktree":str(worktree)})
     if start_agent:
         agent = by_label["agent"]
         pane_id = agent.get("pane_id")
         if pane_id and not herdr.has_agent(pane_id):
             herdr.start_agent(pane_id, f"hwt-{hashlib.sha1(str(worktree).encode()).hexdigest()[:8]}", agent_kind)
-    herdr.metadata(workspace, {"dev_port":str(port),"dev_url":env["HWT_REMOTE_URL"],"worktree":str(worktree)})
     return new_server
 
 
@@ -1620,6 +1719,46 @@ def ensure_canonical_workspace(herdr: Any, repo_path: Path, repo_name: str,
     workspace = obj["result"]["workspace"]["workspace_id"]
     ensure_canonical_layout(herdr, workspace, repo_path, repo_name, start_agent, agent_kind)
     return workspace
+
+
+IN_USE = ("permission denied", "being used by another process", "device or resource busy",
+          "directory not empty", "access is denied", "worktree_remove_failed")
+
+
+class FolderInUse(WorkflowError):
+    pass
+
+
+def folder_in_use(path: Path, error: Exception, retry: str) -> FolderInUse:
+    """A failed removal, said plainly: on Windows, nearly always a program
+    (a terminal cd'd into it, an editor, a server) has the folder open."""
+    detail = str(error).removeprefix("command failed (git) with exit status 255: ")
+    return FolderInUse(
+        f"couldn't delete {path}: a program probably has the folder open (a terminal in it, an "
+        f"editor, a dev server). Close it, then run '{retry}' again. ({detail})")
+
+
+def remove_checkout(canonical: Path, path: Path, force: bool) -> None:
+    git(canonical, "worktree", "remove", *(["--force"] if force else []), str(path))
+
+
+@contextlib.contextmanager
+def explained_removal(path: Path, retry: str):
+    """Windows: a removal that failed because the folder is in use, said plainly.
+    git unregisters a worktree even when it can't delete the folder, so the
+    retry is how Corral finishes the cleanup."""
+    try:
+        yield
+    except WorkflowError as exc:
+        if WINDOWS and not isinstance(exc, FolderInUse) and any(w in str(exc).lower() for w in IN_USE):
+            raise folder_in_use(path, exc, retry) from exc
+        raise
+
+
+def wait_for_exit(pids: list[int], timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while any(_alive(pid) for pid in pids) and time.monotonic() < deadline:
+        time.sleep(0.1)
 
 
 def check_remove_allowed(dirty: bool, force: bool, confirmation: str | None, branch: str) -> None:
@@ -1745,12 +1884,16 @@ def _bootstrap_locked(cfg: dict[str, Any], state: Path, worktree: Path, workspac
             repo_view["_suggest_init"] = True
         https = ensure_https(cfg, port)
         start_dev = bool(repo.get("commands", {}).get("dev")) and bool(repo.get("start_dev", cfg.get("start_dev", False)))
-        server_pane = ensure_layout(h,workspace,worktree,port,cfg.get("dev_host","127.0.0.1"),cfg.get("remote_host",""),
-                                    bool(repo.get("start_agent",False)),repo_view,agent_kind=cfg.get("agent_kind","hermes"),
-                                    https=https,start_dev=start_dev)
-        # Tabs first, install second: the workspace appears immediately while a
-        # potentially slow package-manager run happens afterwards.
-        dep_status=prepare_dependencies(canonical,worktree,repo.get("dependencies",{"policy":"clone"}))
+        # Tabs first, so the workspace appears at once; then the possibly slow
+        # dependency install; the agent last, in a worktree that's ready.
+        deps: list[str] = []
+        server_pane = ensure_layout(
+            h, workspace, worktree, port, cfg.get("dev_host", "127.0.0.1"), cfg.get("remote_host", ""),
+            bool(repo.get("start_agent", False)), repo_view, agent_kind=cfg.get("agent_kind", "hermes"),
+            https=https, start_dev=start_dev,
+            before_agent=lambda: deps.append(
+                prepare_dependencies(canonical, worktree, repo.get("dependencies", {"policy": "clone"}))))
+        dep_status = deps[0]
     except Exception:
         release_port(state, str(worktree), cfg)
         raise
@@ -2025,9 +2168,22 @@ def cmd_update(args) -> None:
         raise WorkflowError(
             f"installation at {root} is not a git checkout; update it the way it was installed")
     previous = __version__
-    result = run(["git", "-C", str(root), "pull", "--ff-only"], check=False)
-    if result.returncode:
-        raise WorkflowError(f"git pull failed: {result.stderr.strip() or result.stdout.strip()}")
+    on_branch = run(["git", "-C", str(root), "symbolic-ref", "-q", "HEAD"], check=False).returncode == 0
+    if on_branch:
+        result = run(["git", "-C", str(root), "pull", "--ff-only"], check=False)
+        if result.returncode:
+            raise WorkflowError(f"git pull failed: {result.stderr.strip() or result.stdout.strip()}")
+    else:
+        # The Corral panel's Install checks out a release tag, which leaves no
+        # branch to pull: move to the newest release instead.
+        result = run(["git", "-C", str(root), "fetch", "-q", "--tags", "--force", "origin"], check=False)
+        if result.returncode:
+            raise WorkflowError(f"git fetch failed: {result.stderr.strip() or result.stdout.strip()}")
+        tag = newest_release_tag(root)
+        if tag and version_tuple(tag) > version_tuple(previous):
+            result = run(["git", "-C", str(root), "checkout", "-q", tag], check=False)
+            if result.returncode:
+                raise WorkflowError(f"git checkout {tag} failed: {result.stderr.strip() or result.stdout.strip()}")
     manifest = tomllib.loads((root / "herdr-plugin.toml").read_text(encoding="utf-8"))
     current = str(manifest.get("version", previous))
     if shutil.which("herdr"):
@@ -2045,6 +2201,12 @@ def cmd_update(args) -> None:
         log("herdr is not on PATH; skipped plugin relink")
     print(json.dumps({"installed_from": str(root), "previous_version": previous,
                       "version": current, "up_to_date": current == previous}, indent=2))
+
+
+def newest_release_tag(root: Path) -> str | None:
+    tags = run(["git", "-C", str(root), "tag", "--list", "v*"], check=False).stdout.split()
+    releases = [t for t in tags if re.fullmatch(r"v\d+\.\d+\.\d+", t)]
+    return max(releases, key=version_tuple, default=None)
 
 
 def ref_exists(repo: Path, ref: str) -> bool:
@@ -2431,7 +2593,7 @@ def cmd_status(args,cfg,state):
         if exists:
             try:
                 name,repo,canonical=repo_for_worktree(cfg,Path(path)); dep=repo.get("dependencies",{}); lock=dep.get("lockfile")
-                if lock and (Path(path)/lock).exists() and (canonical/lock).exists(): mismatch=hash_file(Path(path)/lock)!=hash_file(canonical/lock)
+                if lock and (Path(path)/lock).exists() and (canonical/lock).exists(): mismatch=lockfile_digest(Path(path)/lock)!=lockfile_digest(canonical/lock)
             except WorkflowError: mismatch="unknown"
         rows.append({"path":path,"port":port,"exists":exists,"lockfile_mismatch":mismatch,"listening":not port_is_free(int(port)),
                      "https_url":served.get(int(port))})
@@ -2696,31 +2858,38 @@ def cmd_remove(args,cfg,state,herdr):
     item=candidates[0]; workspace,path=worktree_item_ids(item)
     with worktree_lock(state, path):
         _, repo, canonical = validate_worktree_identity(cfg, path)
-        branch=git(path,"branch","--show-current").stdout.strip(); dirty=bool(git(path,"status","--porcelain").stdout.strip())
+        branch=git(path,"branch","--show-current").stdout.strip(); dirty=worktree_dirty(path, repo)
         check_remove_allowed(dirty,args.force,args.confirm,branch)
         # Re-read immediately before the destructive call while holding our workflow lock.
-        branch2=git(path,"branch","--show-current").stdout.strip(); dirty2=bool(git(path,"status","--porcelain").stdout.strip())
+        branch2=git(path,"branch","--show-current").stdout.strip(); dirty2=worktree_dirty(path, repo)
         if branch2 != branch or dirty2 != dirty: raise WorkflowError("worktree changed while removal was being validated")
         suppress_teardown(state, str(path))
         detach_links(path, repo)
-        if is_desktop(herdr):
-            herdr.remove_worktree(canonical, workspace, path, args.force)
-        elif workspace:
-            focused = focused_workspace_id(herdr)
-            cmd=["worktree","remove","--workspace",workspace]
-            if args.force: cmd.append("--force")
-            herdr.call(*cmd)
-            restore_focus_after_removal(herdr, workspace, focused)
-        else:
-            cmd=["worktree","remove"]
-            if args.force: cmd.append("--force")
-            git(canonical, *cmd, str(path))
+        with explained_removal(path, f"hwt remove {target}"):
+            if is_desktop(herdr):
+                herdr.remove_worktree(canonical, workspace, path, args.force)
+            elif workspace:
+                focused = focused_workspace_id(herdr)
+                cmd=["worktree","remove","--workspace",workspace]
+                if args.force: cmd.append("--force")
+                herdr.call(*cmd)
+                restore_focus_after_removal(herdr, workspace, focused)
+            else:
+                remove_checkout(canonical, path, args.force)
         release_port(state,str(path),cfg)
     print(json.dumps({"removed":str(path),"branch_preserved":branch},indent=2))
 
 
 def cmd_cleanup(args, cfg, state, herdr):
-    item = choose_worktree_item(cfg, configured_worktree_items(cfg, herdr), args.target)
+    items = configured_worktree_items(cfg, herdr)
+    if args.target and not match_removal_items(items, args.target):
+        # Not a worktree (any more): perhaps a cleanup that couldn't finish.
+        found = pending_cleanup(state, args.target)
+        if found:
+            print(json.dumps(resume_cleanup(cfg, state, *found, abandon=bool(args.abandon),
+                                            confirm=args.confirm), indent=2))
+            return
+    item = choose_worktree_item(cfg, items, args.target)
     result = cleanup_worktree_item(cfg, state, herdr, item,
                                    abandon=args.abandon, confirm=args.confirm)
     print(json.dumps(result, indent=2))
@@ -2809,9 +2978,10 @@ def worktree_safety(cfg: dict[str, Any], item: dict[str, Any]) -> str:
     if not branch:
         return "detached"
     path = Path(item.get("path", ""))
-    if path.is_dir() and git(path, "status", "--porcelain", check=False).stdout.strip():
-        return "dirty"
     repo = cfg.get("repositories", {}).get(item.get("repository"), {})
+    with contextlib.suppress(WorkflowError):
+        if path.is_dir() and worktree_dirty(path, repo):
+            return "dirty"
     repo_path = repo.get("path")
     if not repo_path:
         return "unknown"
@@ -3024,7 +3194,7 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
     workspace, path = worktree_item_ids(item)
     with worktree_lock(state, path):
         validate_worktree_identity(cfg, path)
-        dirty = bool(git(path, "status", "--porcelain").stdout.strip())
+        dirty = worktree_dirty(path, repo)
         if dirty and not abandon:
             raise WorkflowError(
                 f"worktree has uncommitted changes; rerun with --abandon --confirm {branch} to discard them")
@@ -3037,45 +3207,133 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
             raise WorkflowError(
                 f"branch {branch} is not merged into {base_branch} and has commits not "
                 f"available on any other branch; rerun with --abandon --confirm {branch} to delete it anyway")
-        branch_ref = f"refs/heads/{branch}"
         remote_ref = f"refs/remotes/{remote}/{branch}"
         remote_exists = git(canonical, "show-ref", "--verify", "--quiet", remote_ref, check=False).returncode == 0
         suppress_teardown(state, str(path))
-        if remote_exists:
-            git(canonical, "push", remote, "--delete", branch)
+        entry = {"repository": repository, "branch": branch, "merged": merged,
+                 "merged_into": base_branch if merged else None, "abandoned": bool(abandon),
+                 "reason": ("squash-merged" if verdict["squash_merged"] else "merged") if merged
+                           else ("abandoned" if abandon else "no-unique-commits")}
+        # Decided: written down before anything goes, so that if the removal
+        # fails partway (git unregisters a worktree even when it can't delete
+        # the folder), running cleanup again finishes it.
+        record_cleanup(state, path, entry)
         # Before removal: a server outlives its checkout (and Herdr's tab
         # closing never reaches one an agent started in the background).
         stopped = stop_worktree_servers(state, path)
         detach_links(path, repo)
-        if is_desktop(herdr):
-            herdr.remove_worktree(canonical, workspace, path, dirty)
-        elif workspace:
-            focused = focused_workspace_id(herdr)
-            remove = ["worktree", "remove", "--workspace", workspace]
-            if dirty:
-                remove.append("--force")
-            herdr.call(*remove)
-            restore_focus_after_removal(herdr, workspace, focused)
-        else:
-            # Not open in Herdr (its remove API is workspace-only); use git directly.
-            remove = ["worktree", "remove"]
-            if dirty:
-                remove.append("--force")
-            git(canonical, *remove, str(path))
-        git(canonical, "update-ref", "-d", branch_ref)
-        release_port(state, str(path), cfg)
+        with explained_removal(path, f"hwt cleanup {branch}"):
+            if is_desktop(herdr):
+                herdr.remove_worktree(canonical, workspace, path, dirty)
+            elif workspace:
+                focused = focused_workspace_id(herdr)
+                remove = ["worktree", "remove", "--workspace", workspace]
+                if dirty:
+                    remove.append("--force")
+                herdr.call(*remove)
+                restore_focus_after_removal(herdr, workspace, focused)
+            else:
+                # Not open in Herdr (its remove API is workspace-only); use git directly.
+                remove_checkout(canonical, path, dirty)
+        # Only now the branches: a failed removal leaves them, and the remote copy, as they were.
+        done = finish_cleanup(cfg, state, canonical, remote, path, entry, remote_exists=remote_exists)
+    return {**done, "stopped_servers": stopped}
+
+
+def record_cleanup(state: Path, path: Path, entry: dict[str, Any]) -> None:
+    with locked_json(state, "cleanups") as pending:
+        pending[str(path.resolve())] = entry
+
+
+def forget_cleanup(state: Path, path: Path) -> None:
+    with locked_json(state, "cleanups") as pending:
+        pending.pop(str(path.resolve()), None)
+
+
+def pending_cleanup(state: Path, target: str) -> tuple[Path, dict[str, Any]] | None:
+    """A cleanup that decided, then couldn't finish, matching a branch or path."""
+    with locked_json(state, "cleanups") as pending:
+        entries = dict(pending)
+    wanted = str(Path(target).expanduser().resolve()) if ("/" in target or "\\" in target) else None
+    for key, entry in entries.items():
+        if target in (entry.get("branch"), key, Path(key).name) or key == wanted:
+            return Path(key), entry
+    return None
+
+
+def finish_cleanup(cfg: dict[str, Any], state: Path, canonical: Path, remote: str, path: Path,
+                   entry: dict[str, Any], *, remote_exists: bool, local_exists: bool = True) -> dict[str, Any]:
+    """After the checkout is gone: its branch, the remote copy, the port lease."""
+    branch = entry["branch"]
+    if local_exists:
+        git(canonical, "update-ref", "-d", f"refs/heads/{branch}")
+    if remote_exists:
+        git(canonical, "push", remote, "--delete", branch)
+    release_port(state, str(path), cfg)
+    forget_cleanup(state, path)
     return {
         "removed": str(path),
-        "local_branch_deleted": branch,
+        "local_branch_deleted": branch if local_exists else None,
         "remote_branch_deleted": branch if remote_exists else None,
         "remote": remote,
-        "merged": merged,
-        "merged_into": base_branch if merged else None,
-        "abandoned": bool(abandon),
-        "stopped_servers": stopped,
-        "reason": ("squash-merged" if verdict["squash_merged"] else "merged") if merged
-                  else ("abandoned" if abandon else "no-unique-commits"),
+        "merged": entry["merged"],
+        "merged_into": entry["merged_into"],
+        "abandoned": entry["abandoned"],
+        "reason": entry["reason"],
     }
+
+
+def holds_files(folder: Path) -> bool:
+    """Whether anything but empty folders is left in folder (links count)."""
+    for item in folder.iterdir():
+        if is_link(item) or not item.is_dir() or holds_files(item):
+            return True
+    return False
+
+
+def resume_cleanup(cfg: dict[str, Any], state: Path, path: Path, entry: dict[str, Any], *,
+                   abandon: bool = False, confirm: str | None = None) -> dict[str, Any]:
+    """Finish a cleanup whose removal failed partway: the folder git couldn't
+    delete (when it's empty), the branch, its remote copy, the lease. The
+    merge check was done, or the abandon confirmed, when it started."""
+    repo = cfg.get("repositories", {}).get(entry.get("repository"))
+    if not repo:
+        raise WorkflowError(f"repository {entry.get('repository')!r} is no longer configured")
+    canonical = resolve_existing(Path(repo["path"]))
+    remote = repo.get("remote", "origin")
+    branch = entry["branch"]
+    if abandon:
+        if confirm != branch:
+            raise WorkflowError(f"abandoning requires exact confirmation: --abandon --confirm {branch}")
+        entry = {**entry, "abandoned": True, "reason": "abandoned"}
+    with worktree_lock(state, path):
+        if any(Path(c["path"]).resolve() == path.resolve() for c in checkout_list(canonical)):
+            raise WorkflowError(f"{path} is still a worktree; run 'hwt list' to see Herdr's view of it")
+        leftover = None
+        if path.is_dir():
+            if holds_files(path):
+                leftover = str(path)
+                log(f"{path} still holds files git couldn't delete; delete the folder once nothing has it open")
+            else:
+                try:
+                    shutil.rmtree(path)
+                except OSError as exc:
+                    raise folder_in_use(path, exc, f"hwt cleanup {branch}") from exc
+        local_exists = git(canonical, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}",
+                           check=False).returncode == 0
+        git(canonical, "fetch", remote, "--prune", check=False)
+        if local_exists and not entry.get("abandoned"):
+            # The branch may have gained commits since the first run decided.
+            verdict = branch_disposition(repo, canonical, branch)
+            if not verdict["merged"] and verdict["unique_commits"]:
+                raise WorkflowError(
+                    f"branch {branch} now has commits not merged into {verdict['base_branch']}; "
+                    f"kept it. Delete it anyway with: hwt cleanup {branch} --abandon --confirm {branch}")
+        remote_exists = git(canonical, "show-ref", "--verify", "--quiet", f"refs/remotes/{remote}/{branch}",
+                            check=False).returncode == 0
+        done = finish_cleanup(cfg, state, canonical, remote, path, entry,
+                              remote_exists=remote_exists, local_exists=local_exists)
+    return {**done, "resumed": True, "leftover_folder": leftover}
 
 
 def teardown_status(repo: dict[str, Any], canonical: Path, branch: str) -> dict[str, Any]:
@@ -3168,6 +3426,21 @@ def cmd_teardown(args, cfg, state):
     input("Enter to close ")
 
 
+def old_junctions(cfg: dict[str, Any]) -> list[str]:
+    """Junctions in configured repositories' worktrees (see is_junction)."""
+    found = []
+    for repo in cfg.get("repositories", {}).values():
+        if repo.get("mode") != "worktree" or not Path(repo.get("path", "")).is_dir():
+            continue
+        for checkout in checkout_list(Path(repo["path"]))[1:]:
+            wt = Path(checkout["path"])
+            places = [wt / Path(r) for r in corral_link_paths(repo)]
+            with contextlib.suppress(OSError):
+                places += list(wt.iterdir())
+            found += sorted({str(p) for p in places if is_junction(p)})
+    return found
+
+
 def cmd_doctor(args,cfg,state):
     checks=[]
     for key in ("canonical_root","worktree_root"):
@@ -3188,6 +3461,13 @@ def cmd_doctor(args,cfg,state):
         checks.append({"check": "launcher", "value": str(launcher),
                        "ok": launcher.is_file() and found is not None
                              and Path(found).resolve() == launcher.resolve()})
+    junctions = old_junctions(cfg) if WINDOWS else []
+    if junctions:
+        checks.append({"check": "junctions", "ok": False, "value": junctions})
+        log("These worktrees hold junctions an older Corral made, which Herdr's Delete can empty the "
+            "main checkout through. 'hwt open <worktree>' replaces the ones Corral manages; "
+            "'rmdir' removes any junction without touching its target: "
+            + ", ".join(junctions))
     latest = latest_remote_version()
     update = {"installed": __version__, "latest": latest,
               "update_available": bool(latest and version_tuple(latest) > version_tuple(__version__))}

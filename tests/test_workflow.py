@@ -36,7 +36,7 @@ class StubProbes:
     def setUp(self):
         super().setUp()
         for name, value in (("squash_merged", False), ("stop_worktree_servers", []),
-                            ("orphan_servers", [])):
+                            ("orphan_servers", []), ("record_cleanup", None), ("forget_cleanup", None)):
             patcher = mock.patch.object(hwt, name, return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -193,23 +193,38 @@ class PortLeaseTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def worktree(self, name):
+        path = self.state / name
+        path.mkdir(exist_ok=True)
+        return str(path)
+
     def test_two_worktrees_receive_distinct_stable_ports_and_release(self):
+        a, b = self.worktree("a"), self.worktree("b")
         with mock.patch.object(hwt, "port_is_free", return_value=True):
-            a1 = hwt.allocate_port(self.state, "/wt/a", 4100, 4102)
-            b = hwt.allocate_port(self.state, "/wt/b", 4100, 4102)
-            a2 = hwt.allocate_port(self.state, "/wt/a", 4100, 4102)
-        self.assertNotEqual(a1, b)
+            a1 = hwt.allocate_port(self.state, a, 4100, 4102)
+            b1 = hwt.allocate_port(self.state, b, 4100, 4102)
+            a2 = hwt.allocate_port(self.state, a, 4100, 4102)
+        self.assertNotEqual(a1, b1)
         self.assertEqual(a1, a2)
-        hwt.release_port(self.state, "/wt/a")
+        hwt.release_port(self.state, a)
         leases = json.loads((self.state / "ports.json").read_text())
-        self.assertNotIn(str(Path("/wt/a").resolve()), leases)
-        self.assertIn(str(Path("/wt/b").resolve()), leases)
+        self.assertNotIn(str(Path(a).resolve()), leases)
+        self.assertIn(str(Path(b).resolve()), leases)
 
     def test_manual_port_collision_is_rejected(self):
         with mock.patch.object(hwt, "port_is_free", return_value=True):
-            hwt.allocate_port(self.state, "/wt/a", 4100, 4102, requested=4101)
+            hwt.allocate_port(self.state, self.worktree("a"), 4100, 4102, requested=4101)
             with self.assertRaises(hwt.WorkflowError):
-                hwt.allocate_port(self.state, "/wt/b", 4100, 4102, requested=4101)
+                hwt.allocate_port(self.state, self.worktree("b"), 4100, 4102, requested=4101)
+
+    def test_a_lease_whose_worktree_is_gone_is_reclaimed(self):
+        gone = self.worktree("gone")
+        with mock.patch.object(hwt, "port_is_free", return_value=True):
+            self.assertEqual(hwt.allocate_port(self.state, gone, 4100, 4100), 4100)
+            os.rmdir(gone)
+            self.assertEqual(hwt.allocate_port(self.state, self.worktree("new"), 4100, 4100), 4100)
+        leases = json.loads((self.state / "ports.json").read_text())
+        self.assertEqual(list(leases), [str(Path(self.state / "new").resolve())])
 
     def test_plugin_specific_state_env_does_not_split_cli_leases(self):
         with mock.patch.dict(os.environ, {"HERDR_PLUGIN_STATE_DIR": "/wrong/plugin/state"}, clear=False):

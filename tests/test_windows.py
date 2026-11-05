@@ -1,6 +1,8 @@
 """Corral on Windows. The mocked tests run everywhere and pin the Windows code
 paths (hwt.WINDOWS / install.WINDOWS stand in for os.name, which can't be
 patched without breaking pathlib); the rest run only on a real Windows."""
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -105,8 +107,22 @@ class WindowsReminderTests(unittest.TestCase):
             api.show_reminder("w2:p3", "Corral: 'hwt dev' starts it")
         self.assertEqual(command.call_args_list[-1], mock.call([
             "herdr", "pane", "run", "w2:p3",
-            "Write-Host ''; Write-Host 'Corral: ''hwt dev'' starts it'; Write-Host ''"]))
+            "Write-Host ''; Write-Host 'Corral: ''hwt dev'' starts it' -ForegroundColor DarkGray; Write-Host ''"]))
         self.assertEqual(len(command.call_args_list), 2, "wait for the prompt, then print; no process-info")
+
+    def test_a_new_tabs_reminder_clears_the_typed_command_away(self):
+        api = hwt.Herdr("herdr")
+        with as_windows(), mock.patch.object(hwt, "run") as command:
+            api.show_reminder("w2:p3", "hello", fresh=True)
+        typed = command.call_args_list[-1].args[0][-1]
+        self.assertTrue(typed.startswith("Clear-Host; "), typed)
+
+    def test_new_tabs_get_fresh_reminders(self):
+        fake = hwt.FakeHerdrForTests()
+        fake.seed_workspace("w1", "/wt", ["agent"])
+        with mock.patch.object(fake, "show_reminder") as shown:
+            hwt.ensure_layout(fake, "w1", Path("/wt"), 4100, "127.0.0.1", "", False, {})
+        self.assertEqual([c.kwargs for c in shown.call_args_list], [{"fresh": True}, {"fresh": True}])
 
     def test_desktop_reminder_is_skipped_cleanly(self):
         core = hwt.HerdrCore("hc")
@@ -232,14 +248,55 @@ class WindowsCopyTests(unittest.TestCase):
                 with self.assertRaises(OSError, msg="POSIX never substitutes"):
                     hwt.make_link(Path(tmp) / "c.cfg", source, directory=False)
 
-    def test_a_folder_gets_a_junction_where_windows_cant_symlink(self):
+    def test_a_folder_is_copied_never_junctioned_where_windows_cant_symlink(self):
+        # Git for Windows before 2.54 deletes through a junction when it removes
+        # a worktree (Herdr's Delete), emptying the main checkout's folder.
         with tempfile.TemporaryDirectory() as tmp:
-            source, destination = Path(tmp) / "modules", Path(tmp) / "wt" / "node_modules"
-            source.mkdir()
+            source, destination = Path(tmp) / "shared", Path(tmp) / "wt" / "shared"
+            (source / "sub").mkdir(parents=True)
+            (source / "sub" / "a.txt").write_text("x")
+            destination.parent.mkdir()
+            with as_windows(), mock.patch.object(Path, "symlink_to", side_effect=OSError(1314, "privilege")):
+                self.assertEqual(hwt.make_link(destination, source, directory=True), "copy")
+            self.assertFalse(hasattr(hwt, "create_junction"), "Corral makes no junctions")
+            self.assertEqual((destination / "sub" / "a.txt").read_text(), "x")
+            self.assertFalse(destination.is_symlink())
+
+    def test_shared_dependencies_without_symlinks_get_their_own_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            canon, wt = Path(tmp) / "canon", Path(tmp) / "wt"
+            (canon / "node_modules" / "pkg").mkdir(parents=True)
+            (canon / "node_modules" / "pkg" / "index.js").write_text("keep")
+            wt.mkdir()
+            (canon / "package.json").write_text("{}")
+            (wt / "package.json").write_text("{}")
+            (canon / "package-lock.json").write_bytes(b'{\n  "a": 1\n}\n')
+            (wt / "package-lock.json").write_bytes(b'{\r\n  "a": 1\r\n}\r\n')  # core.autocrlf
+            dep = {"policy": "shared"}
             with as_windows(), mock.patch.object(Path, "symlink_to", side_effect=OSError(1314, "privilege")), \
-                    mock.patch.object(hwt, "create_junction") as junction:
-                self.assertEqual(hwt.make_link(destination, source, directory=True), "junction")
-            junction.assert_called_once_with(source.resolve(), destination)
+                    contextlib.redirect_stderr(io.StringIO()) as said:
+                self.assertEqual(hwt.prepare_dependencies(canon, wt, dep), "cloned")
+                self.assertEqual(hwt.prepare_dependencies(canon, wt, dep), "present")
+            self.assertIn("Developer Mode", said.getvalue())
+            self.assertFalse(hwt.is_link(wt / "node_modules"))
+            self.assertEqual((wt / "node_modules" / "pkg" / "index.js").read_text(), "keep")
+
+    def test_a_removal_that_fails_on_a_folder_in_use_says_so(self):
+        failure = hwt.WorkflowError("command failed (git) with exit status 255: "
+                                    "error: failed to delete 'C:/wt/x': Permission denied")
+        with as_windows(), self.assertRaises(hwt.FolderInUse) as caught:
+            with hwt.explained_removal(Path("C:/wt/x"), "hwt cleanup feature/x"):
+                raise failure
+        self.assertIn("a program probably has the folder open", str(caught.exception))
+        self.assertIn("run 'hwt cleanup feature/x' again", str(caught.exception))
+        herdr_failure = hwt.WorkflowError('command failed (herdr) with exit status 1: {"error":{"code":"worktree_remove_failed"}}')
+        with as_windows(), self.assertRaises(hwt.FolderInUse):
+            with hwt.explained_removal(Path("C:/wt/x"), "hwt cleanup feature/x"):
+                raise herdr_failure
+        with as_posix(), self.assertRaises(hwt.WorkflowError) as caught:
+            with hwt.explained_removal(Path("/wt/x"), "hwt cleanup feature/x"):
+                raise failure
+        self.assertIs(caught.exception, failure, "POSIX is unchanged")
 
     def test_a_symlinked_file_copied_on_windows_counts_as_current_next_time(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -269,19 +326,24 @@ class WindowsCopyTests(unittest.TestCase):
             self.assertEqual((wt / "local.cfg").read_text(), "one")
             self.assertEqual(logs[-1], "copy differs from local.cfg in the main checkout; left as is")
 
-    def test_junctions_are_removed_before_a_worktree_is_deleted(self):
+    def test_corrals_links_and_old_junctions_go_before_a_worktree_is_deleted(self):
         with tempfile.TemporaryDirectory() as tmp:
             wt = Path(tmp)
-            (wt / "node_modules").mkdir()
-            (wt / "shared").mkdir()
+            for name in ("node_modules", "shared", "old", "mine"):
+                (wt / name).mkdir()
             repo = {"files": [{"path": "shared", "action": "symlink"}, {"path": ".env", "action": "copy"}]}
             removed = []
             with as_windows(), mock.patch.object(hwt, "is_link", side_effect=lambda p: p.name != ".env"), \
+                    mock.patch.object(hwt, "is_junction", side_effect=lambda p: p.name == "old"), \
+                    mock.patch.object(hwt, "remove_link", side_effect=removed.append):
+                hwt.detach_links(wt, repo)
+            self.assertEqual(removed, [wt / "node_modules", wt / "shared", wt / "old"],
+                             "a link of the person's own (mine) stays")
+            removed.clear()
+            with as_posix(), mock.patch.object(hwt, "is_link", return_value=True), \
                     mock.patch.object(hwt, "remove_link", side_effect=removed.append):
                 hwt.detach_links(wt, repo)
             self.assertEqual(removed, [wt / "node_modules", wt / "shared"])
-            with as_posix(), mock.patch.object(hwt, "remove_link", side_effect=AssertionError("POSIX deletes links itself")):
-                hwt.detach_links(wt, repo)
 
 
 class WindowsInstallTests(unittest.TestCase):
@@ -347,6 +409,26 @@ class WindowsInstallTests(unittest.TestCase):
         self.assertEqual(empty.store["Path"], (str(Path("/b")), 2))
 
 
+def junction(target, at):
+    """What Corral 1.3.0 made where Windows couldn't symlink a folder."""
+    import _winapi
+    _winapi.CreateJunction(str(target), str(at))
+
+
+def can_symlink(folder):
+    try:
+        (folder / ".probe").symlink_to(folder, target_is_directory=True)
+    except OSError:
+        return False
+    (folder / ".probe").rmdir()
+    return True
+
+
+def git_version():
+    out = subprocess.run(["git", "--version"], capture_output=True, text=True).stdout
+    return hwt.version_tuple(out)
+
+
 @windows_only
 class RealWindowsTests(unittest.TestCase):
     def test_install_writes_hwt_cmd_and_it_runs_hwt(self):
@@ -361,49 +443,78 @@ class RealWindowsTests(unittest.TestCase):
 
     def test_a_junction_is_a_link_and_removing_it_keeps_its_target(self):
         with tempfile.TemporaryDirectory() as tmp:
-            target, junction = Path(tmp) / "canon_modules", Path(tmp) / "node_modules"
+            target, link = Path(tmp) / "canon_modules", Path(tmp) / "node_modules"
             target.mkdir()
             (target / "keep.js").write_text("x")
-            hwt.create_junction(target, junction)
-            self.assertTrue(hwt.is_link(junction))
+            junction(target, link)
+            self.assertTrue(hwt.is_link(link))
+            self.assertTrue(hwt.is_junction(link))
             self.assertFalse(hwt.is_link(target))
-            self.assertEqual(junction.resolve(), target.resolve())
-            hwt.remove_link(junction)
-            self.assertFalse(junction.exists())
+            self.assertEqual(link.resolve(), target.resolve())
+            hwt.remove_link(link)
+            self.assertFalse(link.exists())
             self.assertEqual((target / "keep.js").read_text(), "x")
 
-    def test_shared_dependencies_become_a_junction_and_stay_current(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            canon, wt = Path(tmp) / "canon", Path(tmp) / "wt"
-            (canon / "node_modules").mkdir(parents=True)
-            wt.mkdir()
-            dep = {"policy": "shared"}
-            with mock.patch.object(Path, "symlink_to", side_effect=OSError(1314, "privilege")):
-                self.assertEqual(hwt.prepare_dependencies(canon, wt, dep), "shared")
-                self.assertEqual(hwt.prepare_dependencies(canon, wt, dep), "shared")
-            self.assertTrue(hwt.is_link(wt / "node_modules"))
-            hwt.detach_links(wt, {})
-            self.assertFalse((wt / "node_modules").exists())
-            self.assertTrue((canon / "node_modules").is_dir())
+    def repo_with_worktree(self, tmp):
+        repo, wt = Path(tmp) / "repo", Path(tmp) / "wt"
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@x", "-c", "user.name=T",
+                        "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+        (repo / "node_modules" / "pkg").mkdir(parents=True)
+        (repo / "node_modules" / "pkg" / "index.js").write_text("keep")
+        subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", str(wt)], check=True)
+        return repo, wt
 
-    def test_deleting_a_worktree_with_git_does_not_follow_a_junction(self):
-        # What Herdr's own Delete runs, without Corral's detach_links first.
+    def test_shared_dependencies_are_never_a_junction(self):
         with tempfile.TemporaryDirectory() as tmp:
-            repo, wt = Path(tmp) / "repo", Path(tmp) / "wt"
-            subprocess.run(["git", "init", "-q", str(repo)], check=True)
-            subprocess.run(["git", "-C", str(repo), "commit", "-q", "--allow-empty", "-m", "x"], check=True)
-            (repo / "node_modules" / "pkg").mkdir(parents=True)
-            (repo / "node_modules" / "pkg" / "index.js").write_text("keep")
-            subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", str(wt)], check=True)
-            hwt.create_junction(repo / "node_modules", wt / "node_modules")
+            repo, wt = self.repo_with_worktree(tmp)
+            dep = {"policy": "shared"}
+            with mock.patch.object(Path, "symlink_to", side_effect=OSError(1314, "privilege")), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                self.assertNotEqual(hwt.prepare_dependencies(repo, wt, dep), "shared")
+            self.assertFalse(hwt.is_link(wt / "node_modules"), "no symlinks here: no link at all")
             subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(wt)], check=True)
             self.assertEqual((repo / "node_modules" / "pkg" / "index.js").read_text(), "keep")
+
+    def test_an_old_corrals_junction_is_replaced_and_the_main_checkout_survives_git(self):
+        # Herdr's Delete is git worktree remove --force, without Corral's detach_links.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, wt = self.repo_with_worktree(tmp)
+            junction(repo / "node_modules", wt / "node_modules")
+            with contextlib.redirect_stderr(io.StringIO()):
+                hwt.prepare_dependencies(repo, wt, {"policy": "shared"})
+            self.assertFalse(hwt.is_junction(wt / "node_modules"))
+            subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(wt)], check=True)
+            self.assertEqual((repo / "node_modules" / "pkg" / "index.js").read_text(), "keep")
+
+    def test_git_deletes_a_directory_symlink_without_following_it(self):
+        # Shared dependencies are a symlink where Windows allows one (Developer
+        # Mode, or an administrator such as CI): git, and so Herdr's Delete, must
+        # remove only the link.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, wt = self.repo_with_worktree(tmp)
+            if not can_symlink(Path(tmp)):
+                self.skipTest("this Windows can't make symlinks")
+            self.assertEqual(hwt.prepare_dependencies(repo, wt, {"policy": "shared"}), "shared")
+            self.assertTrue((wt / "node_modules").is_symlink())
+            subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(wt)], check=True)
+            self.assertEqual((repo / "node_modules" / "pkg" / "index.js").read_text(), "keep")
+
+    def test_git_older_than_2_54_deletes_through_a_junction(self):
+        # Why Corral makes no junctions; and why CI (newer Git) never saw it.
+        print(f"git {'.'.join(map(str, git_version()))}", file=sys.stderr)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, wt = self.repo_with_worktree(tmp)
+            junction(repo / "node_modules", wt / "node_modules")
+            subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", str(wt)], check=True)
+            kept = (repo / "node_modules" / "pkg" / "index.js").exists()
+            self.assertEqual(kept, git_version() >= (2, 54), "Git for Windows added the junction check in 2.54")
 
     def test_a_tree_holding_a_junction_is_not_copied(self):
         with tempfile.TemporaryDirectory() as tmp:
             source, destination = Path(tmp) / "src", Path(tmp) / "dst"
             (source / "real").mkdir(parents=True)
-            hwt.create_junction(source / "real", source / "linked")
+            junction(source / "real", source / "linked")
             self.assertFalse(hwt.clone_tree(source, destination))
             self.assertFalse(destination.exists())
 
