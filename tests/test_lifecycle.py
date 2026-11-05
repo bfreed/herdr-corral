@@ -36,6 +36,16 @@ def git(cwd, *args):
                           capture_output=True, text=True).stdout.strip()
 
 
+def pending(state, target):
+    """The half-done cleanup target names, as cmd_cleanup would pick it."""
+    item = hwt.choose_worktree_item({}, [], target, hwt.pending_cleanups(state))
+    return Path(item["path"]), item["_pending"]
+
+
+def nothing_pending(state):
+    return hwt.pending_cleanups(state) == []
+
+
 class Project(unittest.TestCase):
     """A main checkout with a bare origin, and a merged branch in a worktree."""
 
@@ -117,7 +127,7 @@ class ResumedCleanupTests(Project):
         self.assertFalse(self.has_branch())
         self.assertFalse(self.has_remote_branch())
         self.assertIsNone(hwt.leased_port(self.state, str(self.wt)))
-        self.assertIsNone(hwt.pending_cleanup(self.state, self.branch))
+        self.assertTrue(nothing_pending(self.state))
 
     def test_a_branch_that_gained_commits_since_is_kept_unless_abandoned(self):
         with mock.patch.object(hwt, "remove_checkout", side_effect=self.fail_like_windows):
@@ -130,7 +140,7 @@ class ResumedCleanupTests(Project):
         git(self.canon, "add", "later.txt")
         git(self.canon, "commit", "-q", "-m", "later")
         git(self.canon, "switch", "-q", "main")
-        found = hwt.pending_cleanup(self.state, self.branch)
+        found = pending(self.state, self.branch)
         with self.assertRaisesRegex(hwt.WorkflowError, "now has commits not merged"):
             hwt.resume_cleanup(self.cfg, self.state, *found)
         self.assertTrue(self.has_branch())
@@ -139,6 +149,79 @@ class ResumedCleanupTests(Project):
         result = hwt.resume_cleanup(self.cfg, self.state, *found, abandon=True, confirm=self.branch)
         self.assertEqual(result["reason"], "abandoned")
         self.assertFalse(self.has_branch())
+
+    def other_repo_with_the_same_branch(self):
+        other = self.canon.parent / "other"
+        other.mkdir()
+        git(other, "init", "-q", "-b", "main")
+        git(other, "commit", "-q", "--allow-empty", "-m", "base")
+        wt = self.wt.parent.parent / "other" / hwt.branch_slug(self.branch)
+        wt.parent.mkdir(parents=True)
+        git(other, "worktree", "add", "-q", "-b", self.branch, str(wt), "main")
+        self.cfg["repositories"]["other"] = {"path": str(other), "mode": "worktree", "remote": "origin",
+                                             "base_branch": "origin/main"}
+        return {"branch": self.branch, "is_linked_worktree": True, "path": str(wt), "repository": "other"}
+
+    def test_a_retry_by_branch_name_asks_when_another_repository_has_that_branch(self):
+        live = self.other_repo_with_the_same_branch()
+        with mock.patch.object(hwt, "remove_checkout", side_effect=self.fail_like_windows):
+            with self.assertRaises(hwt.WorkflowError):
+                hwt.cleanup_worktree_item(self.cfg, self.state, mock.Mock(), self.item(),
+                                          abandon=False, confirm=None)
+        args = type("Args", (), {"target": self.branch, "abandon": False, "confirm": None})()
+        with mock.patch.object(hwt, "configured_worktree_items", return_value=[live]), \
+                mock.patch.object(hwt.sys.stdin, "isatty", return_value=False), \
+                contextlib.redirect_stderr(io.StringIO()) as listed:
+            with self.assertRaisesRegex(hwt.WorkflowError, "re-run with one of the listed names or paths"):
+                hwt.cmd_cleanup(args, self.cfg, self.state, mock.Mock())
+        self.assertIn("matches several worktrees", listed.getvalue())
+        self.assertIn(hwt.shorten_home(str(self.wt)), listed.getvalue())
+        self.assertIn(hwt.shorten_home(live["path"]), listed.getvalue())
+        self.assertIn("cleanup cut short", listed.getvalue())
+        self.assertTrue(Path(live["path"]).is_dir(), "the other repository's worktree is untouched")
+        # By path, as the failure's message says: the half-done one.
+        args.target = str(self.wt)
+        with mock.patch.object(hwt, "configured_worktree_items", return_value=[live]), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            hwt.cmd_cleanup(args, self.cfg, self.state, mock.Mock())
+        self.assertTrue(json.loads(out.getvalue())["resumed"])
+        self.assertFalse(self.has_branch())
+        self.assertTrue(Path(live["path"]).is_dir())
+
+    def test_a_retry_closes_the_worktrees_own_workspace_first(self):
+        with mock.patch.object(hwt, "remove_checkout", side_effect=self.fail_like_windows):
+            with self.assertRaises(hwt.WorkflowError):
+                hwt.cleanup_worktree_item(self.cfg, self.state, mock.Mock(), self.item(),
+                                          abandon=False, confirm=None)
+        # Herdr's removal failed, so the worktree's workspace is still open and
+        # its terminals hold the folder until it closes.
+        herdr, closed = mock.Mock(), []
+        herdr.call.side_effect = lambda *a: closed.append(a) or {"result": {}}
+        real_rmtree = hwt.shutil.rmtree
+        def rmtree(path, *a, **k):
+            if not closed:
+                raise PermissionError(13, "in use", str(path))
+            real_rmtree(path, *a, **k)
+        with mock.patch.object(hwt, "find_workspace_for_path", return_value="w7"), \
+                mock.patch.object(hwt.shutil, "rmtree", side_effect=rmtree), \
+                mock.patch.dict(os.environ, {"HERDR_WORKSPACE_ID": "w1"}):
+            result = hwt.resume_cleanup(self.cfg, self.state, *pending(self.state, str(self.wt)), herdr=herdr)
+        self.assertEqual(closed, [("workspace", "close", "w7")])
+        self.assertFalse(self.wt.exists())
+        self.assertIsNone(result["leftover_folder"])
+
+    def test_a_retry_from_inside_the_worktrees_workspace_says_so(self):
+        with mock.patch.object(hwt, "remove_checkout", side_effect=self.fail_like_windows):
+            with self.assertRaises(hwt.WorkflowError):
+                hwt.cleanup_worktree_item(self.cfg, self.state, mock.Mock(), self.item(),
+                                          abandon=False, confirm=None)
+        herdr = mock.Mock()
+        with mock.patch.object(hwt, "find_workspace_for_path", return_value="w7"), \
+                mock.patch.dict(os.environ, {"HERDR_WORKSPACE_ID": "w7"}):
+            with self.assertRaisesRegex(hwt.WorkflowError, "own workspace, which has to close first"):
+                hwt.resume_cleanup(self.cfg, self.state, *pending(self.state, str(self.wt)), herdr=herdr)
+        herdr.call.assert_not_called()
+        self.assertTrue(self.has_branch(), "nothing deleted")
 
     def test_a_folder_still_holding_files_is_reported_not_deleted(self):
         def fail(canonical, path, force):
@@ -151,7 +234,7 @@ class ResumedCleanupTests(Project):
                 hwt.cleanup_worktree_item(self.cfg, self.state, mock.Mock(), self.item(),
                                           abandon=False, confirm=None)
         with contextlib.redirect_stderr(io.StringIO()):
-            result = hwt.resume_cleanup(self.cfg, self.state, *hwt.pending_cleanup(self.state, str(self.wt)))
+            result = hwt.resume_cleanup(self.cfg, self.state, *pending(self.state, str(self.wt)))
         self.assertEqual(result["leftover_folder"], str(self.wt))
         self.assertEqual((self.wt / "locked" / "open.log").read_text(), "in use")
         self.assertFalse(self.has_branch())
@@ -162,7 +245,7 @@ class ResumedCleanupTests(Project):
         self.assertEqual(result["reason"], "merged")
         self.assertFalse(self.wt.exists())
         self.assertFalse(self.has_remote_branch())
-        self.assertIsNone(hwt.pending_cleanup(self.state, self.branch))
+        self.assertTrue(nothing_pending(self.state))
 
 
 class CorralLinkTests(Project):

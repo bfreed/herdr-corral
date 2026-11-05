@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.2 — 2026-11-05
+
+Two cleanup fixes from re-testing 1.4.1 on Windows.
+
+- **A retry could clean up the wrong worktree.** After a cleanup is cut short, git no longer lists the worktree, so `hwt cleanup <branch>` matched another repository's worktree with the same branch name, if there was one, and cleaned that up instead. Half-done cleanups are now candidates like any worktree: a name matching several asks which (listing their paths; marked "cleanup cut short"), and outside a terminal it stops and lists them. The failure's message now gives the retry by path (`hwt cleanup <path>`).
+- **A TUI retry failed the same way.** When Herdr's removal fails, the worktree's Herdr workspace stays open and its terminals keep the folder in use. The retry now closes that workspace first (on Desktop, ends the space), then deletes the empty folder, retrying for a few seconds on Windows. Run from inside that workspace, it says to run it from another one instead of closing itself.
+
 ## 1.4.1 — 2026-11-05
 
 Fixes from a hands-on Windows 11 test of 1.3.0 (Git for Windows 2.49, Herdr 0.9.4, Python 3.14).
