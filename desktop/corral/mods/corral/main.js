@@ -14,7 +14,7 @@ import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import { exec, spaces, panes, focused, terminals, run, theme, notify, window, layout, settings, shared, setShared,
   readTextFile, writeTextFile, appHome } from "herdr";
 
-const VERSION = "1.3.0"; // this panel; ships with the same Corral version
+const VERSION = "1.4.0"; // this panel; ships with the same Corral version
 const RELEASE = `v${VERSION}`; // the Corral release Install checks out
 const REPO = "https://github.com/bfreed/herdr-corral";
 const NEEDS = [1, 2, 0]; // the oldest hwt this panel works with

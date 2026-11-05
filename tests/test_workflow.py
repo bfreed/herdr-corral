@@ -369,7 +369,7 @@ class LayoutTests(unittest.TestCase):
                 "HERDR_PLUGIN_EVENT_JSON": payload,
             }, clear=False), mock.patch.object(hwt, "release_port") as release:
                 hwt.cmd_event(object(), cfg, root / "state", mock.Mock())
-            release.assert_called_once_with(root / "state", str(wt))
+            release.assert_called_once_with(root / "state", str(wt), mock.ANY)
 
     def test_removed_event_releases_lease_for_ad_hoc_worktree_location(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -382,7 +382,7 @@ class LayoutTests(unittest.TestCase):
                 "HERDR_PLUGIN_EVENT_JSON": payload,
             }, clear=False), mock.patch.object(hwt, "release_port") as release:
                 hwt.cmd_event(object(), cfg, root / "state", mock.Mock())
-            release.assert_called_once_with(root / "state", str(wt))
+            release.assert_called_once_with(root / "state", str(wt), mock.ANY)
 
     def test_bootstrap_failure_releases_new_port_lease(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -616,7 +616,7 @@ class RemovalTests(StubProbes, unittest.TestCase):
         self.assertIn(mock.call(Path("/canon/demo"), "push", "origin", "--delete", "feature/x"), git.call_args_list)
         self.assertIn(mock.call("worktree", "remove", "--workspace", "w2", "--force"), fake.call.call_args_list)
         self.assertIn(mock.call(Path("/canon/demo"), "update-ref", "-d", "refs/heads/feature/x"), git.call_args_list)
-        release.assert_called_once_with(Path("/state"), str(Path("/approved/wt")))
+        release.assert_called_once_with(Path("/state"), str(Path("/approved/wt")), mock.ANY)
 
     def test_cleanup_fetch_failure_leaves_checkout_and_branches_untouched(self):
         args = self.cleanup_args()
@@ -682,7 +682,7 @@ class RemovalTests(StubProbes, unittest.TestCase):
             hwt.cmd_cleanup(args, self.CFG, Path("/state"), fake)
         self.assertIn(mock.call("worktree", "remove", "--workspace", "w2"), fake.call.call_args_list)
         self.assertIn(mock.call(Path("/canon/demo"), "update-ref", "-d", "refs/heads/feature/x"), git.call_args_list)
-        release.assert_called_once_with(Path("/state"), str(Path("/approved/wt")))
+        release.assert_called_once_with(Path("/state"), str(Path("/approved/wt")), mock.ANY)
         self.assertEqual(json.loads(out.getvalue())["reason"], "no-unique-commits")
 
     def test_cleanup_of_merged_clean_branch_needs_no_confirmation(self):
@@ -708,7 +708,7 @@ class RemovalTests(StubProbes, unittest.TestCase):
         self.assertIn(mock.call(Path("/canon/demo"), "push", "origin", "--delete", "feature/x"), git.call_args_list)
         self.assertIn(mock.call("worktree", "remove", "--workspace", "w2"), fake.call.call_args_list)
         self.assertIn(mock.call(Path("/canon/demo"), "update-ref", "-d", "refs/heads/feature/x"), git.call_args_list)
-        release.assert_called_once_with(Path("/state"), str(Path("/approved/wt")))
+        release.assert_called_once_with(Path("/state"), str(Path("/approved/wt")), mock.ANY)
 
     def _refocus_run(self, focused_id):
         args = self.cleanup_args()
@@ -818,7 +818,7 @@ class RemovalTests(StubProbes, unittest.TestCase):
                       git.call_args_list)
         self.assertIn(mock.call(Path("/canon/demo"), "update-ref", "-d", "refs/heads/feature/x"),
                       git.call_args_list)
-        release.assert_called_once_with(Path("/state"), str(Path("/approved/wt")))
+        release.assert_called_once_with(Path("/state"), str(Path("/approved/wt")), mock.ANY)
 
     def test_removal_revalidates_configured_worktree_before_git_or_herdr(self):
         cfg = {"repositories": {
