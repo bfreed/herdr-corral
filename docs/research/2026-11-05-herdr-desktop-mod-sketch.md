@@ -1,6 +1,6 @@
 # Corral for Herdr Desktop — sketch
 
-Status: sketch, not built. Read against herdr-app `e77f112` (2026-11-04) and Corral v1.1.0.
+Status: built and shipped in Corral 1.2.0. Some details changed while building (`hwt` picks the Herdr it runs in instead of a config switch; per-tab env works; the panel updates itself). The README's "Herdr Desktop" section describes what shipped. Read against herdr-app `e77f112` (2026-11-04) and Corral v1.1.0.
 
 ## The problem
 
