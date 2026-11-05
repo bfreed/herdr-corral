@@ -43,7 +43,9 @@ function harness({ probe = {}, info = null, hwt = {}, space = {}, terms = [], ta
     Input: { new: element },
     InputState: { new: () => { let v = ""; return { on() {}, value: () => v, set_value: (x) => { v = x; }, type: (x) => { v = x; } }; } },
     theme: () => new Proxy({}, { get: (_, k) => String(k) }),
-    window: () => ({ platform: "macos" }),
+    window: () => ({ platform: "macos", titlebar: "none", fullscreen: false }),
+    layout: () => ({ traffic_lights: [16, 18] }),
+    settings: () => ({ zoom: 1 }),
     spaces: () => structuredClone(state.spaces),
     panes: () => structuredClone(state.panes),
     focused: () => ({ space: theSpace.id }),
@@ -188,4 +190,9 @@ test("clicking a worktree that has no space opens it with hwt open", async () =>
   await h.settle();
   await h.click("wt-0");
   assert.deepEqual(h.hwtCalls(), [["open", "/w/demo/fix-1"]]);
+});
+
+test("on macOS the header clears the window buttons", () => {
+  const h = harness();
+  assert.equal(h.panel.lightsPadding(), 70); // (16 + 64) - the panel's own 10 px padding
 });

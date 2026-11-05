@@ -76,7 +76,7 @@ Corral also works with [Herdr Desktop](https://herdr.dev/), through each machine
 2. Focus a space. If Corral isn't installed on that space's machine, the panel offers **Install Corral**. That needs git and Python 3.11+ there, clones this repository's release into `~/.local/share/herdr-corral`, and runs `install.py --desktop` with the repository's parent folder as the repositories folder. If the repository isn't set up, the panel offers **Set up** with a base-branch choice, plus **More settings…**, which opens `hwt init` in a new tab.
 3. On a repository's main checkout, type a branch name and click **New worktree**. On a worktree, the panel shows its port and dev URL, starts the dev server, and offers **Clean up…** (merge-checked, as `hwt cleanup`).
 
-On a machine that already has Corral, set `frontend = "desktop"` in `~/.config/herdr-corral/config.toml` so `hwt` run from a shell (by you or an agent) also makes Desktop spaces. The panel always passes `--frontend desktop` itself.
+TUI and Desktop work side by side; there's nothing to switch. `hwt` drives whichever Herdr it runs in: the TUI from a TUI pane (and for the TUI plugin's own hooks), Desktop from a Desktop terminal. Only in a shell outside both (ssh, cron) does `frontend` in `~/.config/herdr-corral/config.toml` decide (default `tui`). `--frontend` overrides it all; the panel always passes `--frontend desktop`.
 
 Panel tests: `node --test desktop/tests/panel.test.mjs`. Check it as Herdr loads it: `herdr-app check ~/.config/herdr-app/mods/corral`.
 

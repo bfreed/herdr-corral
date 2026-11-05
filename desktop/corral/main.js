@@ -7,7 +7,7 @@
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { exec, spaces, panes, focused, terminals, run, theme, notify, window } from "herdr";
+import { exec, spaces, panes, focused, terminals, run, theme, notify, window, layout, settings } from "herdr";
 
 const RELEASE = "v1.2.0"; // the Corral release Install checks out
 const REPO = "https://github.com/bfreed/herdr-corral";
@@ -394,11 +394,20 @@ export default class Corral extends View {
     return parts;
   }
 
+  // Room for macOS's window buttons: docked on the left, the panel is the
+  // window's first column (Herdr's own sidebar header does the same).
+  lightsPadding() {
+    const w = window();
+    if (w?.platform !== "macos" || w.titlebar !== "none" || w.fullscreen) return 0;
+    const x = layout()?.traffic_lights?.[0] ?? 12;
+    return Math.max(0, (x + 64) / (settings().zoom ?? 1) - 10);
+  }
+
   render() {
     const t = theme();
     const v = this.view();
     return v_flex().id("corral").size_full().bg(t.chrome).p(10).gap(12).overflow_y_scroll()
-      .child(h_flex().gap(6).items_center()
+      .child(h_flex().gap(6).items_center().pl(this.lightsPadding())
         .child(div().flex_1().font_semibold().text_size(13).text_color(t.foreground).child("Corral"))
         .child(div().text_size(11).text_color(t.dim).child(v ? (v.machine ?? "this computer") : ""))
         .child(div().id("refresh").px(4).cursor_pointer().text_color(t.dim).hover((s) => s.text_color(t.foreground))

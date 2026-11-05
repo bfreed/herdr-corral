@@ -2644,12 +2644,27 @@ def maybe_open_teardown(cfg: dict[str, Any], state: Path, payload: dict[str, Any
              "--env", f"HWT_TEARDOWN_FORCED={'1' if data.get('forced') else '0'}"])
 
 
+def detect_frontend(cfg: dict[str, Any]) -> str:
+    """Which Herdr runs this hwt: the one it was started from, else config.
+
+    A TUI pane, or a TUI plugin hook or action, means the TUI, even when the
+    TUI itself was started inside a Desktop terminal. A herdr-core terminal
+    (Desktop's) means Desktop. Anywhere else (an ssh shell, cron) the
+    config's `frontend` decides."""
+    if (os.environ.get("HERDR_ENV") == "1" or "HERDR_PLUGIN_EVENT" in os.environ
+            or "HERDR_WORKSPACE_ID" in os.environ):
+        return "tui"
+    if os.environ.get("HC_TERMINAL_ID"):
+        return "desktop"
+    return cfg.get("frontend", "tui")
+
+
 def parser() -> argparse.ArgumentParser:
     p=argparse.ArgumentParser(prog="hwt",description="Corral: safe Git-worktree workflow for Herdr")
     p.add_argument("--config",type=Path,default=DEFAULT_CONFIG,help=argparse.SUPPRESS)
     p.add_argument("--version",action="version",version=f"hwt {__version__}")
     p.add_argument("--frontend",choices=("tui","desktop"),
-                   help="Herdr TUI or Herdr Desktop (default: config 'frontend', else tui)")
+                   help="Herdr TUI or Herdr Desktop (default: the one hwt runs in, else config 'frontend', else tui)")
     # metavar hides the internal entry points (event, cleanup-workspace,
     # palette-open, teardown, invoked by Herdr) from usage; omitting their
     # help keeps them out of the table below it.
@@ -2687,7 +2702,7 @@ def main(argv: list[str] | None=None) -> int:
             cmd_palette_open(args)
             return 0
         cfg=load_config(args.config); state=runtime_state_dir()
-        args.frontend = args.frontend or cfg.get("frontend", "tui")
+        args.frontend = args.frontend or detect_frontend(cfg)
         herdr = HerdrCore() if args.frontend == "desktop" else Herdr()
         commands={"add":cmd_add,"info":cmd_info,"new":cmd_new,"open":cmd_open,"init":cmd_init,"list":cmd_list,"status":cmd_status,"dev":cmd_dev,"remove":cmd_remove,"cleanup":cmd_cleanup,"cleanup-workspace":cmd_cleanup_workspace,"sweep":cmd_sweep,"reap":cmd_reap,"palette":cmd_palette,"doctor":cmd_doctor,"event":cmd_event,"teardown":cmd_teardown}
         fn=commands[args.command]

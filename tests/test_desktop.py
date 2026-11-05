@@ -271,14 +271,17 @@ class AddTests(DesktopTestCase):
 
 
 class FrontendSelectionTests(unittest.TestCase):
-    def run_main(self, config_text, *argv):
+    CLEAN = {k: v for k, v in os.environ.items()
+             if k not in ("HERDR_ENV", "HERDR_PLUGIN_EVENT", "HERDR_WORKSPACE_ID", "HC_TERMINAL_ID")}
+
+    def run_main(self, config_text, *argv, env=None):
         with tempfile.TemporaryDirectory() as tmp:
             config = Path(tmp) / "config.toml"
             (Path(tmp) / "r").mkdir()
             config.write_text(f'canonical_root = "{tmp}/r"\nworktree_root = "{tmp}"\nrepositories = {{}}\n'
                               + config_text)
             with mock.patch.object(hwt, "cmd_list") as cmd_list, \
-                 mock.patch.dict(os.environ, {"HWT_STATE_DIR": tmp}):
+                 mock.patch.dict(os.environ, {**self.CLEAN, "HWT_STATE_DIR": tmp, **(env or {})}, clear=True):
                 self.assertEqual(hwt.main(["--config", str(config), *argv, "list"]), 0)
             return cmd_list.call_args.args[3]
 
@@ -286,6 +289,15 @@ class FrontendSelectionTests(unittest.TestCase):
         self.assertIsInstance(self.run_main('frontend = "desktop"\n'), hwt.HerdrCore)
         self.assertIsInstance(self.run_main(""), hwt.Herdr)
         self.assertIsInstance(self.run_main('frontend = "desktop"\n', "--frontend", "tui"), hwt.Herdr)
+
+    def test_the_herdr_it_runs_in_wins_over_config(self):
+        # An agent in a Desktop terminal, with the config still on tui.
+        self.assertIsInstance(self.run_main("", env={"HC_TERMINAL_ID": "t3"}), hwt.HerdrCore)
+        # A TUI pane, or the TUI plugin's own hooks, with the config on desktop.
+        self.assertIsInstance(self.run_main('frontend = "desktop"\n', env={"HERDR_ENV": "1"}), hwt.Herdr)
+        self.assertIsInstance(self.run_main('frontend = "desktop"\n', env={"HERDR_PLUGIN_EVENT": "worktree.created"}), hwt.Herdr)
+        # The TUI started inside a Desktop terminal: its panes are still the TUI's.
+        self.assertIsInstance(self.run_main("", env={"HC_TERMINAL_ID": "t3", "HERDR_ENV": "1"}), hwt.Herdr)
 
 
 @unittest.skipUnless(os.name == "posix", "installer run needs POSIX")
