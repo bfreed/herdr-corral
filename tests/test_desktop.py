@@ -176,11 +176,32 @@ class RemoveWorktreeTests(DesktopTestCase):
         self.mine = self.core.add(self.checkout, {"herdr.space": "spWT", "herdr.tab": "tb1"})
         self.other = self.core.add(self.repo, {"herdr.space": "spMAIN", "herdr.tab": "tb2"})
 
-    def test_removal_deletes_the_checkout_then_ends_only_its_space(self):
+    def test_removal_ends_only_its_space_and_deletes_the_checkout(self):
         self.herdr.remove_worktree(self.repo, "spWT", self.checkout, force=False)
         self.assertFalse(self.checkout.exists())
         self.assertEqual(self.core.killed, [self.mine])
         self.assertIn(self.other, self.core.terms)
+
+    def test_its_terminals_end_before_git_removes_the_checkout(self):
+        # On Windows their shells hold the folder: git can't delete it while they run.
+        at_removal = []
+        real = hwt.remove_checkout
+        with mock.patch.object(hwt, "remove_checkout",
+                               side_effect=lambda *a: (at_removal.extend(self.core.killed), real(*a))):
+            self.herdr.remove_worktree(self.repo, "spWT", self.checkout, force=False)
+        self.assertEqual(at_removal, [self.mine])
+        self.assertFalse(self.checkout.exists())
+
+    def test_the_terminal_hwt_runs_in_ends_last(self):
+        tab = self.core.add(self.checkout, {"herdr.space": "spWT", "herdr.tab": "tb3"})
+        at_removal = []
+        real = hwt.remove_checkout
+        with mock.patch.dict(os.environ, {"HC_TERMINAL_ID": self.mine}), \
+                mock.patch.object(hwt, "remove_checkout",
+                                  side_effect=lambda *a: (at_removal.extend(self.core.killed), real(*a))):
+            self.herdr.remove_worktree(self.repo, "spWT", self.checkout, force=False)
+        self.assertEqual(at_removal, [tab])
+        self.assertEqual(self.core.killed, [tab, self.mine])
 
     def test_a_refused_removal_leaves_the_space_running(self):
         (self.checkout / "f").write_text("changed")

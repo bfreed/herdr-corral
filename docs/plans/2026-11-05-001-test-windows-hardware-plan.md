@@ -4,6 +4,44 @@ For the Windows 11 test machine (Herdr Desktop, herdr 0.9.4, hc, git, Python 3.1
 
 Record for each step: pass/fail, the exact error text, and `hwt --version`, `herdr --version`, `hc --version` and `herdr-app --version` once at the start. Use PowerShell (Windows PowerShell 5.1 unless a step says otherwise). Use a throwaway repository with an `origin` you can push to and delete branches on, for example a fork or a scratch repo: `C:\Users\<you>\repos\demo`, with a `package.json` whose `dev` script listens on `$env:PORT` (`npx http-server -p $env:PORT` is enough) and a `package-lock.json`.
 
+## Re-run for 1.4.1
+
+1.4.1 fixes what the first run on this machine found (Git for Windows 2.49.0, Python 3.14). It also carries 1.4.0 (HTTPS dev servers over Tailscale, `start_dev`), which is off unless configured. Re-run these, in this order. Use the throwaway `demo` repository: step R2 deliberately tests the data-loss case.
+
+- **R0. Get to 1.4.1.** The panel-installed 1.3.0 is a tag checkout, so its own `hwt update` can't move it this once. Run `git -C $HOME\.local\share\herdr-corral fetch --tags`, then `git -C $HOME\.local\share\herdr-corral checkout v1.4.1`, then `hwt update`.
+  - `hwt --version` should print `hwt 1.4.1`.
+  - `hwt doctor`: note any `junctions` check. It lists worktrees 1.3.0 left a junction in.
+  - Then, to check bug 5, run `hwt update` again on that tag checkout. It must print `"up_to_date": true`, with no "git pull failed". (Moving to a newer release is tested in CI; no release is newer than v1.4.1 yet.)
+- **R1. CI's blind spot.** Run `py -3 -m unittest discover -s $HOME\.local\share\herdr-corral\tests`. It must pass, including `test_git_older_than_2_54_deletes_through_a_junction`, which expects Git 2.49 to delete through a junction (that's why Corral no longer makes them). Report the `git 2.49.0` line it prints, and whether `test_git_deletes_a_directory_symlink_without_following_it` ran or was skipped (it needs Developer Mode).
+- **R2. Shared dependencies (bug 1).** With `policy = "shared"` and Developer Mode **off**:
+  - Create a worktree. The bootstrap says "sharing node_modules needs a symlink … the worktree gets its own instead".
+  - `Get-Item <wt>\node_modules | Select LinkType` must be empty: a real folder, not a junction.
+  - Count the files in the main checkout's `node_modules`: `(Get-ChildItem -Recurse -File <main>\node_modules).Count`.
+  - Delete the worktree with **Herdr's own Delete** (not `hwt`). Count again: the two counts must match.
+  - Then, with Developer Mode **on**: a new worktree's `node_modules` shows `SymbolicLink`. Herdr's Delete must again leave the count unchanged.
+- **R3. A 1.3.0 junction.** If R0's `hwt doctor` listed one, run `hwt open <that worktree>`, then `Get-Item <wt>\node_modules | Select LinkType`: it must no longer say `Junction`. Then `hwt doctor` must not list it.
+- **R4. Desktop Clean up (bug 2).** In the panel, use **Clean up…** then **Delete worktree and branch** on a merged worktree whose agent, shell and server tabs are all open. The space must close, then the worktree folder, the branch and its remote copy must all be gone. Expected: no "Permission denied".
+- **R5. A folder in use (bug 3).**
+  - In a separate PowerShell window (not one of the space's tabs), `cd` into a merged worktree's folder. Then run `hwt cleanup <branch>` from another folder.
+  - Expected message: "couldn't delete … a program probably has the folder open … run 'hwt cleanup <branch>' again".
+  - Then check:
+    - `git branch --list <branch>`: still there.
+    - `git ls-remote origin <branch>`: still there.
+    - `hwt status`: still shows the lease.
+  - `cd` out of the folder, then run the same `hwt cleanup <branch>` again. It must print `"resumed": true`, and remove the empty folder, the branch, the remote branch and the lease.
+- **R6. New worktree with Claude (bug 4).** In a folder Claude hasn't seen, run `hwt new` (TUI, `start_agent = true`, agent `claude`).
+  - The bootstrap finishes after "the agent started and is waiting for an answer in its tab", with no error.
+  - `hwt status` shows the lease.
+  - The agent tab shows Claude's trust question, which appeared only after `node_modules` was ready.
+- **R7. Re-opening (bugs 6 and 8).**
+  - Bug 6: with `{ path = "local.cfg", action = "symlink" }`, run `hwt open <wt>` twice. No "symlink escape".
+  - Bug 8: with `policy = "clone"` and `core.autocrlf=true`, the bootstrap log says "cloned node_modules", not an install.
+- **R8. Dirty check (bug 7).** With Developer Mode on and `policy = "shared"`, `hwt cleanup` of a merged worktree must not say "uncommitted changes".
+- **R9. Small ones (bug 9).**
+  - Run `irm …/install.ps1 | iex` with Herdr closed, then `$LASTEXITCODE`: it must be 0.
+  - Put a broken `repos.d\x.toml` in place, run `hwt list`, and check that the error names `x.toml` with no traceback. Remove it afterwards.
+  - In the TUI, a new worktree's server and shell tabs show the dim reminder with no `Write-Host …` command left above it.
+
 ## 0. Before you start
 
 1. `where.exe python py python3 git hc herdr herdr-app`: note which exist and where. The Store's `python.exe`/`python3.exe` stubs in `WindowsApps` count as missing.

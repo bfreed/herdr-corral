@@ -62,13 +62,12 @@ jobs:
           $env:HERDR_APP_HOME = Join-Path $env:RUNNER_TEMP "herdr-app"
           New-Item -ItemType Directory -Force -Path "$env:HERDR_APP_HOME\layouts" | Out-Null
           Set-Content -Path "$env:HERDR_APP_HOME\layouts\main.json" -Value "{}"
-          # A herdr-app with no window open: complains on stderr and exits 1.
+          # A herdr-app with no window open: complains on stderr and fails.
           $stub = Join-Path $env:RUNNER_TEMP "stub"
           New-Item -ItemType Directory -Force -Path $stub | Out-Null
-          Set-Content -Path "$stub\herdr-app.cmd" -Value "@echo no Herdr window 1>&2`r`n@exit /b 1"
+          Set-Content -Path "$stub\herdr-app.cmd" -Value "@echo no Herdr window 1>&2`r`n@exit /b 2"
           $env:PATH = "$stub;$env:PATH"
           Get-Content desktop\install.ps1 -Raw | Invoke-Expression *>&1 | Tee-Object -Variable out
+          if ($LASTEXITCODE -ne 0) { throw "install.ps1 left exit code $LASTEXITCODE (herdr-app's)" }
           if (-not ((Get-Content "$env:HERDR_APP_HOME\mods\corral\main.js" -TotalCount 1) -like "// Corral panel*")) { throw "main.js wasn't installed" }
           if (-not ($out -match "herdr-app do layout.clone --name main --as main-corral")) { throw "no layout.clone instruction" }
-          # The stub's exit code is still in $LASTEXITCODE, which the runner would report.
-          exit 0
