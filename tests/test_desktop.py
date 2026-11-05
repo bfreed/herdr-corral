@@ -203,6 +203,16 @@ class RemoveWorktreeTests(DesktopTestCase):
         self.assertEqual(at_removal, [tab])
         self.assertEqual(self.core.killed, [tab, self.mine])
 
+    def test_closing_a_space_ends_its_terminals_but_not_hwts_own(self):
+        self.herdr.call("workspace", "close", "spWT")
+        self.assertEqual(self.core.killed, [self.mine])
+        self.assertIn(self.other, self.core.terms)
+        mine = self.core.add(self.checkout, {"herdr.space": "spWT2", "herdr.tab": "tb4"})
+        with mock.patch.dict(os.environ, {"HC_TERMINAL_ID": mine}):
+            with self.assertRaisesRegex(hwt.WorkflowError, "hwt runs in that space"):
+                self.herdr.call("workspace", "close", "spWT2")
+        self.assertIn(mine, self.core.terms)
+
     def test_a_refused_removal_leaves_the_space_running(self):
         (self.checkout / "f").write_text("changed")
         with self.assertRaises(hwt.WorkflowError):

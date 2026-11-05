@@ -49,7 +49,7 @@ class SafetyError(WorkflowError):
 
 WINDOWS = os.name == "nt"  # patched in tests; never patch os.name (pathlib reads it)
 
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 
 GITHUB_REPO = "bfreed/herdr-corral"
 DEFAULT_CONFIG = Path.home() / ".config/herdr-corral/config.toml"
@@ -1476,6 +1476,10 @@ class HerdrCore:
             return {"result": {"workspace": {"workspace_id": self.new_space(cwd)}}}
         if verb == ("workspace", "focus"):
             return {"result": {}}
+        if verb == ("workspace", "close"):
+            if self.end_space(args[2]):
+                raise WorkflowError("hwt runs in that space, so it can't close it")
+            return {"result": {}}
         if verb == ("worktree", "open"):
             path = Path(args[args.index("--path") + 1])
             return {"result": {"workspace": {"workspace_id": self.new_space(path)}}}
@@ -1515,8 +1519,16 @@ class HerdrCore:
         if not force and git(path, "status", "--porcelain", "--ignore-submodules=none",
                              check=False).stdout.strip():
             raise WorkflowError(f"{path} has modified or untracked files; removing it needs --force")
-        terms = self._terminals(f"herdr.space={workspace}") if workspace else []
-        # hwt itself may run in one of them (the space's shell tab): that one last.
+        own = self.end_space(workspace) if workspace else []
+        remove_checkout(canonical, path, force)
+        for term in own:
+            with contextlib.suppress(WorkflowError):
+                run([self.binary, "kill", term["address"]])
+
+    def end_space(self, workspace: str) -> list[dict[str, Any]]:
+        """End a space's terminals, and wait for what ran in them, except the
+        one hwt itself runs in (the space's shell tab), which is returned."""
+        terms = self._terminals(f"herdr.space={workspace}")
         me = os.environ.get("HC_TERMINAL_ID")
         own = [t for t in terms if me and me in (t.get("id"), t.get("address"))]
         others = [t for t in terms if t not in own]
@@ -1528,10 +1540,7 @@ class HerdrCore:
             with contextlib.suppress(WorkflowError):
                 run([self.binary, "kill", term["address"]])
         wait_for_exit(held)
-        remove_checkout(canonical, path, force)
-        for term in own:
-            with contextlib.suppress(WorkflowError):
-                run([self.binary, "kill", term["address"]])
+        return own
 
     def tabs(self, workspace: str) -> list[dict[str, Any]]:
         tabs: dict[str, dict[str, Any]] = {}
@@ -1735,7 +1744,8 @@ def folder_in_use(path: Path, error: Exception, retry: str) -> FolderInUse:
     detail = str(error).removeprefix("command failed (git) with exit status 255: ")
     return FolderInUse(
         f"couldn't delete {path}: a program probably has the folder open (a terminal in it, an "
-        f"editor, a dev server). Close it, then run '{retry}' again. ({detail})")
+        f"editor, a dev server). Run '{retry}' again: it closes the worktree's own Herdr "
+        f"workspace first; close anything else that has the folder open. ({detail})")
 
 
 def remove_checkout(canonical: Path, path: Path, force: bool) -> None:
@@ -2834,10 +2844,17 @@ def fuzzy_worktree_matches(items: list[dict[str, Any]], target: str) -> list[dic
 
 
 def choose_worktree_item(cfg: dict[str, Any], items: list[dict[str, Any]],
-                         target: str | None) -> dict[str, Any]:
-    linked = [item for item in items if item.get("is_linked_worktree", False)]
+                         target: str | None, pending: list[dict[str, Any]] = ()) -> dict[str, Any]:
+    """The worktree target names, asking when it names several (or none).
+    pending: half-done cleanups (see pending_cleanups), chosen like worktrees."""
+    live = {str(Path(i["path"]).resolve()) for i in items if isinstance(i.get("path"), str)}
+    pending = [p for p in pending if str(Path(p["path"]).resolve()) not in live]
+    linked = [item for item in items if item.get("is_linked_worktree", False)] + pending
     if target:
-        exact = match_removal_items(items, target)
+        wanted = Path(target).expanduser().resolve() if ("/" in target or "\\" in target) else None
+        exact = match_removal_items(items, target) + [
+            p for p in pending
+            if target in (p["branch"], p["path"], Path(p["path"]).name) or Path(p["path"]).resolve() == wanted]
         if len(exact) == 1:
             return exact[0]
         if len(exact) > 1:
@@ -2882,14 +2899,12 @@ def cmd_remove(args,cfg,state,herdr):
 
 def cmd_cleanup(args, cfg, state, herdr):
     items = configured_worktree_items(cfg, herdr)
-    if args.target and not match_removal_items(items, args.target):
-        # Not a worktree (any more): perhaps a cleanup that couldn't finish.
-        found = pending_cleanup(state, args.target)
-        if found:
-            print(json.dumps(resume_cleanup(cfg, state, *found, abandon=bool(args.abandon),
-                                            confirm=args.confirm), indent=2))
-            return
-    item = choose_worktree_item(cfg, items, args.target)
+    item = choose_worktree_item(cfg, items, args.target, pending_cleanups(state))
+    if item.get("_pending") is not None:
+        # A cleanup that couldn't finish: git no longer lists its worktree.
+        print(json.dumps(resume_cleanup(cfg, state, Path(item["path"]), item["_pending"], herdr=herdr,
+                                        abandon=bool(args.abandon), confirm=args.confirm), indent=2))
+        return
     result = cleanup_worktree_item(cfg, state, herdr, item,
                                    abandon=args.abandon, confirm=args.confirm)
     print(json.dumps(result, indent=2))
@@ -2902,6 +2917,7 @@ SAFETY_LABELS = {
     "unpublished-work": "has unpublished commits",
     "dirty": "dirty",
     "detached": "detached HEAD",
+    "half-done": "cleanup cut short — run it again to finish",
 }
 
 # Plumbing-stable diff output for patch-id: the branch diff and the base log
@@ -2994,7 +3010,7 @@ def worktree_safety(cfg: dict[str, Any], item: dict[str, Any]) -> str:
 
 
 SAFETY_COLORS = {"merged": "32", "squash-merged": "32", "no-unique-commits": "32",
-                 "unpublished-work": "33", "dirty": "31", "detached": "33"}
+                 "unpublished-work": "33", "dirty": "31", "detached": "33", "half-done": "33"}
 
 
 def colorize(text: str, code: str) -> str:
@@ -3022,7 +3038,7 @@ def worktree_listing_lines(cfg: dict[str, Any], items: list[dict[str, Any]]) -> 
                 lines.append("")
             lines.append(colorize(repo, "1"))
             current_repo = repo
-        safety = worktree_safety(cfg, item)
+        safety = "half-done" if item.get("_pending") is not None else worktree_safety(cfg, item)
         label = colorize(f"[{SAFETY_LABELS.get(safety, safety)}]", SAFETY_COLORS.get(safety, "0"))
         branch = item.get("branch") or "(detached)"
         lines.append(f"  {index:>2}. {branch}  {label}")
@@ -3222,7 +3238,7 @@ def cleanup_worktree_item(cfg, state, herdr, item, *, abandon: bool, confirm: st
         # closing never reaches one an agent started in the background).
         stopped = stop_worktree_servers(state, path)
         detach_links(path, repo)
-        with explained_removal(path, f"hwt cleanup {branch}"):
+        with explained_removal(path, retry_command(path)):
             if is_desktop(herdr):
                 herdr.remove_worktree(canonical, workspace, path, dirty)
             elif workspace:
@@ -3250,15 +3266,23 @@ def forget_cleanup(state: Path, path: Path) -> None:
         pending.pop(str(path.resolve()), None)
 
 
-def pending_cleanup(state: Path, target: str) -> tuple[Path, dict[str, Any]] | None:
-    """A cleanup that decided, then couldn't finish, matching a branch or path."""
+def pending_cleanups(state: Path) -> list[dict[str, Any]]:
+    """Cleanups that decided, then couldn't finish, as worktree items for
+    choose_worktree_item: git no longer lists their worktrees, but a folder,
+    the branch, its remote copy or the lease may be left."""
     with locked_json(state, "cleanups") as pending:
         entries = dict(pending)
-    wanted = str(Path(target).expanduser().resolve()) if ("/" in target or "\\" in target) else None
-    for key, entry in entries.items():
-        if target in (entry.get("branch"), key, Path(key).name) or key == wanted:
-            return Path(key), entry
-    return None
+    return [{"branch": entry.get("branch"), "path": key, "repository": entry.get("repository"),
+             "is_linked_worktree": True, "_pending": entry} for key, entry in sorted(entries.items())]
+
+
+def retry_command(path: Path) -> str:
+    """hwt cleanup naming the checkout by path: after git unregisters it, a
+    branch name can match another repository's worktree."""
+    text = str(path)
+    if WINDOWS:
+        return f'hwt cleanup "{text}"' if " " in text else f"hwt cleanup {text}"
+    return f"hwt cleanup {shlex.quote(text)}"
 
 
 def finish_cleanup(cfg: dict[str, Any], state: Path, canonical: Path, remote: str, path: Path,
@@ -3292,10 +3316,12 @@ def holds_files(folder: Path) -> bool:
 
 
 def resume_cleanup(cfg: dict[str, Any], state: Path, path: Path, entry: dict[str, Any], *,
-                   abandon: bool = False, confirm: str | None = None) -> dict[str, Any]:
+                   abandon: bool = False, confirm: str | None = None, herdr: Any = None) -> dict[str, Any]:
     """Finish a cleanup whose removal failed partway: the folder git couldn't
     delete (when it's empty), the branch, its remote copy, the lease. The
-    merge check was done, or the abandon confirmed, when it started."""
+    merge check was done, or the abandon confirmed, when it started. The
+    worktree's own workspace, still open when Herdr's removal failed, is
+    closed first: its terminals hold the folder."""
     repo = cfg.get("repositories", {}).get(entry.get("repository"))
     if not repo:
         raise WorkflowError(f"repository {entry.get('repository')!r} is no longer configured")
@@ -3311,14 +3337,13 @@ def resume_cleanup(cfg: dict[str, Any], state: Path, path: Path, entry: dict[str
             raise WorkflowError(f"{path} is still a worktree; run 'hwt list' to see Herdr's view of it")
         leftover = None
         if path.is_dir():
+            if herdr is not None:
+                close_workspace_of(herdr, path)
             if holds_files(path):
                 leftover = str(path)
                 log(f"{path} still holds files git couldn't delete; delete the folder once nothing has it open")
             else:
-                try:
-                    shutil.rmtree(path)
-                except OSError as exc:
-                    raise folder_in_use(path, exc, f"hwt cleanup {branch}") from exc
+                remove_empty_folder(path)
         local_exists = git(canonical, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}",
                            check=False).returncode == 0
         git(canonical, "fetch", remote, "--prune", check=False)
@@ -3328,12 +3353,39 @@ def resume_cleanup(cfg: dict[str, Any], state: Path, path: Path, entry: dict[str
             if not verdict["merged"] and verdict["unique_commits"]:
                 raise WorkflowError(
                     f"branch {branch} now has commits not merged into {verdict['base_branch']}; "
-                    f"kept it. Delete it anyway with: hwt cleanup {branch} --abandon --confirm {branch}")
+                    f"kept it. Delete it anyway with: {retry_command(path)} --abandon --confirm {branch}")
         remote_exists = git(canonical, "show-ref", "--verify", "--quiet", f"refs/remotes/{remote}/{branch}",
                             check=False).returncode == 0
         done = finish_cleanup(cfg, state, canonical, remote, path, entry,
                               remote_exists=remote_exists, local_exists=local_exists)
     return {**done, "resumed": True, "leftover_folder": leftover}
+
+
+def close_workspace_of(herdr: Any, path: Path) -> None:
+    """Close the Herdr workspace (Desktop: space) showing path, unless this
+    hwt runs in it: closing it would end hwt too."""
+    workspace = None
+    with contextlib.suppress(WorkflowError, KeyError, TypeError):
+        workspace = find_workspace_for_path(herdr, path)
+    if not workspace:
+        return
+    if workspace == os.environ.get("HERDR_WORKSPACE_ID"):
+        raise WorkflowError(f"this terminal is in {path}'s own workspace, which has to close first; "
+                            f"run '{retry_command(path)}' from another workspace")
+    herdr.call("workspace", "close", workspace)
+
+
+def remove_empty_folder(path: Path) -> None:
+    # A just-closed program can hold the folder a moment longer on Windows.
+    deadline = time.monotonic() + (5 if WINDOWS else 0)
+    while True:
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError as exc:
+            if time.monotonic() >= deadline:
+                raise folder_in_use(path, exc, retry_command(path)) from exc
+            time.sleep(0.5)
 
 
 def teardown_status(repo: dict[str, Any], canonical: Path, branch: str) -> dict[str, Any]:

@@ -281,6 +281,15 @@ class WindowsCopyTests(unittest.TestCase):
             self.assertFalse(hwt.is_link(wt / "node_modules"))
             self.assertEqual((wt / "node_modules" / "pkg" / "index.js").read_text(), "keep")
 
+    def test_the_retry_hint_names_the_checkout_by_path(self):
+        # After git unregisters a worktree, its branch name can match another repository's.
+        plain, spaced = Path("C:/Users/b/.herdr/worktrees/demo/x-1"), Path("C:/My Repos/x")
+        with as_windows():
+            self.assertEqual(hwt.retry_command(plain), "hwt cleanup " + str(plain))
+            self.assertEqual(hwt.retry_command(spaced), 'hwt cleanup "' + str(spaced) + '"')
+        with as_posix():
+            self.assertEqual(hwt.retry_command(Path("/home/b/my wts/x")), "hwt cleanup '/home/b/my wts/x'")
+
     def test_a_removal_that_fails_on_a_folder_in_use_says_so(self):
         failure = hwt.WorkflowError("command failed (git) with exit status 255: "
                                     "error: failed to delete 'C:/wt/x': Permission denied")
@@ -288,7 +297,8 @@ class WindowsCopyTests(unittest.TestCase):
             with hwt.explained_removal(Path("C:/wt/x"), "hwt cleanup feature/x"):
                 raise failure
         self.assertIn("a program probably has the folder open", str(caught.exception))
-        self.assertIn("run 'hwt cleanup feature/x' again", str(caught.exception))
+        self.assertIn("Run 'hwt cleanup feature/x' again: it closes the worktree's own Herdr workspace",
+                      str(caught.exception))
         herdr_failure = hwt.WorkflowError('command failed (herdr) with exit status 1: {"error":{"code":"worktree_remove_failed"}}')
         with as_windows(), self.assertRaises(hwt.FolderInUse):
             with hwt.explained_removal(Path("C:/wt/x"), "hwt cleanup feature/x"):

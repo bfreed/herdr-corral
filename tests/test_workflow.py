@@ -36,7 +36,8 @@ class StubProbes:
     def setUp(self):
         super().setUp()
         for name, value in (("squash_merged", False), ("stop_worktree_servers", []),
-                            ("orphan_servers", []), ("record_cleanup", None), ("forget_cleanup", None)):
+                            ("orphan_servers", []), ("record_cleanup", None), ("forget_cleanup", None),
+                            ("pending_cleanups", [])):
             patcher = mock.patch.object(hwt, name, return_value=value)
             patcher.start()
             self.addCleanup(patcher.stop)

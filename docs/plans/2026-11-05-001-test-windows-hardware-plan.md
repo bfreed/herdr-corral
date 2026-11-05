@@ -4,14 +4,14 @@ For the Windows 11 test machine (Herdr Desktop, herdr 0.9.4, hc, git, Python 3.1
 
 Record for each step: pass/fail, the exact error text, and `hwt --version`, `herdr --version`, `hc --version` and `herdr-app --version` once at the start. Use PowerShell (Windows PowerShell 5.1 unless a step says otherwise). Use a throwaway repository with an `origin` you can push to and delete branches on, for example a fork or a scratch repo: `C:\Users\<you>\repos\demo`, with a `package.json` whose `dev` script listens on `$env:PORT` (`npx http-server -p $env:PORT` is enough) and a `package-lock.json`.
 
-## Re-run for 1.4.1
+## Re-run for 1.4.1 (and 1.4.2)
 
 1.4.1 fixes what the first run on this machine found (Git for Windows 2.49.0, Python 3.14). It also carries 1.4.0 (HTTPS dev servers over Tailscale, `start_dev`), which is off unless configured. Re-run these, in this order. Use the throwaway `demo` repository: step R2 deliberately tests the data-loss case.
 
-- **R0. Get to 1.4.1.** The panel-installed 1.3.0 is a tag checkout, so its own `hwt update` can't move it this once. Run `git -C $HOME\.local\share\herdr-corral fetch --tags`, then `git -C $HOME\.local\share\herdr-corral checkout v1.4.1`, then `hwt update`.
-  - `hwt --version` should print `hwt 1.4.1`.
+- **R0. Get to 1.4.2.** The panel-installed 1.3.0 is a tag checkout, so its own `hwt update` can't move it this once. Run `git -C $HOME\.local\share\herdr-corral fetch --tags`, then `git -C $HOME\.local\share\herdr-corral checkout v1.4.2`, then `hwt update`. (From 1.4.1, `hwt update` alone does it.)
+  - `hwt --version` should print `hwt 1.4.2`.
   - `hwt doctor`: note any `junctions` check. It lists worktrees 1.3.0 left a junction in.
-  - Then, to check bug 5, run `hwt update` again on that tag checkout. It must print `"up_to_date": true`, with no "git pull failed". (Moving to a newer release is tested in CI; no release is newer than v1.4.1 yet.)
+  - Then, to check bug 5, run `hwt update` again on that tag checkout. It must print `"up_to_date": true`, with no "git pull failed". (Moving to a newer release is tested in CI; no release is newer than v1.4.2 yet.)
 - **R1. CI's blind spot.** Run `py -3 -m unittest discover -s $HOME\.local\share\herdr-corral\tests`. It must pass, including `test_git_older_than_2_54_deletes_through_a_junction`, which expects Git 2.49 to delete through a junction (that's why Corral no longer makes them). Report the `git 2.49.0` line it prints, and whether `test_git_deletes_a_directory_symlink_without_following_it` ran or was skipped (it needs Developer Mode).
 - **R2. Shared dependencies (bug 1).** With `policy = "shared"` and Developer Mode **off**:
   - Create a worktree. The bootstrap says "sharing node_modules needs a symlink … the worktree gets its own instead".
@@ -21,14 +21,20 @@ Record for each step: pass/fail, the exact error text, and `hwt --version`, `her
   - Then, with Developer Mode **on**: a new worktree's `node_modules` shows `SymbolicLink`. Herdr's Delete must again leave the count unchanged.
 - **R3. A 1.3.0 junction.** If R0's `hwt doctor` listed one, run `hwt open <that worktree>`, then `Get-Item <wt>\node_modules | Select LinkType`: it must no longer say `Junction`. Then `hwt doctor` must not list it.
 - **R4. Desktop Clean up (bug 2).** In the panel, use **Clean up…** then **Delete worktree and branch** on a merged worktree whose agent, shell and server tabs are all open. The space must close, then the worktree folder, the branch and its remote copy must all be gone. Expected: no "Permission denied".
-- **R5. A folder in use (bug 3).**
+- **R5. A folder in use (bug 3; redone for 1.4.2).**
   - In a separate PowerShell window (not one of the space's tabs), `cd` into a merged worktree's folder. Then run `hwt cleanup <branch>` from another folder.
-  - Expected message: "couldn't delete … a program probably has the folder open … run 'hwt cleanup <branch>' again".
+  - Expected message: "couldn't delete … a program probably has the folder open … Run 'hwt cleanup <path>' again: it closes the worktree's own Herdr workspace first". The hint names the folder's path, not the branch.
   - Then check:
     - `git branch --list <branch>`: still there.
     - `git ls-remote origin <branch>`: still there.
     - `hwt status`: still shows the lease.
-  - `cd` out of the folder, then run the same `hwt cleanup <branch>` again. It must print `"resumed": true`, and remove the empty folder, the branch, the remote branch and the lease.
+  - `cd` out of the folder, then run the `hwt cleanup <path>` from the message. It must print `"resumed": true`, and remove the empty folder, the branch, the remote branch and the lease.
+- **R5b. TUI: the worktree's workspace still open (1.4.2).** In the Herdr TUI, `cd` into a merged worktree from a terminal *outside* Herdr, then run `hwt cleanup <branch>` from a Herdr tab in another workspace. It fails, and the worktree's workspace stays open. Close the outside terminal, then run the `hwt cleanup <path>` from the message. The worktree's workspace must close by itself and the cleanup finish with `"resumed": true`. Then repeat the retry from a tab *inside* that workspace: it must refuse with "has to close first; run … from another workspace" and delete nothing.
+- **R5c. Same branch name in two repositories (1.4.2).**
+  - Make worktrees with the same branch name in two configured repositories, then cut one's cleanup short as in R5.
+  - Run `hwt cleanup <branch>`. It must list both (the half-done one marked "cleanup cut short") and ask, not pick one.
+  - Run it from the Desktop panel, or with no terminal, and it must stop with "re-run with one of the listed names or paths".
+  - Finally `hwt cleanup <path>` finishes the half-done one only, and the other repository's worktree is still there.
 - **R6. New worktree with Claude (bug 4).** In a folder Claude hasn't seen, run `hwt new` (TUI, `start_agent = true`, agent `claude`).
   - The bootstrap finishes after "the agent started and is waiting for an answer in its tab", with no error.
   - `hwt status` shows the lease.
